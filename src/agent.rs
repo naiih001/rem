@@ -3,7 +3,10 @@ use rig::{agent::AgentBuilder, client::CompletionClient, completion::Prompt, pro
 
 use crate::{
     config::Config,
-    tools::{BashTool, EditTool, ReadTool, WriteTool},
+    tools::{
+        BashTool, EditTool, GitDiffTool, GitStatusTool, GlobTool, GrepTool, ListDirectoryTool,
+        ReadTool, WriteTool,
+    },
 };
 
 /// Swappable orchestrator abstraction. `RigAgent` is the Rig implementation;
@@ -14,7 +17,7 @@ pub trait AgentLoop {
 }
 
 /// Rig-backed agent: OpenAI-compatible `/chat/completions` model + preamble +
-/// the 4 file/shell tools, using Rig's built-in multi-step loop (no hand-rolled ReAct).
+/// the 9 file/shell/git/search tools, using Rig's built-in multi-step loop (no hand-rolled ReAct).
 pub struct RigAgent {
     agent: rig::agent::Agent,
 }
@@ -33,7 +36,8 @@ impl RigAgent {
         let agent = AgentBuilder::new(model)
             .preamble(
                 "You are rem, a coding agent in a terminal TUI. \
-                 Use the read/write/edit/bash tools to inspect and change files. \
+                 Use the read/write/edit/bash/list_directory/git_status/git_diff/grep/glob tools to inspect and change files. \
+                 list_directory lists a dir, glob finds files by pattern, grep searches contents, git_status/git_diff inspect git state. \
                  Bash runs `sh -c` in the project dir (30s timeout) and is unrestricted. \
                  Prefer reading a file before editing it. Keep replies concise.",
             )
@@ -41,6 +45,11 @@ impl RigAgent {
             .tool(WriteTool)
             .tool(EditTool)
             .tool(BashTool)
+            .tool(ListDirectoryTool)
+            .tool(GitStatusTool)
+            .tool(GitDiffTool)
+            .tool(GrepTool)
+            .tool(GlobTool)
             .default_max_turns(10)
             .build();
 
