@@ -33,8 +33,9 @@ impl TuiBackend for CursiveBackend {
 
         let mut siv = cursive::default();
 
+        // Spec §5: top scrollable chat/tool log named "out".
         let log = TextView::new(buf.lock().unwrap().clone())
-            .with_name("log")
+            .with_name("out")
             .scrollable();
 
         // Clone Arcs into the (UI-thread, 'static) submit callback.
@@ -55,7 +56,7 @@ impl TuiBackend for CursiveBackend {
                 if let Ok(mut b) = submit_buf.lock() {
                     b.clear();
                 }
-                siv.call_on_name("log", |v: &mut TextView| v.set_content(""));
+                siv.call_on_name("out", |v: &mut TextView| v.set_content(""));
                 return;
             }
 
@@ -118,5 +119,5 @@ fn append_log(siv: &mut Cursive, buf: &Arc<Mutex<String>>, line: &str) {
         b.push_str(line);
         b.clone()
     };
-    siv.call_on_name("log", |v: &mut TextView| v.set_content(snapshot));
+    siv.call_on_name("out", |v: &mut TextView| v.set_content(snapshot));
 }
