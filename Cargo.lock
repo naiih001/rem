@@ -5288,6 +5288,7 @@ dependencies = [
  "async-trait",
  "cursive",
  "dotenvy",
+ "glob",
  "rig",
  "serde",
  "serde_json",
