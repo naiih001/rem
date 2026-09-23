@@ -380,3 +380,93 @@ fn parse_ddg_lite(html: &str, want: usize) -> Vec<(String, String, String)> {
     }
     results
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rig::tool::{Tool, ToolContext};
+
+    #[test]
+    fn rejects_non_http_urls() {
+        assert!(check_url("file:///etc/passwd").is_err());
+        assert!(check_url("ftp://example.com").is_err());
+        assert!(check_url("http://example.com").is_ok());
+        assert!(check_url("https://example.com").is_ok());
+    }
+
+    #[test]
+    fn decodes_percent_encoding() {
+        assert_eq!(
+            percent_decode("https%3A%2F%2Fdocs.rs%2Freqwest%2F"),
+            "https://docs.rs/reqwest/"
+        );
+        assert_eq!(percent_decode("a+b"), "a b");
+    }
+
+    #[test]
+    fn strips_script_and_style_to_text() {
+        let html = "<html><head><style>p{color:red}</style><script>alert(1)</script></head>\
+            <body><h1>Hello</h1><p>World &amp; friends</p></body></html>";
+        let text = html_to_text(html);
+        assert!(text.contains("Hello"), "got: {text}");
+        assert!(text.contains("World & friends"), "got: {text}");
+        assert!(!text.contains("alert"), "got: {text}");
+        assert!(!text.contains("color"), "got: {text}");
+    }
+
+    #[test]
+    fn parses_ddg_lite_blocks() {
+        let html = "<a rel=\"nofollow\" href=\"//duckduckgo.com/l/?uddg=https%3A%2F%2Fdocs.rs%2F&amp;rut=abc\" class='result-link'>reqwest - Rust</a> \
+            <td class='result-snippet'>An <b>HTTP</b> client</td>";
+        let out = parse_ddg_lite(html, 5);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "reqwest - Rust");
+        assert_eq!(out[0].1, "https://docs.rs/");
+        assert_eq!(out[0].2, "An HTTP client");
+    }
+
+    #[tokio::test]
+    async fn live_search_returns_numbered_results() {
+        let mut ctx = ToolContext::new();
+        let out = WebSearchTool
+            .call(
+                &mut ctx,
+                WebSearchArgs {
+                    query: "rust reqwest crate".into(),
+                    count: Some(2),
+                },
+            )
+            .await
+            .expect("live search");
+        assert!(out.contains("1."), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn live_fetch_example_domain_as_text() {
+        let mut ctx = ToolContext::new();
+        let out = WebFetchTool
+            .call(
+                &mut ctx,
+                WebFetchArgs {
+                    url: "https://example.com".into(),
+                    max_bytes: None,
+                },
+            )
+            .await
+            .expect("live fetch");
+        assert!(out.starts_with("HTTP 200"), "got: {out}");
+        assert!(out.contains("Example Domain"), "got: {out}");
+        assert!(!out.contains("<script"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn empty_query_is_rejected() {
+        let mut ctx = ToolContext::new();
+        assert!(
+            WebSearchTool
+                .call(&mut ctx, WebSearchArgs { query: "  ".into(), count: None })
+                .await
+                .is_err()
+        );
+    }
+}
