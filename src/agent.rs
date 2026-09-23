@@ -1,8 +1,15 @@
 use async_trait::async_trait;
-use rig::{agent::AgentBuilder, client::CompletionClient, completion::Prompt, providers::openai};
+use rig::{
+    agent::AgentBuilder,
+    client::CompletionClient,
+    completion::{Chat, Prompt},
+    message::ToolChoice,
+    providers::openai,
+};
 
 use crate::{
     config::Config,
+    context::Context,
     tools::{
         BashTool, EditTool, GitDiffTool, GitStatusTool, GlobTool, GrepTool, ListDirectoryTool,
         ReadTool, WebFetchTool, WebSearchTool, WriteTool,
@@ -18,8 +25,11 @@ pub trait AgentLoop {
 
 /// Rig-backed agent: OpenAI-compatible `/chat/completions` model + preamble +
 /// the 11 file/shell/git/search/web tools, using Rig's built-in multi-step loop (no hand-rolled ReAct).
+/// Conversation history is caller-owned in [`Context`]: tool outputs are
+/// truncated on entry and old turns are summarized past 100 messages.
 pub struct RigAgent {
     agent: rig::agent::Agent,
+    context: tokio::sync::Mutex<Context>,
 }
 
 impl RigAgent {
@@ -56,13 +66,48 @@ impl RigAgent {
             .default_max_turns(10)
             .build();
 
-        Ok(Self { agent })
+        Ok(Self {
+            agent,
+            context: tokio::sync::Mutex::new(Context::new()),
+        })
     }
 }
 
 #[async_trait]
 impl AgentLoop for RigAgent {
     async fn chat(&self, prompt: &str) -> Result<String, String> {
-        self.agent.prompt(prompt).await.map_err(|e| e.to_string())
+        const SUMMARIZER_PROMPT: &str = "Summarize this conversation so far for continued work. \
+            Preserve: filenames touched, decisions made, errors seen, and any pending tasks. \
+            Keep it under 1500 chars. Reply with the summary only.";
+
+        // Lock once for the whole turn: history mutation + compaction are atomic
+        // w.r.t. other chat() calls. The TUI serializes turns anyway.
+        let mut ctx = self.context.lock().await;
+        let before = ctx.len();
+
+        let reply = Chat::chat(&self.agent, prompt, ctx.messages_mut())
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // Truncate newly committed tool outputs so they don't eat the window.
+        ctx.truncate_new(before);
+
+        // Compact past the trigger: summarize oldest, keep newest verbatim.
+        if let Some(drained) = ctx.take_for_compaction() {
+            let material = Context::render_for_summary(&drained);
+            drop(drained);
+            // Summarize WITHOUT tools and WITHOUT history: a plain one-shot
+            // call so the summary can't recurse into compaction or tool loops.
+            let summary = self
+                .agent
+                .prompt(material)
+                .preamble(SUMMARIZER_PROMPT)
+                .tool_choice(ToolChoice::None)
+                .await
+                .map_err(|e| e.to_string())?;
+            ctx.apply_summary(summary);
+        }
+
+        Ok(reply)
     }
 }
