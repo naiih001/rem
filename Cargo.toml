@@ -13,3 +13,5 @@ async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 glob = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+html-escape = "0.2"

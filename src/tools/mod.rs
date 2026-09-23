@@ -5,6 +5,7 @@ pub mod glob_tool;
 pub mod grep;
 pub mod list_directory;
 pub mod read;
+pub mod web;
 pub mod write;
 
 pub use bash::BashTool;
@@ -14,6 +15,7 @@ pub use glob_tool::GlobTool;
 pub use grep::GrepTool;
 pub use list_directory::ListDirectoryTool;
 pub use read::ReadTool;
+pub use web::{WebFetchTool, WebSearchTool};
 pub use write::WriteTool;
 
 use std::fmt;
