@@ -42,12 +42,12 @@ impl Context {
                 for item in content.iter_mut() {
                     if let UserContent::ToolResult(result) = item {
                         for c in result.content.iter_mut() {
-                            if let ToolResultContent::Text(t) = c {
-                                if t.text.len() > Self::TOOL_BUDGET {
-                                    let dropped = t.text.len() - Self::TOOL_BUDGET;
-                                    t.text.truncate(Self::TOOL_BUDGET);
-                                    t.text.push_str(&format!(" [truncated {dropped} chars]"));
-                                }
+                            if let ToolResultContent::Text(t) = c
+                                && t.text.len() > Self::TOOL_BUDGET
+                            {
+                                let dropped = t.text.len() - Self::TOOL_BUDGET;
+                                t.text.truncate(Self::TOOL_BUDGET);
+                                t.text.push_str(&format!(" [truncated {dropped} chars]"));
                             }
                         }
                     }

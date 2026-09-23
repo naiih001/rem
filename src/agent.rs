@@ -95,17 +95,25 @@ impl AgentLoop for RigAgent {
         // Compact past the trigger: summarize oldest, keep newest verbatim.
         if let Some(drained) = ctx.take_for_compaction() {
             let material = Context::render_for_summary(&drained);
-            drop(drained);
             // Summarize WITHOUT tools and WITHOUT history: a plain one-shot
             // call so the summary can't recurse into compaction or tool loops.
-            let summary = self
+            match self
                 .agent
                 .prompt(material)
                 .preamble(SUMMARIZER_PROMPT)
                 .tool_choice(ToolChoice::None)
                 .await
-                .map_err(|e| e.to_string())?;
-            ctx.apply_summary(summary);
+            {
+                Ok(summary) => ctx.apply_summary(summary),
+                Err(e) => {
+                    // Summarizer failed: put the drained messages back instead
+                    // of silently dropping history. Next turn retries.
+                    let mut restored = drained;
+                    restored.extend(ctx.messages_mut().drain(..));
+                    *ctx.messages_mut() = restored;
+                    return Err(format!("context compaction failed, history restored: {e}"));
+                }
+            }
         }
 
         Ok(reply)
