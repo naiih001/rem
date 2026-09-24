@@ -3,10 +3,13 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use rig::{
     agent::AgentBuilder,
-    agent::{AgentHook, HookContext, ToolResultAction, ToolResultEvent},
+    agent::{
+        AgentHook, CompletionResponseEvent, HookContext, ObservationAction, ToolResultAction,
+        ToolResultEvent,
+    },
     client::CompletionClient,
     completion::{Chat, Prompt},
-    message::ToolChoice,
+    message::{AssistantContent, ToolChoice},
     providers::openai,
 };
 
@@ -30,6 +33,12 @@ pub trait AgentLoop {
     fn last_tool_events(&self) -> Vec<ToolEvent> {
         Vec::new()
     }
+    /// True LLM reasoning texts captured during the most recent `chat` turn,
+    /// in order. Empty when the provider emitted no `Reasoning` blocks.
+    /// Defaulted so other `AgentLoop` impls need no changes.
+    fn last_reasoning(&self) -> Vec<String> {
+        Vec::new()
+    }
     /// Model id for the TUI footer. Defaulted for other impls.
     fn model_name(&self) -> String {
         "model".to_string()
@@ -37,13 +46,17 @@ pub trait AgentLoop {
 }
 
 /// One tool execution observed during a turn: what ran, with what args,
-/// whether it succeeded, and a short human-readable result summary.
+/// whether it succeeded, a short human-readable result summary, and the full
+/// output text (for inline expandable display).
 #[derive(Debug, Clone)]
 pub struct ToolEvent {
     pub name: String,
     pub args: serde_json::Value,
     pub ok: bool,
     pub summary: String,
+    /// Full rendered tool output; may be multi-line. Truncated to
+    /// [`FULL_OUTPUT_CAP`] chars so the transcript stores a bounded copy.
+    pub output: String,
 }
 
 impl ToolEvent {
@@ -83,15 +96,46 @@ fn compact_args(args: &serde_json::Value) -> String {
     }
 }
 
-/// [`AgentHook`] that records every tool result into a shared vec.
-/// Registered via `AgentBuilder::add_hook`; fires for successes, failures,
-/// skips, and refusals without altering agent behavior (always `Keep`).
+/// Bound on the full output text stored per tool event for inline display.
+/// Long outputs render truncated with expand; the stored copy stays bounded.
+pub const FULL_OUTPUT_CAP: usize = 4000;
+
+/// [`AgentHook`] that records every tool result plus true LLM reasoning text
+/// into shared vecs. Registered via `AgentBuilder::add_hook`; fires for
+/// successes, failures, skips, and refusals without altering agent behavior
+/// (always `Keep` / `Continue`).
 #[derive(Debug, Clone, Default)]
 struct ToolRecorder {
     events: Arc<Mutex<Vec<ToolEvent>>>,
+    reasoning: Arc<Mutex<Vec<String>>>,
 }
 
 impl AgentHook for ToolRecorder {
+    /// Capture true LLM reasoning text from each model response. Only
+    /// `Reasoning` content blocks count; plain text and tool calls are not
+    /// reasoning. Never alters behavior (always `Continue`).
+    async fn on_completion_response(
+        &self,
+        _ctx: &HookContext,
+        event: CompletionResponseEvent<'_>,
+    ) -> ObservationAction {
+        let mut texts = Vec::new();
+        for content in event.content.iter() {
+            if let AssistantContent::Reasoning(r) = content {
+                let text = r.display_text();
+                if !text.trim().is_empty() {
+                    texts.push(text);
+                }
+            }
+        }
+        if !texts.is_empty()
+            && let Ok(mut guard) = self.reasoning.lock()
+        {
+            guard.extend(texts);
+        }
+        ObservationAction::Continue
+    }
+
     async fn on_tool_result(
         &self,
         _ctx: &HookContext,
@@ -103,6 +147,7 @@ impl AgentHook for ToolRecorder {
             true => first_line(&detail, 120),
             false => format!("failed: {}", first_line(&detail, 120)),
         };
+        let output = truncate_chars(&detail, FULL_OUTPUT_CAP);
         let parsed: serde_json::Value =
             serde_json::from_str(event.args).unwrap_or(serde_json::Value::Null);
         if let Ok(mut guard) = self.events.lock() {
@@ -111,9 +156,20 @@ impl AgentHook for ToolRecorder {
                 args: parsed,
                 ok,
                 summary,
+                output,
             });
         }
         ToolResultAction::keep()
+    }
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    match s.chars().count() > max {
+        true => format!(
+            "{}… [truncated]",
+            s.chars().take(max - 1).collect::<String>()
+        ),
+        false => s.to_string(),
     }
 }
 
@@ -170,7 +226,7 @@ impl RigAgent {
             .tool(GlobTool)
             .tool(WebFetchTool)
             .tool(WebSearchTool)
-            .default_max_turns(10)
+            .default_max_turns(100)
             .add_hook(recorder.clone())
             .build();
 
@@ -195,8 +251,11 @@ impl AgentLoop for RigAgent {
         let mut ctx = self.context.lock().await;
         let before = ctx.len();
 
-        // Fresh per-turn tool log: the hook appends as tools resolve.
+        // Fresh per-turn tool + reasoning logs: the hooks append as the turn runs.
         if let Ok(mut guard) = self.recorder.events.lock() {
+            guard.clear();
+        }
+        if let Ok(mut guard) = self.recorder.reasoning.lock() {
             guard.clear();
         }
 
@@ -237,6 +296,14 @@ impl AgentLoop for RigAgent {
     fn last_tool_events(&self) -> Vec<ToolEvent> {
         self.recorder
             .events
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
+    fn last_reasoning(&self) -> Vec<String> {
+        self.recorder
+            .reasoning
             .lock()
             .map(|g| g.clone())
             .unwrap_or_default()
