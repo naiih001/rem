@@ -45,7 +45,11 @@ impl Tool for GlobTool {
             match entry {
                 Ok(p) => {
                     let s = p.to_string_lossy().into_owned();
-                    if s.contains(".git/") || s.starts_with(".git") || s.contains("target/") || s.starts_with("target") {
+                    if s.contains(".git/")
+                        || s.starts_with(".git")
+                        || s.contains("target/")
+                        || s.starts_with("target")
+                    {
                         continue;
                     }
                     paths.push(s);
@@ -62,7 +66,10 @@ impl Tool for GlobTool {
         if paths.is_empty() {
             Ok(format!("no files match {:?}", args.pattern))
         } else if paths.len() >= MAX_MATCHES {
-            Ok(format!("{}\n[truncated to {MAX_MATCHES} paths]", paths.join("\n")))
+            Ok(format!(
+                "{}\n[truncated to {MAX_MATCHES} paths]",
+                paths.join("\n")
+            ))
         } else {
             Ok(paths.join("\n"))
         }

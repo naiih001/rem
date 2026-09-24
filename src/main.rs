@@ -1,6 +1,7 @@
 mod agent;
 mod config;
 mod context;
+mod history;
 mod permissions;
 mod tools;
 mod tui;

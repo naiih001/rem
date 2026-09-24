@@ -13,8 +13,7 @@ impl Config {
         dotenvy::dotenv().ok();
 
         fn required(var: &str) -> Result<String, String> {
-            std::env::var(var)
-                .map_err(|_| format!("missing required environment variable: {var}"))
+            std::env::var(var).map_err(|_| format!("missing required environment variable: {var}"))
         }
 
         Ok(Self {

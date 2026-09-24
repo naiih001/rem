@@ -44,9 +44,17 @@ impl Tool for GrepTool {
         let root = args.path.clone().unwrap_or_else(|| ".".to_string());
         let mut hits: Vec<String> = Vec::new();
         let mut files_scanned: usize = 0;
-        search_path(std::path::Path::new(&root), &args.pattern, &mut hits, &mut files_scanned)?;
+        search_path(
+            std::path::Path::new(&root),
+            &args.pattern,
+            &mut hits,
+            &mut files_scanned,
+        )?;
         if hits.is_empty() {
-            Ok(format!("no matches for {:?} under {root} ({files_scanned} files)", args.pattern))
+            Ok(format!(
+                "no matches for {:?} under {root} ({files_scanned} files)",
+                args.pattern
+            ))
         } else {
             let mut out = hits.join("\n");
             if hits.len() >= MAX_MATCHES {
@@ -67,7 +75,11 @@ fn search_path(
         return Ok(());
     }
     let rel = path.to_string_lossy();
-    if rel.contains(".git/") || rel.starts_with(".git") || rel.contains("target/") || rel.starts_with("target") {
+    if rel.contains(".git/")
+        || rel.starts_with(".git")
+        || rel.contains("target/")
+        || rel.starts_with("target")
+    {
         return Ok(());
     }
     let meta = std::fs::symlink_metadata(path)
@@ -89,7 +101,22 @@ fn search_path(
     }
     // Regular file: skip likely binaries by extension + NUL-byte sniff.
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        if matches!(ext, "png" | "jpg" | "jpeg" | "gif" | "ico" | "pdf" | "zip" | "gz" | "o" | "so" | "rlib" | "rmeta" | "lockb") {
+        if matches!(
+            ext,
+            "png"
+                | "jpg"
+                | "jpeg"
+                | "gif"
+                | "ico"
+                | "pdf"
+                | "zip"
+                | "gz"
+                | "o"
+                | "so"
+                | "rlib"
+                | "rmeta"
+                | "lockb"
+        ) {
             return Ok(());
         }
     }

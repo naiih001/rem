@@ -101,10 +101,7 @@ impl Tool for WebFetchTool {
             out.truncate(cap);
             note = format!(" [truncated to {cap} bytes]");
         }
-        Ok(format!(
-            "HTTP {}{note}\n{out}",
-            status.as_u16()
-        ))
+        Ok(format!("HTTP {}{note}\n{out}", status.as_u16()))
     }
 }
 
@@ -138,7 +135,9 @@ fn strip_tag_blocks(html: &str, tag: &str) -> String {
         }
         out.push_str(&rest[..start]);
         let after_open = &rest_lower[start..];
-        let Some(gt) = after_open.find('>') else { break; };
+        let Some(gt) = after_open.find('>') else {
+            break;
+        };
         let content_start = start + gt + 1;
         match rest_lower[content_start..].find(close_pat.as_str()) {
             Some(end) => {
@@ -176,7 +175,28 @@ fn html_to_text(html: &str) -> String {
     let no_style = strip_tag_blocks(&no_script, "style");
     // Block-level tags become line breaks before stripping.
     let mut s = no_style;
-    for tag in ["<br", "</p>", "</div>", "</h1>", "</h2>", "</h3>", "</h4>", "</h5>", "</h6>", "</li>", "</tr>", "</table>", "</blockquote>", "<p", "<div", "<li", "<h1", "<h2", "<h3", "<tr"] {
+    for tag in [
+        "<br",
+        "</p>",
+        "</div>",
+        "</h1>",
+        "</h2>",
+        "</h3>",
+        "</h4>",
+        "</h5>",
+        "</h6>",
+        "</li>",
+        "</tr>",
+        "</table>",
+        "</blockquote>",
+        "<p",
+        "<div",
+        "<li",
+        "<h1",
+        "<h2",
+        "<h3",
+        "<tr",
+    ] {
         s = replace_ci(&s, tag, "\n");
     }
     // Strip remaining tags.
@@ -364,7 +384,8 @@ fn parse_ddg_lite(html: &str, want: usize) -> Vec<(String, String, String)> {
                         }
                     }
                     let decoded = html_escape::decode_html_entities(&plain).into_owned();
-                    let collapsed: String = decoded.split_whitespace().collect::<Vec<_>>().join(" ");
+                    let collapsed: String =
+                        decoded.split_whitespace().collect::<Vec<_>>().join(" ");
                     collapsed.chars().take(300).collect()
                 })
             })
@@ -464,7 +485,13 @@ mod tests {
         let mut ctx = ToolContext::new();
         assert!(
             WebSearchTool
-                .call(&mut ctx, WebSearchArgs { query: "  ".into(), count: None })
+                .call(
+                    &mut ctx,
+                    WebSearchArgs {
+                        query: "  ".into(),
+                        count: None
+                    }
+                )
                 .await
                 .is_err()
         );

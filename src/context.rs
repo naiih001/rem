@@ -17,7 +17,9 @@ impl Context {
     pub const KEEP: usize = 40;
 
     pub fn new() -> Self {
-        Self { messages: Vec::new() }
+        Self {
+            messages: Vec::new(),
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -85,11 +87,8 @@ impl Context {
                         .map(|c| match c {
                             UserContent::Text(t) => t.text.chars().take(500).collect(),
                             UserContent::ToolResult(r) => {
-                                let texts: Vec<&str> = r
-                                    .content
-                                    .iter()
-                                    .filter_map(|c| c.as_text())
-                                    .collect();
+                                let texts: Vec<&str> =
+                                    r.content.iter().filter_map(|c| c.as_text()).collect();
                                 let joined = texts.join(" | ");
                                 let cut: String = joined.chars().take(500).collect();
                                 format!("[{} result] {cut}", r.name)
@@ -103,9 +102,7 @@ impl Context {
                     let parts: Vec<String> = content
                         .iter()
                         .map(|c| match c {
-                            AssistantContent::Text(t) => {
-                                t.text.chars().take(500).collect()
-                            }
+                            AssistantContent::Text(t) => t.text.chars().take(500).collect(),
                             AssistantContent::ToolCall(tc) => {
                                 format!("[tool call: {}]", tc.function.name)
                             }

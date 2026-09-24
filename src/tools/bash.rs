@@ -46,13 +46,16 @@ impl Tool for BashTool {
             .spawn()
             .map_err(|e| ToolError(format!("bash spawn: {e}")))?;
 
-        let output = tokio::time::timeout(
-            Duration::from_secs(TIMEOUT_SECS),
-            child.wait_with_output(),
-        )
-        .await
-        .map_err(|_| ToolError(format!("bash: timed out after {TIMEOUT_SECS}s: {}", args.command)))?
-        .map_err(|e| ToolError(format!("bash wait: {e}")))?;
+        let output =
+            tokio::time::timeout(Duration::from_secs(TIMEOUT_SECS), child.wait_with_output())
+                .await
+                .map_err(|_| {
+                    ToolError(format!(
+                        "bash: timed out after {TIMEOUT_SECS}s: {}",
+                        args.command
+                    ))
+                })?
+                .map_err(|e| ToolError(format!("bash wait: {e}")))?;
 
         let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -72,7 +75,10 @@ impl Tool for BashTool {
 
         Ok(format!(
             "exit: {}{note}\n{combined}",
-            output.status.code().map_or("signal".to_string(), |c| c.to_string())
+            output
+                .status
+                .code()
+                .map_or("signal".to_string(), |c| c.to_string())
         ))
     }
 }

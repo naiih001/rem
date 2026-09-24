@@ -36,7 +36,9 @@ pub trait AgentLoop {
     }
     /// True LLM reasoning texts captured during the most recent `chat` turn,
     /// in order. Empty when the provider emitted no `Reasoning` blocks.
-    /// Defaulted so other `AgentLoop` impls need no changes.
+    /// Defaulted so other `AgentLoop` impls need no changes. Recorded
+    /// internally but hidden from the transcript (ADR-0005).
+    #[allow(dead_code)]
     fn last_reasoning(&self) -> Vec<String> {
         Vec::new()
     }

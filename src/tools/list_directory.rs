@@ -40,7 +40,8 @@ impl Tool for ListDirectoryTool {
             .map_err(|e| ToolError(format!("list_directory {}: {e}", args.path)))?;
         let mut lines: Vec<String> = Vec::new();
         for entry in entries {
-            let entry = entry.map_err(|e| ToolError(format!("list_directory {}: {e}", args.path)))?;
+            let entry =
+                entry.map_err(|e| ToolError(format!("list_directory {}: {e}", args.path)))?;
             let ft = entry
                 .file_type()
                 .map_err(|e| ToolError(format!("list_directory {}: {e}", args.path)))?;

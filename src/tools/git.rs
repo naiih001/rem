@@ -91,7 +91,12 @@ async fn run_git(argv: Vec<String>) -> Result<String, ToolError> {
 
     let output = tokio::time::timeout(Duration::from_secs(TIMEOUT_SECS), child.wait_with_output())
         .await
-        .map_err(|_| ToolError(format!("git {}: timed out after {TIMEOUT_SECS}s", argv.join(" "))))?
+        .map_err(|_| {
+            ToolError(format!(
+                "git {}: timed out after {TIMEOUT_SECS}s",
+                argv.join(" ")
+            ))
+        })?
         .map_err(|e| ToolError(format!("git wait: {e}")))?;
 
     if !output.status.success() {
@@ -99,7 +104,10 @@ async fn run_git(argv: Vec<String>) -> Result<String, ToolError> {
         return Err(ToolError(format!(
             "git {} failed (exit {}): {}",
             argv.join(" "),
-            output.status.code().map_or("signal".to_string(), |c| c.to_string()),
+            output
+                .status
+                .code()
+                .map_or("signal".to_string(), |c| c.to_string()),
             stderr.trim()
         )));
     }
