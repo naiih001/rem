@@ -93,6 +93,22 @@ fn run_app(
         },
     )
     .context("create terminal")?;
+    // Wipe the terminal so rem owns the full screen from the start,
+    // matching Aster's clear_screen on launch. Purge clears the
+    // scrollback (cargo output, shell prompt) above the viewport.
+    {
+        use crossterm::{
+            cursor::MoveTo,
+            execute,
+            terminal::{Clear, ClearType},
+        };
+        execute!(
+            io::stdout(),
+            Clear(ClearType::All),
+            Clear(ClearType::Purge),
+            MoveTo(0, 0),
+        )?;
+    }
 
     let mut app = App::new(model);
     // The approval channel is tokio mpsc; the TUI loop is sync crossterm, so
