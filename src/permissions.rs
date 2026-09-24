@@ -339,8 +339,18 @@ fn split_segments(cmd: &str) -> Vec<String> {
                 cur.push(c);
             }
             '#' => {
-                // Comment to end of line (only when not quoted).
-                break;
+                // Comment to end of LINE only: flush the pending segment,
+                // skip to `\n`, keep scanning. Breaking entirely would
+                // silently drop trailing commands (`a # c\nrm ...` -> Allow).
+                if !cur.trim().is_empty() {
+                    out.push(cur.trim().to_string());
+                }
+                cur.clear();
+                for nc in chars.by_ref() {
+                    if nc == '\n' {
+                        break;
+                    }
+                }
             }
             ';' | '\n' => {
                 if !cur.trim().is_empty() {

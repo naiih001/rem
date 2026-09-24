@@ -31,6 +31,25 @@
 - **Session rule**: An `always allow` decision cached for the process lifetime (e.g. always allow `cargo test`). Scoped by exact tool + normalized args, never by prefix alone.
 - **Audit trail**: Every decision appends a `permission ...` system block to the transcript.
 
+## Input area (ADR-0004, Aster-style)
+
+- **Input band**: 3-row shaded composer (`PANE_BG` `#191919`): 1-row vertical padding around the text line. Middle row = 1-column inset + `❯ ` prompt + input window.
+- **Status row**: Zero-height when idle; 1 row when busy or approvals queued. Busy = braille spinner + `working · {s}s · esc to interrupt`. Approval = `waiting approval (N queued)` + key hints.
+- **Gap row**: 1 terminal-bg row separating the transcript from the bottom pane. The shaded band starts at the input, not the gap.
+- **Footer**: Single quiet line: `▶▶▶ edit · {model} · {N} turns · hints`. No busy readout; busy state lives in the status row.
+
+## Message list (ADR-0005, Aster-style)
+
+- **Scrollback model**: Finished rows print into the terminal's own scrollback and are never touched again. Only the bottom pane stays managed. No Tab selection, no expand/collapse, no click-toggle, no in-app scroll.
+- **Chapter mark**: The user row — filled band (`rail_bg`) with accent left rail (`▌`) + `❯ ` prompt. The only banded row; not a bullet.
+- **Bullet row**: Every other row — dim `• ` glyph with hanging indent (continuations indent under the bullet, 2-column gutter).
+- **Tool row**: Flat, one group per tool call. Bold label line + dim nested sub-rows, `└` branch on the first sub-row.
+- **Patch row**: `▸ verb path` + `+N −M` counts pushed right, then a tinted body: full-row add/del background bands with a darker mark glyph.
+- **Elision**: Long tool output renders first 4 + last 4 lines with a gap marker. No expand; the tail is always visible.
+- **Hidden thinking**: Reasoning recorded internally, never printed. No marker row.
+- **Live stream**: Each resolved tool prints immediately into scrollback.
+- **Trailer**: `• Done ({elapsed}s · N tools)`. File counts, `+/-`, cost are later slices.
+
 ## Non-goals (v1)
 
 - True OS sandboxing (namespaces, seccomp, grsecurity). The gate is a *policy + human* layer, not a kernel boundary.
