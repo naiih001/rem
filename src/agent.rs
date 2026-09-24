@@ -16,6 +16,7 @@ use rig::{
 use crate::{
     config::Config,
     context::Context,
+    permissions::{ApprovalTx, PermissionHook},
     tools::{
         BashTool, EditTool, GitDiffTool, GitStatusTool, GlobTool, GrepTool, ListDirectoryTool,
         ReadTool, WebFetchTool, WebSearchTool, WriteTool,
@@ -194,7 +195,11 @@ pub struct RigAgent {
 }
 
 impl RigAgent {
-    pub fn new(cfg: &Config) -> Result<Self, String> {
+    pub fn new(
+        cfg: &Config,
+        approval_tx: ApprovalTx,
+        project_root: std::path::PathBuf,
+    ) -> Result<Self, String> {
         // Explicit `.base_url()` per spec — no reliance on OPENAI_BASE_URL env.
         let client = openai::CompletionsClient::builder()
             .api_key(cfg.api_key.clone())
@@ -205,6 +210,8 @@ impl RigAgent {
         let model = client.completion_model(cfg.model.clone());
 
         let recorder = ToolRecorder::default();
+        // Observer first (sees everything), gate second (steers). ADR-0001.
+        let gate = PermissionHook::new(approval_tx, project_root);
 
         let agent = AgentBuilder::new(model)
             .preamble(
@@ -212,7 +219,7 @@ impl RigAgent {
                  Use the read/write/edit/bash/list_directory/git_status/git_diff/grep/glob/web_fetch/web_search tools to inspect and change files. \
                  list_directory lists a dir, glob finds files by pattern, grep searches contents, git_status/git_diff inspect git state. \
                  web_search searches the web (DuckDuckGo, no key), web_fetch reads a URL as text. \
-                 Bash runs `sh -c` in the project dir (30s timeout) and is unrestricted. \
+                 Bash runs `sh -c` in the project dir (30s timeout). Destructive shell patterns are blocked outright; other mutations and network access ask the human for approval mid-run — if a call is denied, replan without it. \
                  Prefer reading a file before editing it. Keep replies concise.",
             )
             .tool(ReadTool)
@@ -228,6 +235,7 @@ impl RigAgent {
             .tool(WebSearchTool)
             .default_max_turns(100)
             .add_hook(recorder.clone())
+            .add_hook(gate)
             .build();
 
         Ok(Self {

@@ -1,6 +1,7 @@
 mod agent;
 mod config;
 mod context;
+mod permissions;
 mod tools;
 mod tui;
 
@@ -19,7 +20,10 @@ async fn main() {
         }
     };
 
-    let agent = match RigAgent::new(&cfg) {
+    let project_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let (approval_tx, approval_rx) = permissions::approval_channel();
+
+    let agent = match RigAgent::new(&cfg, approval_tx, project_root) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("rem: {e}");
@@ -27,7 +31,7 @@ async fn main() {
         }
     };
 
-    if let Err(e) = RatatuiBackend::new().run(agent) {
+    if let Err(e) = RatatuiBackend::new().run(agent, approval_rx) {
         eprintln!("rem: TUI error: {e:#}");
         std::process::exit(1);
     }

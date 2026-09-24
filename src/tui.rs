@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::{self, Stdout};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
@@ -13,20 +14,25 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Terminal,
 };
 use unicode_width::UnicodeWidthStr;
 
 use crate::agent::{AgentLoop, ToolEvent};
+use crate::permissions::{ApprovalDecision, ApprovalRequest, ApprovalRx};
 
 /// Swappable UI abstraction. `RatatuiBackend` is the Ratatui implementation;
 /// the old Cursive backend was removed in favor of this Aster-styled UI.
 pub trait TuiBackend {
-    fn run(self, agent: impl AgentLoop + Send + Sync + 'static) -> anyhow::Result<()>;
+    fn run(
+        self,
+        agent: impl AgentLoop + Send + Sync + 'static,
+        approval_rx: ApprovalRx,
+    ) -> anyhow::Result<()>;
 }
 
 pub struct RatatuiBackend;
@@ -38,8 +44,12 @@ impl RatatuiBackend {
 }
 
 impl TuiBackend for RatatuiBackend {
-    fn run(self, agent: impl AgentLoop + Send + Sync + 'static) -> anyhow::Result<()> {
-        run_app(agent)
+    fn run(
+        self,
+        agent: impl AgentLoop + Send + Sync + 'static,
+        approval_rx: ApprovalRx,
+    ) -> anyhow::Result<()> {
+        run_app(agent, approval_rx)
     }
 }
 
@@ -59,7 +69,10 @@ struct ThinkMsg {
     summary: String,
 }
 
-fn run_app(agent: impl AgentLoop + Send + Sync + 'static) -> anyhow::Result<()> {
+fn run_app(
+    agent: impl AgentLoop + Send + Sync + 'static,
+    approval_rx: ApprovalRx,
+) -> anyhow::Result<()> {
     let model = agent.model_name();
     let agent = Arc::new(agent);
     let (tx, rx) = mpsc::channel::<TurnResult>();
@@ -73,7 +86,19 @@ fn run_app(agent: impl AgentLoop + Send + Sync + 'static) -> anyhow::Result<()> 
     let mut terminal = Terminal::new(backend).context("create terminal")?;
 
     let mut app = App::new(model);
-    let outcome = event_loop(&mut terminal, &mut app, agent, &rx, tx, &think_rx, think_tx);
+    // The approval channel is tokio mpsc; the TUI loop is sync crossterm, so
+    // poll with try_recv (never block the 50ms frame).
+    let mut approval_rx = approval_rx;
+    let outcome = event_loop(
+        &mut terminal,
+        &mut app,
+        agent,
+        &rx,
+        tx,
+        &think_rx,
+        think_tx,
+        &mut approval_rx,
+    );
 
     disable_raw_mode().ok();
     execute!(
@@ -195,6 +220,34 @@ struct App {
     selected: Option<BlockId>,
     /// Last Esc press, for double-Esc quit.
     last_esc: Option<Instant>,
+    /// Pending human approvals (FIFO). Head renders as a blocking modal;
+    /// resolving it resumes the parked agent worker in the same run.
+    pending_approvals: VecDeque<ApprovalRequest>,
+}
+
+/// Resolve a queued approval: send the decision over the oneshot and record
+/// an audit block. A dropped/closed oneshot means the worker already moved
+/// on; the request is simply forgotten.
+fn resolve_approval(app: &mut App, decision: ApprovalDecision) {
+    let Some(req) = app.pending_approvals.pop_front() else {
+        return;
+    };
+    let label = match decision {
+        ApprovalDecision::Approve => "approved",
+        ApprovalDecision::ApproveAlways => "approved (always this session)",
+        ApprovalDecision::Deny => "denied",
+        ApprovalDecision::AbortTurn => "aborted turn",
+    };
+    let _ = req.reply.send(decision);
+    app.blocks.push(MessageBlock::System {
+        text: format!(
+            "permission {}: {}({})",
+            label, req.tool_name, req.args_preview
+        ),
+    });
+    app.cap_blocks();
+    app.pinned = true;
+    app.dirty = true;
 }
 
 /// One tool observation streamed live during a busy turn.
@@ -238,6 +291,7 @@ impl App {
             dirty: true,
             selected: None,
             last_esc: None,
+            pending_approvals: VecDeque::new(),
         };
         app.push_system("rem — /quit or esc×2 exits, /clear clears, tab selects blocks.");
         app
@@ -392,6 +446,11 @@ fn short_home(path: &str) -> String {
     }
 }
 
+/// Main loop: drains turn/live/approval channels, renders, routes input.
+/// Eight args is one over the default lint: the five channels plus terminal,
+/// app, and agent are each a distinct pipe and bundling them would obscure
+/// the drain order below.
+#[allow(clippy::too_many_arguments)]
 fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
@@ -400,12 +459,19 @@ fn event_loop(
     tx: mpsc::Sender<TurnResult>,
     think_rx: &mpsc::Receiver<ThinkMsg>,
     think_tx: mpsc::Sender<ThinkMsg>,
+    approval_rx: &mut ApprovalRx,
 ) -> anyhow::Result<()> {
     loop {
         // Drain live tool observations: each resolved tool appends to the
         // trailing live row inline in the messages area.
         while let Ok(msg) = think_rx.try_recv() {
             app.push_live_tool(msg);
+        }
+        // Drain approval requests into the modal queue. The agent worker is
+        // parked on its oneshot; the same run resumes on resolve.
+        while let Ok(req) = approval_rx.try_recv() {
+            app.pending_approvals.push_back(req);
+            app.dirty = true;
         }
         // Drain completed turns without blocking the UI.
         while let Ok(turn) = rx.try_recv() {
@@ -417,7 +483,7 @@ fn event_loop(
             app.push_turn(&turn.events, &turn.reasoning, &turn.result);
         }
 
-        if app.dirty || app.busy {
+        if app.dirty || app.busy || !app.pending_approvals.is_empty() {
             terminal
                 .draw(|f| render(f, app))
                 .context("draw frame")?;
@@ -474,6 +540,31 @@ fn handle_key(
     code: KeyCode,
     mods: KeyModifiers,
 ) -> bool {
+    // Approval modal owns every keystroke while pending: y/a/n/x (+Enter as
+    // approve). Ctrl+C still clears nothing here; Esc never dismisses — the
+    // worker is parked and must receive an explicit decision.
+    if !app.pending_approvals.is_empty() {
+        // Ctrl combos are ignored in the modal (no input line to clear).
+        if mods.contains(KeyModifiers::CONTROL) {
+            return false;
+        }
+        match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                resolve_approval(app, ApprovalDecision::Approve);
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                resolve_approval(app, ApprovalDecision::ApproveAlways);
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                resolve_approval(app, ApprovalDecision::Deny);
+            }
+            KeyCode::Char('x') | KeyCode::Char('X') => {
+                resolve_approval(app, ApprovalDecision::AbortTurn);
+            }
+            _ => {}
+        }
+        return false;
+    }
     if mods.contains(KeyModifiers::CONTROL) {
         return handle_ctrl(app, code);
     }
@@ -979,6 +1070,70 @@ fn render(f: &mut ratatui::Frame, app: &mut App) {
     render_body(f, app, chunks[1]);
     render_input(f, app, chunks[2]);
     render_footer(f, app, chunks[3]);
+    // Approval modal last: centered overlay over the whole frame.
+    if let Some(req) = app.pending_approvals.front() {
+        render_approval_modal(f, f.area(), req, app.pending_approvals.len());
+    }
+}
+
+/// Centered approval modal for the head pending request. Blocks the frame
+/// visually; `handle_key` blocks input routing until resolved.
+fn render_approval_modal(f: &mut ratatui::Frame, area: Rect, req: &ApprovalRequest, queued: usize) {
+    let w = (area.width.saturating_sub(8)).clamp(40, 76);
+    let h = 11u16;
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let modal = Rect::new(x, y, w, h);
+    f.render_widget(Clear, modal);
+    let block = Block::default()
+        .title(format!(
+            " permission — approval needed{} ",
+            match queued > 1 {
+                true => format!(" (1 of {queued})"),
+                false => String::new(),
+            }
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(modal);
+    f.render_widget(block, modal);
+    let arg_line = match req.args_preview.chars().count() > inner.width as usize {
+        true => format!(
+            "{}…",
+            req.args_preview.chars().take(inner.width as usize - 1).collect::<String>()
+        ),
+        false => req.args_preview.clone(),
+    };
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(
+                format!("{} ", req.tool_name),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!("({arg_line})")),
+        ]),
+        Line::from(vec![Span::styled(
+            req.reason.clone(),
+            Style::default().fg(Color::DarkGray),
+        )]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("[y] approve  ", Style::default().fg(Color::Green)),
+            Span::styled("[a] always this session  ", Style::default().fg(Color::Green)),
+            Span::styled("[n] deny  ", Style::default().fg(Color::Red)),
+            Span::styled("[x] abort turn", Style::default().fg(Color::Red)),
+        ]),
+        Line::from(vec![Span::styled(
+            "deny returns feedback so the model replans in the same run.",
+            Style::default().fg(Color::DarkGray),
+        )]),
+    ];
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        inner,
+    );
 }
 
 /// Messages area: flatten every block to styled lines, then scroll like the
@@ -1298,6 +1453,9 @@ fn render_footer(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect)
         ),
     ];
     let right_text = match (&app.status, app.busy) {
+        (_, true) if !app.pending_approvals.is_empty() => {
+            format!("waiting approval ({} queued)", app.pending_approvals.len())
+        }
         (_, true) => {
             let dots = 1 + (app.busy_since.elapsed().as_millis() / 400 % 3) as usize;
             format!("thinking{}", ".".repeat(dots))
@@ -1308,6 +1466,7 @@ fn render_footer(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect)
         },
     };
     let right_style = match (&app.status, app.busy) {
+        (_, true) if !app.pending_approvals.is_empty() => Style::default().fg(Color::Yellow),
         (_, true) => Style::default().fg(Color::Yellow),
         (_, _) => match app.status {
             Status::Ready => Style::default().fg(Color::DarkGray),
@@ -1563,5 +1722,78 @@ mod tests {
         assert!(app.click_toggle(0, 80));
         assert_eq!(app.selected, Some(0));
         assert!(app.blocks[0].is_expanded());
+    }
+
+    fn approval_req(tool: &str, preview: &str) -> (ApprovalRequest, tokio::sync::oneshot::Receiver<ApprovalDecision>) {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let req = ApprovalRequest {
+            tool_name: tool.to_string(),
+            args_preview: preview.to_string(),
+            full_args: serde_json::json!({}),
+            reason: "needs approval".to_string(),
+            reply,
+        };
+        (req, rx)
+    }
+
+    #[test]
+    fn modal_keys_resolve_approval_with_audit_block() {
+        let mut app = App::new("model".to_string());
+        app.blocks.clear();
+        let (req, rx) = approval_req("bash", "cargo test");
+        app.pending_approvals.push_back(req);
+        // Bare keys only: y approves.
+        let agent = std::sync::Arc::new(StubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        assert!(!handle_key(&mut app, &agent, &tx, &think_tx, KeyCode::Char('y'), KeyModifiers::empty()));
+        assert!(app.pending_approvals.is_empty());
+        assert!(rx.blocking_recv().is_ok());
+        assert!(app.blocks.iter().any(|b| matches!(b, MessageBlock::System { text } if text.contains("permission approved"))));
+    }
+
+    #[test]
+    fn modal_deny_and_abort_map_to_decisions() {
+        for (key, expect) in [
+            (KeyCode::Char('n'), ApprovalDecision::Deny),
+            (KeyCode::Char('x'), ApprovalDecision::AbortTurn),
+            (KeyCode::Char('a'), ApprovalDecision::ApproveAlways),
+        ] {
+            let mut app = App::new("model".to_string());
+            app.blocks.clear();
+            let (req, rx) = approval_req("write", "a.txt");
+            app.pending_approvals.push_back(req);
+            let agent = std::sync::Arc::new(StubAgent);
+            let (tx, _rx) = mpsc::channel::<TurnResult>();
+            let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+            assert!(!handle_key(&mut app, &agent, &tx, &think_tx, key, KeyModifiers::empty()));
+            assert_eq!(rx.blocking_recv().unwrap(), expect);
+        }
+    }
+
+    #[test]
+    fn modal_renders_tool_and_key_hints() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("test-model".to_string());
+        app.blocks.clear();
+        let (req, _rx) = approval_req("bash", "cargo test");
+        app.pending_approvals.push_back(req);
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let text = terminal.backend().to_string();
+        assert!(text.contains("approval needed"), "got: {text}");
+        assert!(text.contains("cargo test"), "got: {text}");
+        assert!(text.contains("[y] approve"), "got: {text}");
+        assert!(text.contains("[n] deny"), "got: {text}");
+    }
+
+    struct StubAgent;
+
+    #[async_trait::async_trait]
+    impl AgentLoop for StubAgent {
+        async fn chat(&self, _prompt: &str) -> Result<String, String> {
+            Ok(String::new())
+        }
     }
 }
