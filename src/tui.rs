@@ -46,10 +46,19 @@ struct TurnResult {
     events: Vec<ToolEvent>,
 }
 
+/// One live tool observation pushed from the hook while a turn is running.
+struct ThinkMsg {
+    name: String,
+    preview: String,
+    ok: bool,
+    summary: String,
+}
+
 fn run_app(agent: impl AgentLoop + Send + Sync + 'static) -> anyhow::Result<()> {
     let model = agent.model_name();
     let agent = Arc::new(agent);
     let (tx, rx) = mpsc::channel::<TurnResult>();
+    let (think_tx, think_rx) = mpsc::channel::<ThinkMsg>();
 
     enable_raw_mode().context("enable raw mode")?;
     let mut stdout = io::stdout();
@@ -58,7 +67,7 @@ fn run_app(agent: impl AgentLoop + Send + Sync + 'static) -> anyhow::Result<()> 
     let mut terminal = Terminal::new(backend).context("create terminal")?;
 
     let mut app = App::new(model);
-    let outcome = event_loop(&mut terminal, &mut app, agent, &rx, tx);
+    let outcome = event_loop(&mut terminal, &mut app, agent, &rx, tx, &think_rx, think_tx);
 
     disable_raw_mode().ok();
     execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
@@ -85,6 +94,22 @@ struct App {
     /// Wrapped line count from the last render; anchors scrollback.
     rendered_total: usize,
     dirty: bool,
+    /// Live tool feed for the current turn. The hook pushes here via a
+    /// channel as each tool resolves; the turn-completion path replays them
+    /// into the transcript. Collapsible with Ctrl+D.
+    thinking: Vec<LiveTool>,
+    thinking_open: bool,
+    /// Last Esc press, for double-Esc quit.
+    last_esc: Option<Instant>,
+}
+
+/// One tool observation streamed live during a busy turn.
+#[derive(Debug, Clone)]
+struct LiveTool {
+    name: String,
+    preview: String,
+    ok: bool,
+    summary: String,
 }
 
 #[derive(Clone)]
@@ -117,8 +142,11 @@ impl App {
             view_h: 10,
             rendered_total: 0,
             dirty: true,
+            thinking: Vec::new(),
+            thinking_open: true,
+            last_esc: None,
         };
-        app.push_system("rem — Aster-style TUI. /quit exits, /clear clears history view.");
+        app.push_system("rem — /quit or esc×2 exits, /clear clears, ctrl+d toggles thinking.");
         app
     }
 
@@ -264,8 +292,21 @@ fn event_loop(
     agent: Arc<impl AgentLoop + Send + Sync + 'static>,
     rx: &mpsc::Receiver<TurnResult>,
     tx: mpsc::Sender<TurnResult>,
+    think_rx: &mpsc::Receiver<ThinkMsg>,
+    think_tx: mpsc::Sender<ThinkMsg>,
 ) -> anyhow::Result<()> {
     loop {
+        // Drain live tool observations first so the thinking block updates
+        // while the turn is still running.
+        while let Ok(msg) = think_rx.try_recv() {
+            app.thinking.push(LiveTool {
+                name: msg.name,
+                preview: msg.preview,
+                ok: msg.ok,
+                summary: msg.summary,
+            });
+            app.dirty = true;
+        }
         // Drain completed turns without blocking the UI.
         while let Ok(turn) = rx.try_recv() {
             app.busy = false;
@@ -274,6 +315,7 @@ fn event_loop(
                 app.status = Status::Ready;
             }
             app.push_turn(&turn.events, &turn.result);
+            app.thinking.clear();
         }
 
         if app.dirty || app.busy {
@@ -281,6 +323,7 @@ fn event_loop(
                 .draw(|f| render(f, app))
                 .context("draw frame")?;
             // Place the hardware cursor inside the input line.
+            // Layout: bar(1) header(1) body(?) think(?) input(1) footer(1).
             let area = terminal.size().unwrap_or_default();
             let x = app.cursor_x(area.width);
             let y = area.height.saturating_sub(2);
@@ -294,7 +337,7 @@ fn event_loop(
         if event::poll(Duration::from_millis(50)).context("poll events")? {
             match event::read().context("read event")? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
-                    if handle_key(app, &agent, &tx, key.code, key.modifiers) {
+                    if handle_key(app, &agent, &tx, &think_tx, key.code, key.modifiers) {
                         return Ok(());
                     }
                     app.dirty = true;
@@ -313,6 +356,7 @@ fn handle_key(
     app: &mut App,
     agent: &Arc<impl AgentLoop + Send + Sync + 'static>,
     tx: &mpsc::Sender<TurnResult>,
+    think_tx: &mpsc::Sender<ThinkMsg>,
     code: KeyCode,
     mods: KeyModifiers,
 ) -> bool {
@@ -320,7 +364,7 @@ fn handle_key(
         return handle_ctrl(app, code);
     }
     match code {
-        KeyCode::Enter => return submit(app, agent, tx),
+        KeyCode::Enter => return submit(app, agent, tx, think_tx),
         KeyCode::Backspace => {
             if app.cursor > 0 {
                 app.cursor -= 1;
@@ -367,6 +411,14 @@ fn handle_key(
             app.scroll = app.scroll.saturating_add(app.view_h.max(1));
         }
         KeyCode::Esc => {
+            let now = Instant::now();
+            let double = app
+                .last_esc
+                .is_some_and(|t| now.duration_since(t) < Duration::from_millis(600));
+            app.last_esc = Some(now);
+            if double {
+                return true;
+            }
             app.input.clear();
             app.cursor = 0;
         }
@@ -380,7 +432,18 @@ fn handle_key(
 
 fn handle_ctrl(app: &mut App, code: KeyCode) -> bool {
     match code {
-        KeyCode::Char('c') | KeyCode::Char('d') => true,
+        // Ctrl+D toggles the thinking block.
+        KeyCode::Char('d') => {
+            app.thinking_open = !app.thinking_open;
+            app.dirty = true;
+            false
+        }
+        // Ctrl+C clears the input line (quit is Ctrl+D-free: double-Esc or /quit).
+        KeyCode::Char('c') => {
+            app.input.clear();
+            app.cursor = 0;
+            false
+        }
         KeyCode::Char('u') => {
             app.input.clear();
             app.cursor = 0;
@@ -398,6 +461,7 @@ fn submit(
     app: &mut App,
     agent: &Arc<impl AgentLoop + Send + Sync + 'static>,
     tx: &mpsc::Sender<TurnResult>,
+    think_tx: &mpsc::Sender<ThinkMsg>,
 ) -> bool {
     let text = app.input.trim().to_string();
     if text.is_empty() || app.busy {
@@ -430,11 +494,44 @@ fn submit(
     app.busy_since = Instant::now();
     app.status = Status::Ready;
     app.pinned = true;
+    // Fresh thinking feed for this turn; worker pushes live tools into it.
+    app.thinking.clear();
+    app.thinking_open = true;
 
     let agent = Arc::clone(agent);
     let tx = tx.clone();
+    let think_tx = think_tx.clone();
+    // Snapshot how many tools the recorder already holds so the watcher only
+    // forwards tools from THIS turn.
+    let seen = agent.last_tool_events().len();
     tokio::spawn(async move {
+        // Poll the recorder and forward new tools live. Chat is blocking, so
+        // this is the live feed without switching to streaming.
+        let watch_agent = Arc::clone(&agent);
+        let watcher = tokio::spawn(async move {
+            let mut forwarded = seen;
+            loop {
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                let events = watch_agent.last_tool_events();
+                if events.len() <= forwarded {
+                    // Stop probing once the turn result arrives: the main
+                    // task below sends TurnResult right after chat returns.
+                    continue;
+                }
+                for ev in events.iter().skip(forwarded) {
+                    let _ = think_tx.send(ThinkMsg {
+                        name: ev.name.clone(),
+                        preview: ev.arg_preview(),
+                        ok: ev.ok,
+                        summary: ev.summary.clone(),
+                    });
+                }
+                forwarded = events.len();
+            }
+        });
         let result = agent.chat(&text).await;
+        watcher.abort();
+        // Forward anything the 80ms poll missed between last probe and return.
         let events = agent.last_tool_events();
         let _ = tx.send(TurnResult { result, events });
     });
@@ -545,22 +642,29 @@ fn visible_window(input: &str, cursor: usize, max_w: usize) -> (String, usize) {
 
 fn render(f: &mut ratatui::Frame, app: &mut App) {
     let area = f.area();
+    // Thinking block height: header row + 2 rows per live tool (name row +
+    // summary row), capped at 3 tools. Only while busy and expanded.
+    // Collapsed is zero rows (Ctrl+D toggles).
+    let think_rows = think_rows_for(app.busy, app.thinking_open, app.thinking.len());
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
-            Constraint::Min(0),
-            Constraint::Length(1),
-            Constraint::Length(1),
+            Constraint::Length(1), // activity bar
+            Constraint::Length(1), // header
+            Constraint::Min(0),    // transcript
+            Constraint::Length(think_rows),
+            Constraint::Length(1), // input
+            Constraint::Length(1), // footer
         ])
         .split(area);
-    app.view_h = chunks[1].height;
+    app.view_h = chunks[2].height;
 
-    render_header(f, app, chunks[0]);
+    render_activity(f, app, chunks[0]);
+    render_header(f, app, chunks[1]);
     // Ratatui 0.29 clamps nothing: lines with y < scroll.y are skipped and
     // the rest shift up, so pin-to-bottom must be an explicit offset from the
     // last wrapped line count. `rendered_total` trails by one frame at most.
-    let body_h = chunks[1].height as usize;
+    let body_h = chunks[2].height as usize;
     let bottom = app.rendered_total.saturating_sub(body_h) as u16;
     let scroll = match app.pinned {
         true => bottom,
@@ -569,10 +673,103 @@ fn render(f: &mut ratatui::Frame, app: &mut App) {
     let body = Paragraph::new(app.transcript.clone())
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
-    app.rendered_total = count_wrapped(&app.transcript, chunks[1].width as usize);
-    f.render_widget(body, chunks[1]);
-    render_input(f, app, chunks[2]);
-    render_footer(f, app, chunks[3]);
+    app.rendered_total = count_wrapped(&app.transcript, chunks[2].width as usize);
+    f.render_widget(body, chunks[2]);
+    if think_rows > 0 {
+        render_thinking(f, app, chunks[3]);
+    }
+    render_input(f, app, chunks[4]);
+    render_footer(f, app, chunks[5]);
+}
+
+/// Fast left-to-right sweeper shown while the agent works.
+/// A bright segment bounces across the top row; idle renders blank.
+fn render_activity(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
+    if !app.busy || area.width == 0 {
+        return;
+    }
+    let w = area.width as usize;
+    // ~140ms per step: visibly fast without strobing.
+    let step = (app.busy_since.elapsed().as_millis() / 140) as usize;
+    let head = sweep_head(w, step);
+    let seg = 12usize.min(w);
+    let mut bar = String::with_capacity(w);
+    for i in 0..w {
+        let on = i >= head && i < head + seg;
+        bar.push(match on {
+            true => '━',
+            false => '─',
+        });
+    }
+    let line = Line::from(vec![Span::styled(
+        bar,
+        Style::default().fg(Color::Cyan),
+    )]);
+    f.render_widget(Paragraph::new(line), area);
+}
+
+/// Bounce position of the activity-bar head: sweeps left-to-right then back,
+/// so short terminals still show motion instead of a stuck edge.
+fn sweep_head(width: usize, step: usize) -> usize {
+    let seg = 12usize.min(width);
+    let span = width.saturating_sub(seg).max(1);
+    let pos = step % (span * 2);
+    match pos < span {
+        true => pos,
+        false => span * 2 - pos,
+    }
+}
+
+/// Thinking-block height in rows: 1 header + 2 rows per live tool,
+/// capped at 3 tools. Zero when idle or collapsed.
+fn think_rows_for(busy: bool, open: bool, tools: usize) -> u16 {
+    match busy && open {
+        true => 1 + (tools.clamp(1, 3) * 2) as u16,
+        false => 0,
+    }
+}
+
+/// Collapsible live thinking block: current tool feed while busy.
+/// Toggle with Ctrl+D. Shows live tool rows, elapsed time, and hint.
+fn render_thinking(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
+    let elapsed = app.busy_since.elapsed().as_secs();
+    let mut lines = vec![Line::from(vec![
+        Span::styled("◌ thinking", Style::default().fg(Color::Cyan)),
+        Span::styled(
+            format!(" · {}s · {} tool{}", elapsed, app.thinking.len(), match app.thinking.len() == 1 {
+                true => "",
+                false => "s",
+            }),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(" · ctrl+d to collapse", Style::default().fg(Color::DarkGray)),
+    ])];
+    if app.thinking.is_empty() {
+        lines.push(Line::from(vec![Span::styled(
+            "  └ working…",
+            Style::default().fg(Color::DarkGray),
+        )]));
+    } else {
+        for t in app.thinking.iter().rev().take(3).rev() {
+            let mark = match t.ok {
+                true => "└",
+                false => "✗",
+            };
+            let mark_style = match t.ok {
+                true => Style::default().fg(Color::DarkGray),
+                false => Style::default().fg(Color::Red),
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {mark} "), mark_style),
+                Span::raw(format!("{} {}", t.name, t.preview)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("    ", Style::default()),
+                Span::styled(t.summary.clone(), Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+    }
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 /// Wrapped line count of the transcript at `width`, mirroring
@@ -654,6 +851,7 @@ fn render_footer(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect)
             format!("edit · {} · {} turn{}", app.model, app.turns, if app.turns == 1 { "" } else { "s" }),
             Style::default().fg(Color::DarkGray),
         ),
+        Span::styled(" · ctrl+d think · esc×2 quit", Style::default().fg(Color::DarkGray)),
     ];
     let right_text = match (&app.status, app.busy) {
         (_, true) => {
@@ -752,5 +950,32 @@ mod tests {
         let (v, c) = visible_window("abcdefgh", 2, 5);
         assert_eq!(v, "abcde");
         assert_eq!(c, 2);
+    }
+
+    #[test]
+    fn sweep_head_bounces_within_bounds() {
+        let w = 40;
+        let seg = 12usize.min(w);
+        let max_head = w - seg;
+        // Starts at left, moves right, bounces at the far edge.
+        assert_eq!(sweep_head(w, 0), 0);
+        assert_eq!(sweep_head(w, 5), 5);
+        assert_eq!(sweep_head(w, max_head), max_head);
+        // One step past the edge it heads back left.
+        assert_eq!(sweep_head(w, max_head + 1), max_head - 1);
+        // Never exceeds the segment window.
+        for step in 0..200 {
+            assert!(sweep_head(w, step) + seg <= w);
+        }
+    }
+
+    #[test]
+    fn think_rows_match_two_line_tool_rows() {
+        assert_eq!(think_rows_for(false, true, 5), 0);
+        assert_eq!(think_rows_for(true, false, 5), 0);
+        assert_eq!(think_rows_for(true, true, 0), 3);
+        assert_eq!(think_rows_for(true, true, 1), 3);
+        assert_eq!(think_rows_for(true, true, 3), 7);
+        assert_eq!(think_rows_for(true, true, 9), 7);
     }
 }
