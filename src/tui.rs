@@ -234,7 +234,7 @@ struct App {
     /// Pending human approvals (FIFO). Head renders as a blocking modal;
     /// resolving it resumes the parked agent worker in the same run.
     pending_approvals: VecDeque<ApprovalRequest>,
-    /// In-flight turn worker + live-feed watcher (Task 1 / ADR-0005).
+    /// In-flight turn worker + live-feed watcher (Task 1 / ADR-0006).
     /// D1: `tokio::spawn` tasks are independent — aborting the outer chat
     /// task does NOT stop a nested watcher, so `submit()` spawns the 80ms
     /// watcher as a sibling and both handles are stored here for `abort_turn`.
@@ -271,7 +271,7 @@ fn resolve_approval(app: &mut App, decision: ApprovalDecision) {
     app.dirty = true;
 }
 
-/// Abort the in-flight turn worker + live-feed watcher (Task 1 / ADR-0005).
+/// Abort the in-flight turn worker + live-feed watcher (Task 1 / ADR-0006).
 /// Keeps partial output: the live feed row becomes final `ToolCall` blocks,
 /// then a system `interrupted.` marker + `Interrupted (N tools)` trailer.
 /// D1: the watcher is a sibling task (see `submit`), so both stored handles
@@ -664,7 +664,7 @@ fn handle_key(
                 resolve_approval(app, ApprovalDecision::AbortTurn);
             }
             KeyCode::Esc => {
-                // Task 2 / ADR-0005: modal Esc is AbortTurn, same path
+                // Task 2 / ADR-0006: modal Esc is AbortTurn, same path
                 // as `x` (→ ToolCallAction::stop); never silently dismissed.
                 resolve_approval(app, ApprovalDecision::AbortTurn);
             }
@@ -675,7 +675,7 @@ fn handle_key(
     if mods.contains(KeyModifiers::CONTROL) {
         return handle_ctrl(app, code);
     }
-    // Esc matrix (Task 2 / ADR-0005): busy-first so selected+busy
+    // Esc matrix (Task 2 / ADR-0006): busy-first so selected+busy
     // interrupts; selected+idle deselects; idle is a no-op. No Esc
     // sequence quits (double-Esc quit removed).
     if code == KeyCode::Esc {
@@ -784,7 +784,7 @@ fn handle_selected_key(app: &mut App, code: KeyCode) -> bool {
             false
         }
         KeyCode::Esc => {
-            // Task 2 / ADR-0005: busy wins over selection; idle Esc
+            // Task 2 / ADR-0006: busy wins over selection; idle Esc
             // only deselects. Never quits.
             if app.busy {
                 abort_turn(app);
@@ -816,7 +816,7 @@ fn handle_selected_key(app: &mut App, code: KeyCode) -> bool {
 
 fn handle_ctrl(app: &mut App, code: KeyCode) -> bool {
     match code {
-        // Task 4 / ADR-0005: Ctrl+C is strict clear-only — clears the
+        // Task 4 / ADR-0006: Ctrl+C is strict clear-only — clears the
         // input line, never interrupts, never quits (quit is Ctrl+D-on-empty
         // or /quit). Ignored in the modal via the CONTROL early-return in
         // `handle_key` above.
@@ -835,7 +835,7 @@ fn handle_ctrl(app: &mut App, code: KeyCode) -> bool {
             false
         }
         KeyCode::Char('d') => {
-            // Task 3 / ADR-0005 (D3): Ctrl+D quits only when the input
+            // Task 3 / ADR-0006 (D3): Ctrl+D quits only when the input
             // line is empty — non-empty is a no-op (Unix convention, never
             // deletes). Empty + modal: resolve the head approval as
             // AbortTurn (same path as `x`/Esc → ToolCallAction::stop) so
