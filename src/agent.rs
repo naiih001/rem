@@ -178,7 +178,10 @@ fn first_line(s: &str, max: usize) -> String {
     let line = s.lines().next().unwrap_or("").trim();
     const ELLIPSIS: char = '…';
     match line.chars().count() > max {
-        true => format!("{}…", line.chars().take(max - 1).collect::<String>().trim_end()),
+        true => format!(
+            "{}…",
+            line.chars().take(max - 1).collect::<String>().trim_end()
+        ),
         false => line.to_string().replace(ELLIPSIS, "..."),
     }
 }
@@ -210,7 +213,7 @@ impl RigAgent {
         let model = client.completion_model(cfg.model.clone());
 
         let recorder = ToolRecorder::default();
-        // Observer first (sees everything), gate second (steers). ADR-0001.
+        // Observer first (see everything), gate second (steers). ADR-0001.
         let gate = PermissionHook::new(approval_tx, project_root);
 
         let agent = AgentBuilder::new(model)
