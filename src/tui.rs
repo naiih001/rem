@@ -4,7 +4,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
+        KeyModifiers, MouseButton, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -44,6 +47,8 @@ impl TuiBackend for RatatuiBackend {
 struct TurnResult {
     result: Result<String, String>,
     events: Vec<ToolEvent>,
+    /// True LLM reasoning texts captured this turn (may be empty).
+    reasoning: Vec<String>,
 }
 
 /// One live tool observation pushed from the hook while a turn is running.
@@ -62,7 +67,8 @@ fn run_app(agent: impl AgentLoop + Send + Sync + 'static) -> anyhow::Result<()> 
 
     enable_raw_mode().context("enable raw mode")?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen).context("enter alternate screen")?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
+        .context("enter alternate screen")?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("create terminal")?;
 
@@ -70,15 +76,104 @@ fn run_app(agent: impl AgentLoop + Send + Sync + 'static) -> anyhow::Result<()> 
     let outcome = event_loop(&mut terminal, &mut app, agent, &rx, tx, &think_rx, think_tx);
 
     disable_raw_mode().ok();
-    execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )
+    .ok();
     terminal.show_cursor().ok();
     outcome
+}
+
+/// Stable id for one message block. Index into `App.blocks`.
+type BlockId = usize;
+
+/// Collapsed output budget: a tool/thinking body taller than this renders
+/// truncated with an expand hint until toggled open.
+const COLLAPSED_LINES: usize = 10;
+
+/// Cap on stored blocks; oldest blocks drop off the top like the old
+/// 5000-line transcript cap.
+const MAX_BLOCKS: usize = 1000;
+
+/// One selectable row in the messages area. Claude Code style: the user
+/// prompt, the assistant reply, one block per tool call (name + key args +
+/// status + output), and one collapsed-by-default thinking row per turn that
+/// produced true LLM reasoning.
+#[derive(Debug, Clone)]
+enum MessageBlock {
+    User {
+        text: String,
+    },
+    Reply {
+        text: String,
+    },
+    ToolCall {
+        name: String,
+        args_preview: String,
+        ok: bool,
+        summary: String,
+        output: String,
+        expanded: bool,
+    },
+    Thinking {
+        text: String,
+        expanded: bool,
+    },
+    System {
+        text: String,
+    },
+    /// In-progress tool feed while a turn runs: a live row per tool that has
+    /// resolved so far, replaced by final blocks when the turn completes.
+    LiveTools {
+        tools: Vec<LiveTool>,
+    },
+    Error {
+        text: String,
+    },
+    /// `Done (N tools)` trailer after a successful tool turn.
+    Trailer {
+        text: String,
+    },
+}
+
+impl MessageBlock {
+    /// Whether this block can be expanded/collapsed.
+    fn expandable(&self) -> bool {
+        match self {
+            MessageBlock::ToolCall { output, .. } => {
+                output.lines().count() + 1 > COLLAPSED_LINES
+            }
+            MessageBlock::Thinking { text, .. } => {
+                text.lines().count() > COLLAPSED_LINES
+            }
+            _ => false,
+        }
+    }
+
+    fn is_expanded(&self) -> bool {
+        match self {
+            MessageBlock::ToolCall { expanded, .. } => *expanded,
+            MessageBlock::Thinking { expanded, .. } => *expanded,
+            _ => false,
+        }
+    }
+
+    fn toggle(&mut self) {
+        match self {
+            MessageBlock::ToolCall { expanded, .. } => *expanded = !*expanded,
+            MessageBlock::Thinking { expanded, .. } => *expanded = !*expanded,
+            _ => {}
+        }
+    }
 }
 
 struct App {
     model: String,
     cwd: String,
-    transcript: Vec<Line<'static>>,
+    /// Selectable block list: the messages area. Replaces `transcript`.
+    blocks: Vec<MessageBlock>,
     input: String,
     cursor: usize, // char index into `input`
     history: Vec<String>,
@@ -94,11 +189,10 @@ struct App {
     /// Wrapped line count from the last render; anchors scrollback.
     rendered_total: usize,
     dirty: bool,
-    /// Live tool feed for the current turn. The hook pushes here via a
-    /// channel as each tool resolves; the turn-completion path replays them
-    /// into the transcript. Collapsible with Ctrl+D.
-    thinking: Vec<LiveTool>,
-    thinking_open: bool,
+    /// Selected block for keyboard expand/collapse. `None` = input focus
+    /// (Enter submits, Up/Down = history). `Some` = block focus (Enter/Space
+    /// toggles, Up/Down moves selection, Esc clears).
+    selected: Option<BlockId>,
     /// Last Esc press, for double-Esc quit.
     last_esc: Option<Instant>,
 }
@@ -127,7 +221,7 @@ impl App {
         let mut app = Self {
             model,
             cwd,
-            transcript: Vec::new(),
+            blocks: Vec::new(),
             input: String::new(),
             cursor: 0,
             history: Vec::new(),
@@ -142,118 +236,130 @@ impl App {
             view_h: 10,
             rendered_total: 0,
             dirty: true,
-            thinking: Vec::new(),
-            thinking_open: true,
+            selected: None,
             last_esc: None,
         };
-        app.push_system("rem — /quit or esc×2 exits, /clear clears, ctrl+d toggles thinking.");
+        app.push_system("rem — /quit or esc×2 exits, /clear clears, tab selects blocks.");
         app
     }
 
     fn push_user(&mut self, prompt: &str) {
-        if !self.transcript.is_empty() {
-            self.transcript.push(Line::from(""));
+        if !self.blocks.is_empty() {
+            self.blocks.push(MessageBlock::System {
+                text: String::new(),
+            });
         }
-        self.transcript.push(Line::from(vec![
-            Span::styled(
-                "› ",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(prompt.to_string()),
-        ]));
+        self.blocks.push(MessageBlock::User {
+            text: prompt.to_string(),
+        });
     }
 
-    fn push_turn(&mut self, events: &[ToolEvent], result: &Result<String, String>) {
+    /// Replay one completed turn as inline blocks: one collapsed-by-default
+    /// thinking row (only when the provider emitted true reasoning), one
+    /// tool block per event, then the reply. Removes the live feed row.
+    fn push_turn(
+        &mut self,
+        events: &[ToolEvent],
+        reasoning: &[String],
+        result: &Result<String, String>,
+    ) {
+        self.remove_live_row();
+        for text in reasoning {
+            if !text.trim().is_empty() {
+                self.blocks.push(MessageBlock::Thinking {
+                    text: text.clone(),
+                    expanded: false,
+                });
+            }
+        }
         for ev in events {
-            self.push_tool(ev);
+            self.blocks.push(MessageBlock::ToolCall {
+                name: ev.name.clone(),
+                args_preview: ev.arg_preview(),
+                ok: ev.ok,
+                summary: ev.summary.clone(),
+                output: ev.output.clone(),
+                expanded: false,
+            });
         }
         if !events.is_empty() {
-            self.transcript.push(Line::from(""));
+            self.blocks.push(MessageBlock::System {
+                text: String::new(),
+            });
         }
         match result {
             Ok(text) => self.push_reply(text),
             Err(e) => {
-                self.transcript.push(Line::from(vec![Span::styled(
-                    format!("  [error] {e}"),
-                    Style::default().fg(Color::Red),
-                )]));
+                self.blocks.push(MessageBlock::Error {
+                    text: format!("[error] {e}"),
+                });
                 self.status = Status::Error;
             }
         }
         if !events.is_empty() && result.is_ok() {
             let n = events.len();
-            self.transcript.push(Line::from(vec![Span::styled(
-                format!("  Done ({n} tool{})", if n == 1 { "" } else { "s" }),
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::ITALIC),
-            )]));
+            self.blocks.push(MessageBlock::Trailer {
+                text: format!("Done ({} tool{})", n, if n == 1 { "" } else { "s" }),
+            });
         }
-        self.cap_transcript();
+        self.cap_blocks();
+        self.selected = None;
+        self.pinned = true;
         self.dirty = true;
     }
 
-    fn push_tool(&mut self, ev: &ToolEvent) {
-        let name_style = match ev.ok {
-            true => Style::default().add_modifier(Modifier::BOLD),
-            false => Style::default()
-                .fg(Color::Red)
-                .add_modifier(Modifier::BOLD),
+    /// Live row maintenance while a turn runs: append or update the trailing
+    /// `LiveTools` row so in-progress tools stream inline in the messages
+    /// area. Created on demand by the first live tool message.
+    fn push_live_tool(&mut self, msg: ThinkMsg) {
+        let tool = LiveTool {
+            name: msg.name,
+            preview: msg.preview,
+            ok: msg.ok,
+            summary: msg.summary,
         };
-        let mut head = vec![
-            Span::raw("  ".to_string()),
-            Span::styled(ev.name.clone(), name_style),
-            Span::styled(
-                format!(" {}", ev.arg_preview()),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ];
-        if !ev.ok {
-            head.push(Span::styled(
-                " ✗",
-                Style::default().fg(Color::Red),
-            ));
+        match self.blocks.last_mut() {
+            Some(MessageBlock::LiveTools { tools }) => tools.push(tool),
+            _ => self.blocks.push(MessageBlock::LiveTools { tools: vec![tool] }),
         }
-        self.transcript.push(Line::from(head));
-        self.transcript.push(Line::from(vec![
-            Span::styled("  └ ", Style::default().fg(Color::DarkGray)),
-            Span::styled(ev.summary.clone(), Style::default().fg(Color::DarkGray)),
-        ]));
+        self.cap_blocks();
+        self.pinned = true;
+        self.dirty = true;
+    }
+
+    fn remove_live_row(&mut self) {
+        if matches!(
+            self.blocks.last(),
+            Some(MessageBlock::LiveTools { .. })
+        ) {
+            self.blocks.pop();
+        }
     }
 
     fn push_reply(&mut self, text: &str) {
-        let mut any = false;
-        for line in text.lines() {
-            any = true;
-            self.transcript
-                .push(Line::from(vec![Span::styled(
-                    line.to_string(),
-                    reply_style(line),
-                )]));
-        }
-        if !any {
-            self.transcript.push(Line::from(vec![Span::styled(
-                "  (empty reply)",
-                Style::default().fg(Color::DarkGray),
-            )]));
+        match text.trim().is_empty() {
+            true => self.blocks.push(MessageBlock::Reply {
+                text: "(empty reply)".to_string(),
+            }),
+            false => self.blocks.push(MessageBlock::Reply {
+                text: text.to_string(),
+            }),
         }
     }
 
     fn push_system(&mut self, msg: &str) {
-        self.transcript.push(Line::from(vec![Span::styled(
-            format!("  {msg}"),
-            Style::default().fg(Color::DarkGray),
-        )]));
+        self.blocks.push(MessageBlock::System {
+            text: msg.to_string(),
+        });
         self.dirty = true;
     }
 
-    fn cap_transcript(&mut self) {
-        const MAX: usize = 5000;
-        if self.transcript.len() > MAX {
-            let drop = self.transcript.len() - MAX;
-            self.transcript.drain(..drop);
+    fn cap_blocks(&mut self) {
+        if self.blocks.len() > MAX_BLOCKS {
+            let drop = self.blocks.len() - MAX_BLOCKS;
+            self.blocks.drain(..drop);
+            // Dropped indices shift: clamp selection into range.
+            self.selected = self.selected.and_then(|s| s.checked_sub(drop));
         }
     }
 }
@@ -296,16 +402,10 @@ fn event_loop(
     think_tx: mpsc::Sender<ThinkMsg>,
 ) -> anyhow::Result<()> {
     loop {
-        // Drain live tool observations first so the thinking block updates
-        // while the turn is still running.
+        // Drain live tool observations: each resolved tool appends to the
+        // trailing live row inline in the messages area.
         while let Ok(msg) = think_rx.try_recv() {
-            app.thinking.push(LiveTool {
-                name: msg.name,
-                preview: msg.preview,
-                ok: msg.ok,
-                summary: msg.summary,
-            });
-            app.dirty = true;
+            app.push_live_tool(msg);
         }
         // Drain completed turns without blocking the UI.
         while let Ok(turn) = rx.try_recv() {
@@ -314,8 +414,7 @@ fn event_loop(
             if turn.result.is_ok() {
                 app.status = Status::Ready;
             }
-            app.push_turn(&turn.events, &turn.result);
-            app.thinking.clear();
+            app.push_turn(&turn.events, &turn.reasoning, &turn.result);
         }
 
         if app.dirty || app.busy {
@@ -323,7 +422,7 @@ fn event_loop(
                 .draw(|f| render(f, app))
                 .context("draw frame")?;
             // Place the hardware cursor inside the input line.
-            // Layout: bar(1) header(1) body(?) think(?) input(1) footer(1).
+            // Layout: header(1) body(?) input(1) footer(1).
             let area = terminal.size().unwrap_or_default();
             let x = app.cursor_x(area.width);
             let y = area.height.saturating_sub(2);
@@ -341,6 +440,21 @@ fn event_loop(
                         return Ok(());
                     }
                     app.dirty = true;
+                }
+                Event::Mouse(mouse) => {
+                    if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                        // Clicks land in the body region: rows 1..height-2
+                        // (header row 0, input + footer at the bottom).
+                        let area = terminal.size().unwrap_or_default();
+                        let body_h = app.view_h;
+                        let body_top: u16 = 1;
+                        if mouse.row >= body_top
+                            && mouse.row < body_top.saturating_add(body_h)
+                            && app.click_toggle(mouse.row - body_top, area.width)
+                        {
+                            app.dirty = true;
+                        }
+                    }
                 }
                 Event::Resize(_, _) => {
                     app.dirty = true;
@@ -363,8 +477,18 @@ fn handle_key(
     if mods.contains(KeyModifiers::CONTROL) {
         return handle_ctrl(app, code);
     }
+    // Block focus: selection commands win over input editing.
+    if app.selected.is_some() {
+        return handle_selected_key(app, code);
+    }
     match code {
         KeyCode::Enter => return submit(app, agent, tx, think_tx),
+        // Tab enters block selection on the newest expandable block.
+        // Crossterm reports Shift+Tab as BackTab; both handled here since
+        // input focus has no BackTab branch to conflict with.
+        KeyCode::Tab | KeyCode::BackTab => {
+            app.select_newest(mods.contains(KeyModifiers::SHIFT));
+        }
         KeyCode::Backspace => {
             if app.cursor > 0 {
                 app.cursor -= 1;
@@ -385,6 +509,7 @@ fn handle_key(
             // End snaps the transcript back to live and moves cursor to EOL.
             app.cursor = app.input.chars().count();
             app.pinned = true;
+            app.scroll = 0;
         }
         KeyCode::Up => {
             if mods.contains(KeyModifiers::SHIFT) {
@@ -408,7 +533,8 @@ fn handle_key(
         }
         KeyCode::PageDown => {
             app.pinned = false;
-            app.scroll = app.scroll.saturating_add(app.view_h.max(1));
+            let max = app.max_scroll_offset();
+            app.scroll = app.scroll.saturating_add(app.view_h.max(1)).min(max);
         }
         KeyCode::Esc => {
             let now = Instant::now();
@@ -430,15 +556,68 @@ fn handle_key(
     false
 }
 
-fn handle_ctrl(app: &mut App, code: KeyCode) -> bool {
+/// Keys while a block is selected. Enter/Space toggles, Up/Down (or
+/// Tab/Shift+Tab) moves selection, Esc clears back to input focus.
+/// Typing a printable char drops selection and inserts into input so no
+/// keystroke is lost.
+fn handle_selected_key(app: &mut App, code: KeyCode) -> bool {
     match code {
-        // Ctrl+D toggles the thinking block.
-        KeyCode::Char('d') => {
-            app.thinking_open = !app.thinking_open;
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            app.toggle_selected();
+            false
+        }
+        KeyCode::Up => {
+            app.move_selection(true);
+            false
+        }
+        KeyCode::Down => {
+            app.move_selection(false);
+            false
+        }
+        KeyCode::Tab => {
+            app.move_selection(false);
+            false
+        }
+        KeyCode::BackTab => {
+            app.move_selection(true);
+            false
+        }
+        KeyCode::Esc => {
+            let now = Instant::now();
+            let double = app
+                .last_esc
+                .is_some_and(|t| now.duration_since(t) < Duration::from_millis(600));
+            app.last_esc = Some(now);
+            if double {
+                return true;
+            }
+            app.selected = None;
             app.dirty = true;
             false
         }
-        // Ctrl+C clears the input line (quit is Ctrl+D-free: double-Esc or /quit).
+        KeyCode::Char(c) => {
+            // Drop selection, keep the keystroke: focus returns to input.
+            app.selected = None;
+            insert_char_at(&mut app.input, &mut app.cursor, c);
+            app.dirty = true;
+            false
+        }
+        KeyCode::Backspace => {
+            app.selected = None;
+            if app.cursor > 0 {
+                app.cursor -= 1;
+                remove_char_at(&mut app.input, app.cursor);
+            }
+            app.dirty = true;
+            false
+        }
+        _ => false,
+    }
+}
+
+fn handle_ctrl(app: &mut App, code: KeyCode) -> bool {
+    match code {
+        // Ctrl+C clears the input line (quit is double-Esc or /quit).
         KeyCode::Char('c') => {
             app.input.clear();
             app.cursor = 0;
@@ -476,9 +655,11 @@ fn submit(
         return true;
     }
     if text == "/clear" {
-        app.transcript.clear();
+        app.blocks.clear();
         app.push_system("cleared.");
+        app.selected = None;
         app.pinned = true;
+        app.scroll = 0;
         return false;
     }
     if text.starts_with('/') {
@@ -494,9 +675,10 @@ fn submit(
     app.busy_since = Instant::now();
     app.status = Status::Ready;
     app.pinned = true;
-    // Fresh thinking feed for this turn; worker pushes live tools into it.
-    app.thinking.clear();
-    app.thinking_open = true;
+    app.scroll = 0;
+    app.selected = None;
+    // Fresh live feed for this turn; worker pushes resolved tools into it.
+    app.remove_live_row();
 
     let agent = Arc::clone(agent);
     let tx = tx.clone();
@@ -533,7 +715,12 @@ fn submit(
         watcher.abort();
         // Forward anything the 80ms poll missed between last probe and return.
         let events = agent.last_tool_events();
-        let _ = tx.send(TurnResult { result, events });
+        let reasoning = agent.last_reasoning();
+        let _ = tx.send(TurnResult {
+            result,
+            events,
+            reasoning,
+        });
     });
     false
 }
@@ -596,6 +783,138 @@ fn delete_word_before(input: &mut String, cursor: &mut usize) {
 }
 
 impl App {
+    /// Toggle the selected block's expanded state. No-op for non-expandable.
+    fn toggle_selected(&mut self) {
+        if let Some(id) = self.selected
+            && let Some(block) = self.blocks.get_mut(id)
+        {
+            block.toggle();
+        }
+        self.dirty = true;
+    }
+
+    /// Move selection to the next/previous expandable block, wrapping around.
+    /// Falls back to any block when none is expandable.
+    fn move_selection(&mut self, up: bool) {
+        if self.blocks.is_empty() {
+            return;
+        }
+        let n = self.blocks.len();
+        let start = self.selected.unwrap_or(match up {
+            true => 0,
+            false => n - 1,
+        });
+        // Prefer expandable blocks; accept any block as fallback.
+        for step in 1..=n {
+            let idx = match up {
+                true => (start + n - step) % n,
+                false => (start + step) % n,
+            };
+            if self.blocks[idx].expandable() {
+                self.selected = Some(idx);
+                self.ensure_selected_visible();
+                self.dirty = true;
+                return;
+            }
+        }
+        let idx = match up {
+            true => (start + n - 1) % n,
+            false => (start + 1) % n,
+        };
+        self.selected = Some(idx);
+        self.ensure_selected_visible();
+        self.dirty = true;
+    }
+
+    /// Select the newest expandable block (`any` = newest block of any kind).
+    fn select_newest(&mut self, any: bool) {
+        let found = self.blocks.iter().rposition(|b| any || b.expandable());
+        self.selected = found;
+        self.ensure_selected_visible();
+        self.dirty = true;
+    }
+
+    /// Unpin and scroll just enough to show the selected block's first line.
+    fn ensure_selected_visible(&mut self) {
+        let Some(id) = self.selected else { return };
+        let width = 80usize; // refined on next render; view width unknown here
+        let mut start = 0usize;
+        for (i, block) in self.blocks.iter().enumerate() {
+            if i == id {
+                break;
+            }
+            start += block_height(block, width);
+        }
+        let view = self.view_h.max(1) as usize;
+        let bottom = self.rendered_total.saturating_sub(view);
+        let cur = match self.pinned {
+            true => bottom,
+            false => self.scroll as usize,
+        };
+        if start < cur {
+            self.pinned = false;
+            self.scroll = start.min(bottom) as u16;
+        } else if start >= cur + view {
+            self.pinned = false;
+            self.scroll = start.saturating_sub(view.saturating_sub(1)).min(bottom) as u16;
+        }
+    }
+
+    /// Click at `row` lines below the body top: map to a block and toggle it.
+    /// Returns true when a block was toggled. Uses wrapped heights so the
+    /// mapping agrees with what the `Paragraph` actually rendered.
+    fn click_toggle(&mut self, row: u16, width: u16) -> bool {
+        let scroll = match self.pinned {
+            true => self.rendered_total.saturating_sub(self.view_h as usize) as u16,
+            false => self.scroll,
+        };
+        let target = scroll.saturating_add(row) as usize;
+        let w = (width as usize).max(1);
+        // Flatten like render_body, then walk wrapped line counts.
+        let mut flat: Vec<Line<'static>> = Vec::new();
+        let mut starts: Vec<usize> = Vec::with_capacity(self.blocks.len());
+        for block in self.blocks.iter() {
+            starts.push(flat.len());
+            render_block(block, false, &mut flat);
+        }
+        // Wrapped offset of each flattened line: prefix sums over div_ceil.
+        let mut block_of_line: Vec<usize> = Vec::with_capacity(flat.len());
+        for (id, _) in self.blocks.iter().enumerate() {
+            let end = match id + 1 < starts.len() {
+                true => starts[id + 1],
+                false => flat.len(),
+            };
+            for line in &flat[starts[id]..end] {
+                let line_w: usize = line
+                    .spans
+                    .iter()
+                    .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+                    .sum();
+                let h = line_w.div_ceil(w).max(1);
+                for _ in 0..h {
+                    block_of_line.push(id);
+                }
+            }
+        }
+        if target < block_of_line.len() {
+            let id = block_of_line[target];
+            self.selected = Some(id);
+            if let Some(b) = self.blocks.get_mut(id) {
+                b.toggle();
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Max scroll offset in wrapped lines (for PageDown clamping).
+    fn max_scroll_offset(&self) -> u16 {
+        self.rendered_total
+            .saturating_sub(self.view_h as usize) as u16
+    }
+}
+
+impl App {
     /// Terminal x-coordinate of the cursor within the input row.
     /// Shares [`visible_window`] with the renderer so the hardware caret
     /// always sits on the displayed caret column, even mid-line in overflow.
@@ -642,137 +961,256 @@ fn visible_window(input: &str, cursor: usize, max_w: usize) -> (String, usize) {
 
 fn render(f: &mut ratatui::Frame, app: &mut App) {
     let area = f.area();
-    // Thinking block height: header row + 2 rows per live tool (name row +
-    // summary row), capped at 3 tools. Only while busy and expanded.
-    // Collapsed is zero rows (Ctrl+D toggles).
-    let think_rows = think_rows_for(app.busy, app.thinking_open, app.thinking.len());
+    // Layout: header(1) / body (everything else) / input(1) / footer(1).
+    // The old top activity bar + bottom think region are gone: freed rows
+    // belong to the messages area, which now owns inline tool blocks.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // activity bar
             Constraint::Length(1), // header
-            Constraint::Min(0),    // transcript
-            Constraint::Length(think_rows),
+            Constraint::Min(0),    // blocks
             Constraint::Length(1), // input
             Constraint::Length(1), // footer
         ])
         .split(area);
-    app.view_h = chunks[2].height;
+    app.view_h = chunks[1].height;
 
-    render_activity(f, app, chunks[0]);
-    render_header(f, app, chunks[1]);
-    // Ratatui 0.29 clamps nothing: lines with y < scroll.y are skipped and
-    // the rest shift up, so pin-to-bottom must be an explicit offset from the
-    // last wrapped line count. `rendered_total` trails by one frame at most.
-    let body_h = chunks[2].height as usize;
-    let bottom = app.rendered_total.saturating_sub(body_h) as u16;
+    render_header(f, app, chunks[0]);
+    render_body(f, app, chunks[1]);
+    render_input(f, app, chunks[2]);
+    render_footer(f, app, chunks[3]);
+}
+
+/// Messages area: flatten every block to styled lines, then scroll like the
+/// old transcript `Paragraph` (pin-to-bottom or manual offset).
+fn render_body(f: &mut ratatui::Frame, app: &mut App, area: ratatui::layout::Rect) {
+    let width = area.width as usize;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (id, block) in app.blocks.iter().enumerate() {
+        let selected = app.selected == Some(id);
+        render_block(block, selected, &mut lines);
+    }
+    let body_h = area.height as usize;
+    let total = count_wrapped(&lines, width);
+    app.rendered_total = total;
+    let bottom = total.saturating_sub(body_h) as u16;
     let scroll = match app.pinned {
         true => bottom,
         false => app.scroll.min(bottom),
     };
-    let body = Paragraph::new(app.transcript.clone())
+    let body = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
-    app.rendered_total = count_wrapped(&app.transcript, chunks[2].width as usize);
-    f.render_widget(body, chunks[2]);
-    if think_rows > 0 {
-        render_thinking(f, app, chunks[3]);
-    }
-    render_input(f, app, chunks[4]);
-    render_footer(f, app, chunks[5]);
+    f.render_widget(body, area);
 }
 
-/// Fast left-to-right sweeper shown while the agent works.
-/// A bright segment bounces across the top row; idle renders blank.
-fn render_activity(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
-    if !app.busy || area.width == 0 {
-        return;
-    }
-    let w = area.width as usize;
-    // ~140ms per step: visibly fast without strobing.
-    let step = (app.busy_since.elapsed().as_millis() / 140) as usize;
-    let head = sweep_head(w, step);
-    let seg = 12usize.min(w);
-    let mut bar = String::with_capacity(w);
-    for i in 0..w {
-        let on = i >= head && i < head + seg;
-        bar.push(match on {
-            true => '━',
-            false => '─',
-        });
-    }
-    let line = Line::from(vec![Span::styled(
-        bar,
-        Style::default().fg(Color::Cyan),
-    )]);
-    f.render_widget(Paragraph::new(line), area);
-}
-
-/// Bounce position of the activity-bar head: sweeps left-to-right then back,
-/// so short terminals still show motion instead of a stuck edge.
-fn sweep_head(width: usize, step: usize) -> usize {
-    let seg = 12usize.min(width);
-    let span = width.saturating_sub(seg).max(1);
-    let pos = step % (span * 2);
-    match pos < span {
-        true => pos,
-        false => span * 2 - pos,
-    }
-}
-
-/// Thinking-block height in rows: 1 header + 2 rows per live tool,
-/// capped at 3 tools. Zero when idle or collapsed.
-fn think_rows_for(busy: bool, open: bool, tools: usize) -> u16 {
-    match busy && open {
-        true => 1 + (tools.clamp(1, 3) * 2) as u16,
-        false => 0,
-    }
-}
-
-/// Collapsible live thinking block: current tool feed while busy.
-/// Toggle with Ctrl+D. Shows live tool rows, elapsed time, and hint.
-fn render_thinking(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
-    let elapsed = app.busy_since.elapsed().as_secs();
-    let mut lines = vec![Line::from(vec![
-        Span::styled("◌ thinking", Style::default().fg(Color::Cyan)),
-        Span::styled(
-            format!(" · {}s · {} tool{}", elapsed, app.thinking.len(), match app.thinking.len() == 1 {
-                true => "",
-                false => "s",
-            }),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::styled(" · ctrl+d to collapse", Style::default().fg(Color::DarkGray)),
-    ])];
-    if app.thinking.is_empty() {
-        lines.push(Line::from(vec![Span::styled(
-            "  └ working…",
-            Style::default().fg(Color::DarkGray),
-        )]));
-    } else {
-        for t in app.thinking.iter().rev().take(3).rev() {
-            let mark = match t.ok {
-                true => "└",
-                false => "✗",
+/// Claude Code-style inline block renderer. One block flattens to 1+
+/// styled lines: a header line plus a collapsible body. Long bodies render
+/// truncated to [`COLLAPSED_LINES`] with an expand hint; toggling shows the
+/// full stored text. Selected blocks get a `▸` cursor marker.
+fn render_block(block: &MessageBlock, selected: bool, out: &mut Vec<Line<'static>>) {
+    let cursor = match selected {
+        true => "▸ ",
+        false => "  ",
+    };
+    match block {
+        MessageBlock::User { text } => {
+            out.push(Line::from(vec![
+                Span::styled(
+                    format!("{cursor}› "),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(text.clone()),
+            ]));
+        }
+        MessageBlock::Reply { text } => {
+            for line in text.lines() {
+                out.push(Line::from(vec![Span::styled(
+                    line.to_string(),
+                    reply_style(line),
+                )]));
+            }
+            if text.is_empty() {
+                out.push(Line::from(""));
+            }
+        }
+        MessageBlock::ToolCall {
+            name,
+            args_preview,
+            ok,
+            summary,
+            output,
+            expanded,
+        } => {
+            let name_style = match ok {
+                true => Style::default().add_modifier(Modifier::BOLD),
+                false => Style::default()
+                    .fg(Color::Red)
+                    .add_modifier(Modifier::BOLD),
             };
-            let mark_style = match t.ok {
+            let status = match ok {
+                true => "· ok",
+                false => "· ✗ err",
+            };
+            let status_style = match ok {
                 true => Style::default().fg(Color::DarkGray),
                 false => Style::default().fg(Color::Red),
             };
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {mark} "), mark_style),
-                Span::raw(format!("{} {}", t.name, t.preview)),
+            let expand_hint = block_expand_hint(block).unwrap_or_default();
+            out.push(Line::from(vec![
+                Span::styled(
+                    format!("{cursor}⏺ "),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled(name.clone(), name_style),
+                Span::styled(
+                    format!("({args_preview}) "),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(status.to_string(), status_style),
+                Span::styled(expand_hint, Style::default().fg(Color::DarkGray)),
             ]));
-            lines.push(Line::from(vec![
-                Span::styled("    ", Style::default()),
-                Span::styled(t.summary.clone(), Style::default().fg(Color::DarkGray)),
+            out.push(Line::from(vec![
+                Span::styled("    └ ", Style::default().fg(Color::DarkGray)),
+                Span::styled(summary.clone(), Style::default().fg(Color::DarkGray)),
             ]));
+            // Body: first line is blank-padded output; collapse window applies.
+            let body: Vec<&str> = output.lines().collect();
+            let shown = match expanded {
+                true => body.len(),
+                false => body.len().min(COLLAPSED_LINES.saturating_sub(1)),
+            };
+            for line in body.iter().take(shown) {
+                out.push(Line::from(vec![
+                    Span::styled("      ", Style::default()),
+                    Span::styled((*line).to_string(), Style::default().fg(Color::DarkGray)),
+                ]));
+            }
+            if !expanded && body.len() > shown {
+                let rest = body.len() - shown;
+                out.push(Line::from(vec![Span::styled(
+                    format!("      … +{rest} lines (Enter to expand)"),
+                    Style::default().fg(Color::DarkGray),
+                )]));
+            }
+        }
+        MessageBlock::Thinking { text, expanded } => {
+            let n = text.lines().count();
+            let marker = match expanded {
+                true => "▾",
+                false => "▸",
+            };
+            let expand_hint = block_expand_hint(block).unwrap_or_default();
+            out.push(Line::from(vec![
+                Span::styled(
+                    format!("{cursor}{marker} thinking "),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled(
+                    format!("({n} lines)"),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(expand_hint, Style::default().fg(Color::DarkGray)),
+            ]));
+            if *expanded {
+                for line in text.lines() {
+                    out.push(Line::from(vec![
+                        Span::styled("      ", Style::default()),
+                        Span::styled(line.to_string(), Style::default().fg(Color::DarkGray)),
+                    ]));
+                }
+            }
+        }
+        MessageBlock::System { text } => {
+            // Empty text = visual separator. Must be a truly empty line:
+            // WordWrapper with trim:false renders whitespace-only lines as
+            // TWO rows, which would desync scroll accounting.
+            match text.is_empty() {
+                true => out.push(Line::from("")),
+                false => out.push(Line::from(vec![Span::styled(
+                    format!("  {text}"),
+                    Style::default().fg(Color::DarkGray),
+                )])),
+            }
+        }
+        MessageBlock::Error { text } => {
+            out.push(Line::from(vec![Span::styled(
+                format!("  [error] {text}"),
+                Style::default().fg(Color::Red),
+            )]));
+        }
+        MessageBlock::Trailer { text } => {
+            out.push(Line::from(vec![Span::styled(
+                format!("  {text}"),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            )]));
+        }
+        MessageBlock::LiveTools { tools } => {
+            // In-progress feed: spinner header + one row per resolved tool.
+            // Replaced by final blocks when the turn completes.
+            let dots = "…";
+            out.push(Line::from(vec![
+                Span::styled(
+                    format!("{cursor}◌ working{dots} "),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled(
+                    format!(
+                        "{} tool{}",
+                        tools.len(),
+                        if tools.len() == 1 { "" } else { "s" }
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+            for t in tools.iter() {
+                let mark = match t.ok {
+                    true => "└",
+                    false => "✗",
+                };
+                let mark_style = match t.ok {
+                    true => Style::default().fg(Color::DarkGray),
+                    false => Style::default().fg(Color::Red),
+                };
+                out.push(Line::from(vec![
+                    Span::styled(format!("    {mark} "), mark_style),
+                    Span::raw(format!("{} {}", t.name, t.preview)),
+                ]));
+                out.push(Line::from(vec![
+                    Span::styled("      ", Style::default()),
+                    Span::styled(t.summary.clone(), Style::default().fg(Color::DarkGray)),
+                ]));
+            }
         }
     }
-    f.render_widget(Paragraph::new(lines), area);
 }
 
-/// Wrapped line count of the transcript at `width`, mirroring
+/// Expand/collapse hint suffix for a block header, e.g. ` · Enter to expand`.
+/// Empty for non-expandable blocks and expanded blocks (which show collapse).
+fn block_expand_hint(block: &MessageBlock) -> Option<String> {
+    match block.expandable() {
+        false => None,
+        true => Some(match block.is_expanded() {
+            true => " · Enter to collapse".to_string(),
+            false => " · Enter to expand".to_string(),
+        }),
+    }
+}
+
+/// Rendered line count of one block at `width`: mirrors `render_block`
+/// structure, then applies `Paragraph::wrap(trim: false)`-style widening so
+/// click mapping and height accounting agree on wrapped terminals.
+fn block_height(block: &MessageBlock, width: usize) -> usize {
+    let w = width.max(1);
+    let mut flat: Vec<Line<'static>> = Vec::new();
+    render_block(block, false, &mut flat);
+    count_wrapped(&flat, w)
+}
+/// Wrapped line count of the flattened body at `width`, mirroring
 /// `Paragraph::wrap(trim: false)` behavior for scroll anchoring.
 /// Conservative ceiling: matches empty lines (1) and wraps long lines up.
 fn count_wrapped(lines: &[Line<'static>], width: usize) -> usize {
@@ -851,7 +1289,13 @@ fn render_footer(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect)
             format!("edit · {} · {} turn{}", app.model, app.turns, if app.turns == 1 { "" } else { "s" }),
             Style::default().fg(Color::DarkGray),
         ),
-        Span::styled(" · ctrl+d think · esc×2 quit", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            match app.selected {
+                Some(_) => " · enter/space expand · esc input · esc×2 quit",
+                None => " · tab selects block · click toggles · esc×2 quit",
+            },
+            Style::default().fg(Color::DarkGray),
+        ),
     ];
     let right_text = match (&app.status, app.busy) {
         (_, true) => {
@@ -875,9 +1319,30 @@ fn render_footer(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect)
         .iter()
         .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
         .sum();
-    let pad = width.saturating_sub(left_w + right_text.width() + 1);
+    let right_w = right_text.width();
+    // Narrow terminals: keep the status visible, truncate the hint suffix.
     let mut spans = left;
-    spans.push(Span::raw(" ".repeat(pad)));
+    let avail = width.saturating_sub(right_w + 1);
+    if left_w > avail {
+        // Drop the hint span first, then shorten the model span if needed.
+        spans.pop();
+        let kept: usize = spans
+            .iter()
+            .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+            .sum();
+        if kept > avail && spans.len() > 1 {
+            spans.pop();
+        }
+        let kept: usize = spans
+            .iter()
+            .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+            .sum();
+        let pad = avail.saturating_sub(kept);
+        spans.push(Span::raw(" ".repeat(pad)));
+    } else {
+        let pad = avail - left_w;
+        spans.push(Span::raw(" ".repeat(pad)));
+    }
     spans.push(Span::styled(right_text, right_style));
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -953,29 +1418,150 @@ mod tests {
     }
 
     #[test]
-    fn sweep_head_bounces_within_bounds() {
-        let w = 40;
-        let seg = 12usize.min(w);
-        let max_head = w - seg;
-        // Starts at left, moves right, bounces at the far edge.
-        assert_eq!(sweep_head(w, 0), 0);
-        assert_eq!(sweep_head(w, 5), 5);
-        assert_eq!(sweep_head(w, max_head), max_head);
-        // One step past the edge it heads back left.
-        assert_eq!(sweep_head(w, max_head + 1), max_head - 1);
-        // Never exceeds the segment window.
-        for step in 0..200 {
-            assert!(sweep_head(w, step) + seg <= w);
+    fn tool_block_truncates_long_output_until_expanded() {
+        let output = (0..30).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let mut block = MessageBlock::ToolCall {
+            name: "bash".to_string(),
+            args_preview: "cargo test".to_string(),
+            ok: true,
+            summary: "ok".to_string(),
+            output,
+            expanded: false,
+        };
+        assert!(block.expandable());
+        assert!(!block.is_expanded());
+        // Collapsed: header + summary + 9 body + "+N lines" hint = 12.
+        assert_eq!(block_height(&block, 80), 12);
+        let mut lines = Vec::new();
+        render_block(&block, false, &mut lines);
+        assert_eq!(lines.len(), 12);
+        assert!(lines[0].to_string().contains("Enter to expand"));
+        // Expanded: header + summary + 30 body = 32.
+        block.toggle();
+        assert!(block.is_expanded());
+        assert_eq!(block_height(&block, 80), 32);
+        let mut lines = Vec::new();
+        render_block(&block, false, &mut lines);
+        assert_eq!(lines.len(), 32);
+        assert!(lines[0].to_string().contains("Enter to collapse"));
+    }
+
+    #[test]
+    fn short_tool_block_is_not_expandable() {
+        let block = MessageBlock::ToolCall {
+            name: "read".to_string(),
+            args_preview: "src/main.rs".to_string(),
+            ok: true,
+            summary: "42 lines".to_string(),
+            output: "line 1\nline 2".to_string(),
+            expanded: false,
+        };
+        assert!(!block.expandable());
+        // header + summary + 2 body, no hint row.
+        assert_eq!(block_height(&block, 80), 4);
+    }
+
+    #[test]
+    fn thinking_block_collapses_by_default() {
+        let text = (0..20).map(|i| format!("thought {i}")).collect::<Vec<_>>().join("\n");
+        let mut block = MessageBlock::Thinking {
+            text,
+            expanded: false,
+        };
+        assert!(block.expandable());
+        assert_eq!(block_height(&block, 80), 1);
+        let mut lines = Vec::new();
+        render_block(&block, true, &mut lines);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].to_string().contains("▸ thinking (20 lines)"));
+        assert!(lines[0].to_string().contains("▸ ›") == false);
+        block.toggle();
+        assert_eq!(block_height(&block, 80), 21);
+    }
+
+    #[test]
+    fn selection_moves_between_expandable_blocks() {
+        let mut app = App::new("model".to_string());
+        app.blocks.clear();
+        app.blocks.push(MessageBlock::System {
+            text: "hi".to_string(),
+        });
+        app.blocks.push(MessageBlock::ToolCall {
+            name: "bash".to_string(),
+            args_preview: "x".to_string(),
+            ok: true,
+            summary: "s".to_string(),
+            output: (0..20).map(|i| format!("l{i}")).collect::<Vec<_>>().join("\n"),
+            expanded: false,
+        });
+        app.blocks.push(MessageBlock::Reply {
+            text: "done".to_string(),
+        });
+        // Newest expandable = the tool block at index 1.
+        app.select_newest(false);
+        assert_eq!(app.selected, Some(1));
+        // Moving down wraps within the single expandable block.
+        app.move_selection(false);
+        assert_eq!(app.selected, Some(1));
+        // Toggle flips expanded.
+        app.toggle_selected();
+        assert!(app.blocks[1].is_expanded());
+    }
+
+    #[test]
+    fn headless_full_frame_renders_without_old_chrome() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("test-model".to_string());
+        app.blocks.clear();
+        app.push_user("list files");
+        let output = (0..25).map(|i| format!("file{i}.rs")).collect::<Vec<_>>().join("\n");
+        app.push_turn(
+            &[crate::agent::ToolEvent {
+                name: "bash".to_string(),
+                args: serde_json::json!({"command": "ls"}),
+                ok: true,
+                summary: "25 files".to_string(),
+                output,
+            }],
+            &["I should list files first, then summarize.".to_string()],
+            &Ok("Here are your files.".to_string()),
+        );
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let text = terminal.backend().to_string();
+        // New chrome present…
+        assert!(text.contains("test-model"));
+        assert!(text.contains("bash(ls)"));
+        assert!(text.contains("thinking (1 lines)"));
+        assert!(text.contains("Here are your files."));
+        // …old chrome gone: no sweeper bar, no live think region, no ctrl+d.
+        assert!(!text.contains("ctrl+d"));
+        assert!(!text.contains("thinking ·"));
+        // No line is a full-width bar of ─/━ run (old activity bar).
+        for line in text.lines() {
+            let bar_run = line.chars().filter(|c| *c == '─' || *c == '━').count();
+            assert!(bar_run < 70, "activity bar remnant: {line}");
         }
     }
 
     #[test]
-    fn think_rows_match_two_line_tool_rows() {
-        assert_eq!(think_rows_for(false, true, 5), 0);
-        assert_eq!(think_rows_for(true, false, 5), 0);
-        assert_eq!(think_rows_for(true, true, 0), 3);
-        assert_eq!(think_rows_for(true, true, 1), 3);
-        assert_eq!(think_rows_for(true, true, 3), 7);
-        assert_eq!(think_rows_for(true, true, 9), 7);
+    fn click_maps_row_to_block_and_toggles() {
+        let mut app = App::new("model".to_string());
+        app.blocks.clear();
+        app.blocks.push(MessageBlock::ToolCall {
+            name: "bash".to_string(),
+            args_preview: "x".to_string(),
+            ok: true,
+            summary: "s".to_string(),
+            output: (0..20).map(|i| format!("l{i}")).collect::<Vec<_>>().join("\n"),
+            expanded: false,
+        });
+        app.view_h = 24;
+        app.pinned = true;
+        app.rendered_total = 12;
+        assert!(app.click_toggle(0, 80));
+        assert_eq!(app.selected, Some(0));
+        assert!(app.blocks[0].is_expanded());
     }
 }
