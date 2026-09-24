@@ -231,8 +231,6 @@ struct App {
     /// (Enter submits, Up/Down = history). `Some` = block focus (Enter/Space
     /// toggles, Up/Down moves selection, Esc clears).
     selected: Option<BlockId>,
-    /// Last Esc press, for double-Esc quit.
-    last_esc: Option<Instant>,
     /// Pending human approvals (FIFO). Head renders as a blocking modal;
     /// resolving it resumes the parked agent worker in the same run.
     pending_approvals: VecDeque<ApprovalRequest>,
@@ -373,13 +371,12 @@ impl App {
             rendered_total: 0,
             dirty: true,
             selected: None,
-            last_esc: None,
             pending_approvals: VecDeque::new(),
             current_turn: None,
             current_watcher: None,
             turn_generation: 0,
         };
-        app.push_system("rem — /quit or esc×2 exits, /clear clears, tab selects blocks.");
+        app.push_system("rem — esc interrupt · ^D quit when empty · ^C clear · /quit quit · /clear clear · tab selects blocks.");
         app
     }
 
@@ -640,12 +637,17 @@ fn handle_key(
     code: KeyCode,
     mods: KeyModifiers,
 ) -> bool {
-    // Approval modal owns every keystroke while pending: y/a/n/x (+Enter as
-    // approve). Ctrl+C still clears nothing here; Esc never dismisses — the
-    // worker is parked and must receive an explicit decision.
+    // Approval modal owns every keystroke while pending: y/a/n/x/Esc
+    // (+Enter as approve). Esc resolves AbortTurn (same as `x`) — never
+    // silently dismisses (ADR-0003 Q7); the parked worker gets a decision.
     if !app.pending_approvals.is_empty() {
-        // Ctrl combos are ignored in the modal (no input line to clear).
+        // Ctrl combos are ignored in the modal (no input line to clear) —
+        // except Ctrl+D, which quits via `handle_ctrl` (empty input only;
+        // the `d` arm resolves AbortTurn before quitting).
         if mods.contains(KeyModifiers::CONTROL) {
+            if code == KeyCode::Char('d') {
+                return handle_ctrl(app, code);
+            }
             return false;
         }
         match code {
@@ -661,12 +663,31 @@ fn handle_key(
             KeyCode::Char('x') | KeyCode::Char('X') => {
                 resolve_approval(app, ApprovalDecision::AbortTurn);
             }
+            KeyCode::Esc => {
+                // Task 2 / ADR-0005: modal Esc is AbortTurn, same path
+                // as `x` (→ ToolCallAction::stop); never silently dismissed.
+                resolve_approval(app, ApprovalDecision::AbortTurn);
+            }
             _ => {}
         }
         return false;
     }
     if mods.contains(KeyModifiers::CONTROL) {
         return handle_ctrl(app, code);
+    }
+    // Esc matrix (Task 2 / ADR-0005): busy-first so selected+busy
+    // interrupts; selected+idle deselects; idle is a no-op. No Esc
+    // sequence quits (double-Esc quit removed).
+    if code == KeyCode::Esc {
+        if app.busy {
+            abort_turn(app);
+            return false;
+        }
+        if app.selected.is_some() {
+            app.selected = None;
+            app.dirty = true;
+        }
+        return false;
     }
     // Block focus: selection commands win over input editing.
     if app.selected.is_some() {
@@ -727,24 +748,6 @@ fn handle_key(
             let max = app.max_scroll_offset();
             app.scroll = app.scroll.saturating_add(app.view_h.max(1)).min(max);
         }
-        KeyCode::Esc => {
-            // Task 1: busy-first interrupt. The full Esc matrix
-            // (modal/selected/idle) lands in Task 2; other arms are untouched.
-            if app.busy {
-                abort_turn(app);
-                return false;
-            }
-            let now = Instant::now();
-            let double = app
-                .last_esc
-                .is_some_and(|t| now.duration_since(t) < Duration::from_millis(600));
-            app.last_esc = Some(now);
-            if double {
-                return true;
-            }
-            app.input.clear();
-            app.cursor = 0;
-        }
         KeyCode::Char(c) => {
             insert_char_at(&mut app.input, &mut app.cursor, c);
         }
@@ -754,7 +757,8 @@ fn handle_key(
 }
 
 /// Keys while a block is selected. Enter/Space toggles, Up/Down (or
-/// Tab/Shift+Tab) moves selection, Esc clears back to input focus.
+/// Tab/Shift+Tab) moves selection, Esc deselects (or aborts when busy —
+/// busy wins). Never quits.
 /// Typing a printable char drops selection and inserts into input so no
 /// keystroke is lost.
 fn handle_selected_key(app: &mut App, code: KeyCode) -> bool {
@@ -780,13 +784,11 @@ fn handle_selected_key(app: &mut App, code: KeyCode) -> bool {
             false
         }
         KeyCode::Esc => {
-            let now = Instant::now();
-            let double = app
-                .last_esc
-                .is_some_and(|t| now.duration_since(t) < Duration::from_millis(600));
-            app.last_esc = Some(now);
-            if double {
-                return true;
+            // Task 2 / ADR-0005: busy wins over selection; idle Esc
+            // only deselects. Never quits.
+            if app.busy {
+                abort_turn(app);
+                return false;
             }
             app.selected = None;
             app.dirty = true;
@@ -814,7 +816,10 @@ fn handle_selected_key(app: &mut App, code: KeyCode) -> bool {
 
 fn handle_ctrl(app: &mut App, code: KeyCode) -> bool {
     match code {
-        // Ctrl+C clears the input line (quit is double-Esc or /quit).
+        // Task 4 / ADR-0005: Ctrl+C is strict clear-only — clears the
+        // input line, never interrupts, never quits (quit is Ctrl+D-on-empty
+        // or /quit). Ignored in the modal via the CONTROL early-return in
+        // `handle_key` above.
         KeyCode::Char('c') => {
             app.input.clear();
             app.cursor = 0;
@@ -828,6 +833,32 @@ fn handle_ctrl(app: &mut App, code: KeyCode) -> bool {
         KeyCode::Char('w') => {
             delete_word_before(&mut app.input, &mut app.cursor);
             false
+        }
+        KeyCode::Char('d') => {
+            // Task 3 / ADR-0005 (D3): Ctrl+D quits only when the input
+            // line is empty — non-empty is a no-op (Unix convention, never
+            // deletes). Empty + modal: resolve the head approval as
+            // AbortTurn (same path as `x`/Esc → ToolCallAction::stop) so
+            // the parked worker gets a decision via the existing Stop
+            // path, then quit. Empty + busy: `abort_turn` synthesizes the
+            // interrupted trailer (and bumps the generation so a late
+            // TurnResult is stale-dropped), then quit. Empty + idle:
+            // quit directly.
+            // /quit parity (flagged, not matched): `/quit` pushes its
+            // line to history before quitting, but Ctrl+D only fires on
+            // empty input so there is nothing to push; neither path needs
+            // to clear `selected` since the process exits.
+            if !app.input.is_empty() {
+                false
+            } else {
+                if !app.pending_approvals.is_empty() {
+                    resolve_approval(app, ApprovalDecision::AbortTurn);
+                }
+                if app.busy {
+                    abort_turn(app);
+                }
+                true
+            }
         }
         _ => false,
     }
@@ -1641,7 +1672,7 @@ fn render_footer(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect)
         Span::styled(
             match app.selected {
                 Some(_) => "  ·  enter/space expand · esc input",
-                None => "  ·  tab selects block · esc×2 quit",
+                None => "  ·  tab selects block · esc interrupt · ^D quit",
             },
             faint,
         ),
@@ -2085,6 +2116,141 @@ mod tests {
         abort_turn(&mut app);
         assert_eq!(app.blocks.len(), before);
         assert_eq!(app.turn_generation, 0);
+    }
+
+    #[test]
+    fn ctrl_d_with_text_is_noop() {
+        let mut app = App::new("model".to_string());
+        app.input = "hi".to_string();
+        app.cursor = 2;
+        let agent = std::sync::Arc::new(StubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        assert!(!handle_key(&mut app, &agent, &tx, &think_tx, KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert_eq!(app.input, "hi");
+    }
+
+    #[test]
+    fn ctrl_d_empty_idle_quits() {
+        let mut app = App::new("model".to_string());
+        let agent = std::sync::Arc::new(StubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        assert!(handle_key(&mut app, &agent, &tx, &think_tx, KeyCode::Char('d'), KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn ctrl_d_empty_busy_aborts_then_quits() {
+        let mut app = App::new("model".to_string());
+        app.blocks.clear();
+        app.busy = true;
+        app.turn_generation = 5;
+        app.blocks.push(MessageBlock::LiveTools {
+            tools: vec![LiveTool {
+                name: "bash".to_string(),
+                preview: "cargo test".to_string(),
+                ok: true,
+                summary: "25 files".to_string(),
+            }],
+        });
+        let agent = std::sync::Arc::new(StubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        assert!(handle_key(&mut app, &agent, &tx, &think_tx, KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert!(!app.busy);
+        assert_eq!(app.turn_generation, 6);
+        assert!(app.blocks.iter().any(|b| matches!(b, MessageBlock::System { text } if text == "interrupted.")));
+        assert!(app.blocks.iter().any(|b| matches!(b, MessageBlock::Trailer { text } if text == "Interrupted (1 tool)")));
+    }
+
+    #[test]
+    fn ctrl_d_empty_modal_resolves_abort_then_quits() {
+        let mut app = App::new("model".to_string());
+        app.blocks.clear();
+        app.busy = true;
+        let (req, rx) = approval_req("bash", "cargo test");
+        app.pending_approvals.push_back(req);
+        let agent = std::sync::Arc::new(StubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        // Modal CONTROL exemption lets Ctrl+D through; head resolves as
+        // AbortTurn (D3), busy turn aborts, then quit.
+        assert!(handle_key(&mut app, &agent, &tx, &think_tx, KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert_eq!(rx.blocking_recv().unwrap(), ApprovalDecision::AbortTurn);
+        assert!(app.pending_approvals.is_empty());
+        assert!(!app.busy);
+    }
+
+    #[test]
+    fn ctrl_d_empty_selected_quits() {
+        let mut app = App::new("model".to_string());
+        app.blocks.clear();
+        app.blocks.push(MessageBlock::System { text: "hi".to_string() });
+        app.selected = Some(0);
+        let agent = std::sync::Arc::new(StubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        // CONTROL routes before selection commands, so Ctrl+D quits even
+        // with a block selected.
+        assert!(handle_key(&mut app, &agent, &tx, &think_tx, KeyCode::Char('d'), KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn ctrl_c_idle_clears_input_without_quit() {
+        let mut app = App::new("model".to_string());
+        app.input = "hello".to_string();
+        app.cursor = 5;
+        let agent = std::sync::Arc::new(StubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        assert!(!handle_key(&mut app, &agent, &tx, &think_tx, KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.input.is_empty());
+        assert_eq!(app.cursor, 0);
+    }
+
+    #[test]
+    fn ctrl_c_while_busy_clears_only_never_interrupts() {
+        let agent = std::sync::Arc::new(StubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        // Busy + typed input: clears the line, the turn keeps running.
+        let mut app = App::new("model".to_string());
+        app.blocks.clear();
+        app.busy = true;
+        app.turn_generation = 7;
+        app.input = "partial".to_string();
+        app.cursor = 7;
+        assert!(!handle_key(&mut app, &agent, &tx, &think_tx, KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.input.is_empty());
+        assert_eq!(app.cursor, 0);
+        assert!(app.busy, "Ctrl+C must never interrupt a busy turn");
+        assert_eq!(app.turn_generation, 7);
+        assert!(!app.blocks.iter().any(|b| matches!(b, MessageBlock::System { text } if text == "interrupted.")));
+        // Busy + empty input: no-op, still no interrupt.
+        assert!(!handle_key(&mut app, &agent, &tx, &think_tx, KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.busy);
+        assert_eq!(app.turn_generation, 7);
+    }
+
+    #[test]
+    fn ctrl_c_in_modal_is_ignored() {
+        let mut app = App::new("model".to_string());
+        app.blocks.clear();
+        app.busy = true;
+        app.input = "typed".to_string();
+        app.cursor = 5;
+        let (req, mut rx) = approval_req("bash", "cargo test");
+        app.pending_approvals.push_back(req);
+        let agent = std::sync::Arc::new(StubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        // Modal CONTROL blanket-ignore: no clear, no resolve, no quit.
+        assert!(!handle_key(&mut app, &agent, &tx, &think_tx, KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert_eq!(app.input, "typed");
+        assert_eq!(app.cursor, 5);
+        assert_eq!(app.pending_approvals.len(), 1);
+        assert!(rx.try_recv().is_err(), "modal Ctrl+C must not resolve the approval");
+        assert!(app.busy);
     }
 
     struct StubAgent;
