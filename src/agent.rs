@@ -1,6 +1,9 @@
+use std::sync::{Arc, Mutex};
+
 use async_trait::async_trait;
 use rig::{
     agent::AgentBuilder,
+    agent::{AgentHook, HookContext, ToolResultAction, ToolResultEvent},
     client::CompletionClient,
     completion::{Chat, Prompt},
     message::ToolChoice,
@@ -21,6 +24,106 @@ use crate::{
 #[async_trait]
 pub trait AgentLoop {
     async fn chat(&self, prompt: &str) -> Result<String, String>;
+    /// Tool calls recorded during the most recent `chat` turn, in order.
+    /// Empty before the first turn. Used by the TUI to render the Aster-style
+    /// work tree. Defaulted so other `AgentLoop` impls need no changes.
+    fn last_tool_events(&self) -> Vec<ToolEvent> {
+        Vec::new()
+    }
+    /// Model id for the TUI footer. Defaulted for other impls.
+    fn model_name(&self) -> String {
+        "model".to_string()
+    }
+}
+
+/// One tool execution observed during a turn: what ran, with what args,
+/// whether it succeeded, and a short human-readable result summary.
+#[derive(Debug, Clone)]
+pub struct ToolEvent {
+    pub name: String,
+    pub args: serde_json::Value,
+    pub ok: bool,
+    pub summary: String,
+}
+
+impl ToolEvent {
+    /// Short arg preview for the tree leaf, e.g. `src/main.rs` or `cargo test`.
+    pub fn arg_preview(&self) -> String {
+        preview_args(&self.name, &self.args)
+    }
+}
+
+fn preview_args(name: &str, args: &serde_json::Value) -> String {
+    let get = |k: &str| args.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    match name {
+        "read" | "write" | "edit" | "list_directory" => {
+            get("path").unwrap_or_else(|| compact_args(args))
+        }
+        "bash" => get("command").unwrap_or_else(|| compact_args(args)),
+        "grep" => match (get("pattern"), get("path")) {
+            (Some(p), Some(path)) => format!("{p} in {path}"),
+            (Some(p), None) => p,
+            _ => compact_args(args),
+        },
+        "glob" => get("pattern").unwrap_or_else(|| compact_args(args)),
+        "git_diff" => get("path").unwrap_or_else(|| "repo".to_string()),
+        "git_status" => "repo".to_string(),
+        "web_fetch" => get("url").unwrap_or_else(|| compact_args(args)),
+        "web_search" => get("query").unwrap_or_else(|| compact_args(args)),
+        _ => compact_args(args),
+    }
+}
+
+fn compact_args(args: &serde_json::Value) -> String {
+    const N: usize = 80;
+    let s = args.to_string();
+    match s.chars().count() > N {
+        true => format!("{}…", s.chars().take(N - 1).collect::<String>()),
+        false => s,
+    }
+}
+
+/// [`AgentHook`] that records every tool result into a shared vec.
+/// Registered via `AgentBuilder::add_hook`; fires for successes, failures,
+/// skips, and refusals without altering agent behavior (always `Keep`).
+#[derive(Debug, Clone, Default)]
+struct ToolRecorder {
+    events: Arc<Mutex<Vec<ToolEvent>>>,
+}
+
+impl AgentHook for ToolRecorder {
+    async fn on_tool_result(
+        &self,
+        _ctx: &HookContext,
+        event: ToolResultEvent<'_>,
+    ) -> ToolResultAction {
+        let ok = event.raw_result.is_success() || event.raw_result.is_skipped();
+        let detail = event.presentation.render();
+        let summary = match ok {
+            true => first_line(&detail, 120),
+            false => format!("failed: {}", first_line(&detail, 120)),
+        };
+        let parsed: serde_json::Value =
+            serde_json::from_str(event.args).unwrap_or(serde_json::Value::Null);
+        if let Ok(mut guard) = self.events.lock() {
+            guard.push(ToolEvent {
+                name: event.tool_name.to_string(),
+                args: parsed,
+                ok,
+                summary,
+            });
+        }
+        ToolResultAction::keep()
+    }
+}
+
+fn first_line(s: &str, max: usize) -> String {
+    let line = s.lines().next().unwrap_or("").trim();
+    const ELLIPSIS: char = '…';
+    match line.chars().count() > max {
+        true => format!("{}…", line.chars().take(max - 1).collect::<String>().trim_end()),
+        false => line.to_string().replace(ELLIPSIS, "..."),
+    }
 }
 
 /// Rig-backed agent: OpenAI-compatible `/chat/completions` model + preamble +
@@ -30,6 +133,8 @@ pub trait AgentLoop {
 pub struct RigAgent {
     agent: rig::agent::Agent,
     context: tokio::sync::Mutex<Context>,
+    recorder: ToolRecorder,
+    model_name: String,
 }
 
 impl RigAgent {
@@ -42,6 +147,8 @@ impl RigAgent {
             .map_err(|e| format!("failed to build LLM client: {e}"))?;
 
         let model = client.completion_model(cfg.model.clone());
+
+        let recorder = ToolRecorder::default();
 
         let agent = AgentBuilder::new(model)
             .preamble(
@@ -64,11 +171,14 @@ impl RigAgent {
             .tool(WebFetchTool)
             .tool(WebSearchTool)
             .default_max_turns(10)
+            .add_hook(recorder.clone())
             .build();
 
         Ok(Self {
             agent,
             context: tokio::sync::Mutex::new(Context::new()),
+            recorder,
+            model_name: cfg.model.clone(),
         })
     }
 }
@@ -84,6 +194,11 @@ impl AgentLoop for RigAgent {
         // w.r.t. other chat() calls. The TUI serializes turns anyway.
         let mut ctx = self.context.lock().await;
         let before = ctx.len();
+
+        // Fresh per-turn tool log: the hook appends as tools resolve.
+        if let Ok(mut guard) = self.recorder.events.lock() {
+            guard.clear();
+        }
 
         let reply = Chat::chat(&self.agent, prompt, ctx.messages_mut())
             .await
@@ -109,7 +224,7 @@ impl AgentLoop for RigAgent {
                     // Summarizer failed: put the drained messages back instead
                     // of silently dropping history. Next turn retries.
                     let mut restored = drained;
-                    restored.extend(ctx.messages_mut().drain(..));
+                    restored.append(ctx.messages_mut());
                     *ctx.messages_mut() = restored;
                     return Err(format!("context compaction failed, history restored: {e}"));
                 }
@@ -117,5 +232,17 @@ impl AgentLoop for RigAgent {
         }
 
         Ok(reply)
+    }
+
+    fn last_tool_events(&self) -> Vec<ToolEvent> {
+        self.recorder
+            .events
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
+    fn model_name(&self) -> String {
+        self.model_name.clone()
     }
 }

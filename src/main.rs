@@ -6,7 +6,7 @@ mod tui;
 
 use agent::RigAgent;
 use config::Config;
-use tui::{CursiveBackend, TuiBackend};
+use tui::{RatatuiBackend, TuiBackend};
 
 #[tokio::main]
 async fn main() {
@@ -27,7 +27,7 @@ async fn main() {
         }
     };
 
-    if let Err(e) = CursiveBackend::new().run(agent) {
+    if let Err(e) = RatatuiBackend::new().run(agent) {
         eprintln!("rem: TUI error: {e:#}");
         std::process::exit(1);
     }
