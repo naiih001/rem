@@ -21,6 +21,7 @@ use ratatui::{
     Terminal,
 };
 use unicode_width::UnicodeWidthStr;
+use tokio::task::JoinHandle;
 
 use crate::agent::{AgentLoop, ToolEvent};
 use crate::permissions::{ApprovalDecision, ApprovalRequest, ApprovalRx};
@@ -59,6 +60,8 @@ struct TurnResult {
     events: Vec<ToolEvent>,
     /// True LLM reasoning texts captured this turn (may be empty).
     reasoning: Vec<String>,
+    /// Generation tag from `App::turn_generation` at submit time (D2).
+    seq: u64,
 }
 
 /// One live tool observation pushed from the hook while a turn is running.
@@ -121,6 +124,16 @@ const COLLAPSED_LINES: usize = 10;
 /// Cap on stored blocks; oldest blocks drop off the top like the old
 /// 5000-line transcript cap.
 const MAX_BLOCKS: usize = 1000;
+
+/// Braille spinner frames for the busy status row (same set Aster uses).
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// Shaded input band background (Aster `pane_bg`).
+const PANE_BG: Color = Color::Rgb(0x19, 0x19, 0x19);
+/// Warm orange accent for the prompt, spinner, and mode glyph.
+const ACCENT: Color = Color::Rgb(242, 118, 79);
+/// Faint placeholder gray (Aster `placeholder`).
+const PLACEHOLDER: Color = Color::Rgb(0x4d, 0x4d, 0x4d);
 
 /// One selectable row in the messages area. Claude Code style: the user
 /// prompt, the assistant reply, one block per tool call (name + key args +
@@ -223,6 +236,16 @@ struct App {
     /// Pending human approvals (FIFO). Head renders as a blocking modal;
     /// resolving it resumes the parked agent worker in the same run.
     pending_approvals: VecDeque<ApprovalRequest>,
+    /// In-flight turn worker + live-feed watcher (Task 1 / ADR-0005).
+    /// D1: `tokio::spawn` tasks are independent — aborting the outer chat
+    /// task does NOT stop a nested watcher, so `submit()` spawns the 80ms
+    /// watcher as a sibling and both handles are stored here for `abort_turn`.
+    current_turn: Option<JoinHandle<()>>,
+    current_watcher: Option<JoinHandle<()>>,
+    /// Turn generation guard (D2): bumped on every `submit` and every
+    /// `abort_turn`; the `event_loop` drain drops any `TurnResult` whose
+    /// `seq` no longer matches (send-then-abort race).
+    turn_generation: u64,
 }
 
 /// Resolve a queued approval: send the decision over the oneshot and record
@@ -246,6 +269,66 @@ fn resolve_approval(app: &mut App, decision: ApprovalDecision) {
         ),
     });
     app.cap_blocks();
+    app.pinned = true;
+    app.dirty = true;
+}
+
+/// Abort the in-flight turn worker + live-feed watcher (Task 1 / ADR-0005).
+/// Keeps partial output: the live feed row becomes final `ToolCall` blocks,
+/// then a system `interrupted.` marker + `Interrupted (N tools)` trailer.
+/// D1: the watcher is a sibling task (see `submit`), so both stored handles
+/// are aborted explicitly — aborting the outer task alone would orphan it.
+/// D2: bumps `turn_generation` so a `TurnResult` that wins the
+/// send-then-abort race is dropped by the `event_loop` drain (`seq` mismatch).
+fn abort_turn(app: &mut App) {
+    if !app.busy {
+        return;
+    }
+    if let Some(handle) = app.current_turn.take() {
+        handle.abort();
+    }
+    if let Some(handle) = app.current_watcher.take() {
+        handle.abort();
+    }
+    app.turn_generation += 1;
+    app.busy = false;
+    app.turns += 1;
+    app.status = Status::Ready;
+    // Keep partial tools: convert the live feed row into final blocks.
+    let partial: Vec<LiveTool> = match app.blocks.pop() {
+        Some(MessageBlock::LiveTools { tools }) => tools,
+        Some(other) => {
+            app.blocks.push(other);
+            Vec::new()
+        }
+        None => Vec::new(),
+    };
+    let n = partial.len();
+    for tool in partial {
+        app.blocks.push(MessageBlock::ToolCall {
+            name: tool.name,
+            args_preview: tool.preview,
+            ok: tool.ok,
+            summary: tool.summary,
+            output: String::new(),
+            expanded: false,
+        });
+    }
+    if n > 0 {
+        app.blocks.push(MessageBlock::System {
+            text: String::new(),
+        });
+    }
+    app.blocks.push(MessageBlock::System {
+        text: "interrupted.".to_string(),
+    });
+    if n > 0 {
+        app.blocks.push(MessageBlock::Trailer {
+            text: format!("Interrupted ({} tool{})", n, if n == 1 { "" } else { "s" }),
+        });
+    }
+    app.cap_blocks();
+    app.selected = None;
     app.pinned = true;
     app.dirty = true;
 }
@@ -292,6 +375,9 @@ impl App {
             selected: None,
             last_esc: None,
             pending_approvals: VecDeque::new(),
+            current_turn: None,
+            current_watcher: None,
+            turn_generation: 0,
         };
         app.push_system("rem — /quit or esc×2 exits, /clear clears, tab selects blocks.");
         app
@@ -463,9 +549,13 @@ fn event_loop(
 ) -> anyhow::Result<()> {
     loop {
         // Drain live tool observations: each resolved tool appends to the
-        // trailing live row inline in the messages area.
+        // trailing live row inline in the messages area. Gated on `busy`:
+        // a ThinkMsg already in flight when the watcher aborts must not
+        // resurrect a live row after `abort_turn` synthesized the trailer.
         while let Ok(msg) = think_rx.try_recv() {
-            app.push_live_tool(msg);
+            if app.busy {
+                app.push_live_tool(msg);
+            }
         }
         // Drain approval requests into the modal queue. The agent worker is
         // parked on its oneshot; the same run resumes on resolve.
@@ -474,7 +564,16 @@ fn event_loop(
             app.dirty = true;
         }
         // Drain completed turns without blocking the UI.
+        // D2: a `tx.send` that wins the send-then-abort race arrives with a
+        // stale `seq`; drop it so an aborted turn never replays as complete.
         while let Ok(turn) = rx.try_recv() {
+            if turn.seq != app.turn_generation {
+                continue;
+            }
+            app.current_turn.take();
+            if let Some(watcher) = app.current_watcher.take() {
+                watcher.abort();
+            }
             app.busy = false;
             app.turns += 1;
             if turn.result.is_ok() {
@@ -487,11 +586,12 @@ fn event_loop(
             terminal
                 .draw(|f| render(f, app))
                 .context("draw frame")?;
-            // Place the hardware cursor inside the input line.
-            // Layout: header(1) body(?) input(1) footer(1).
+            // Place the hardware cursor on the middle row of the input band.
+            // Layout: header(1) body(?) gap(1) status(0/1) input(3) footer(1),
+            // so the text line is always the third row from the bottom.
             let area = terminal.size().unwrap_or_default();
             let x = app.cursor_x(area.width);
-            let y = area.height.saturating_sub(2);
+            let y = area.height.saturating_sub(3);
             terminal
                 .set_cursor_position(ratatui::layout::Position::new(x, y))
                 .ok();
@@ -509,8 +609,8 @@ fn event_loop(
                 }
                 Event::Mouse(mouse) => {
                     if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
-                        // Clicks land in the body region: rows 1..height-2
-                        // (header row 0, input + footer at the bottom).
+                        // Clicks land in the body region: rows 1..1+view_h
+                        // (header row 0, gap + status + input + footer below).
                         let area = terminal.size().unwrap_or_default();
                         let body_h = app.view_h;
                         let body_top: u16 = 1;
@@ -628,6 +728,12 @@ fn handle_key(
             app.scroll = app.scroll.saturating_add(app.view_h.max(1)).min(max);
         }
         KeyCode::Esc => {
+            // Task 1: busy-first interrupt. The full Esc matrix
+            // (modal/selected/idle) lands in Task 2; other arms are untouched.
+            if app.busy {
+                abort_turn(app);
+                return false;
+            }
             let now = Instant::now();
             let double = app
                 .last_esc
@@ -777,33 +883,39 @@ fn submit(
     // Snapshot how many tools the recorder already holds so the watcher only
     // forwards tools from THIS turn.
     let seen = agent.last_tool_events().len();
-    tokio::spawn(async move {
+    app.turn_generation += 1;
+    let seq = app.turn_generation;
+    // D1: the 80ms live-feed watcher is a SIBLING of the chat task, not a
+    // child — `JoinHandle::abort` on the outer task does not propagate to
+    // nested tasks, so both handles are stored on `App` and `abort_turn`
+    // aborts each explicitly.
+    let watch_agent = Arc::clone(&agent);
+    let watcher_handle = tokio::spawn(async move {
         // Poll the recorder and forward new tools live. Chat is blocking, so
         // this is the live feed without switching to streaming.
-        let watch_agent = Arc::clone(&agent);
-        let watcher = tokio::spawn(async move {
-            let mut forwarded = seen;
-            loop {
-                tokio::time::sleep(Duration::from_millis(80)).await;
-                let events = watch_agent.last_tool_events();
-                if events.len() <= forwarded {
-                    // Stop probing once the turn result arrives: the main
-                    // task below sends TurnResult right after chat returns.
-                    continue;
-                }
-                for ev in events.iter().skip(forwarded) {
-                    let _ = think_tx.send(ThinkMsg {
-                        name: ev.name.clone(),
-                        preview: ev.arg_preview(),
-                        ok: ev.ok,
-                        summary: ev.summary.clone(),
-                    });
-                }
-                forwarded = events.len();
+        let mut forwarded = seen;
+        loop {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            let events = watch_agent.last_tool_events();
+            if events.len() <= forwarded {
+                continue;
             }
-        });
+            for ev in events.iter().skip(forwarded) {
+                let _ = think_tx.send(ThinkMsg {
+                    name: ev.name.clone(),
+                    preview: ev.arg_preview(),
+                    ok: ev.ok,
+                    summary: ev.summary.clone(),
+                });
+            }
+            forwarded = events.len();
+        }
+    });
+    let watcher_abort = watcher_handle.abort_handle();
+    app.current_watcher = Some(watcher_handle);
+    app.current_turn = Some(tokio::spawn(async move {
         let result = agent.chat(&text).await;
-        watcher.abort();
+        watcher_abort.abort();
         // Forward anything the 80ms poll missed between last probe and return.
         let events = agent.last_tool_events();
         let reasoning = agent.last_reasoning();
@@ -811,8 +923,9 @@ fn submit(
             result,
             events,
             reasoning,
+            seq,
         });
-    });
+    }));
     false
 }
 
@@ -1006,13 +1119,15 @@ impl App {
 }
 
 impl App {
-    /// Terminal x-coordinate of the cursor within the input row.
+    /// Terminal x-coordinate of the cursor within the input line.
     /// Shares [`visible_window`] with the renderer so the hardware caret
     /// always sits on the displayed caret column, even mid-line in overflow.
+    /// The text line sits inside the shaded band with a 1-column inset plus
+    /// the 2-column `❯ ` prompt, hence the +3 and the -4 width budget.
     fn cursor_x(&self, term_width: u16) -> u16 {
-        let max_w = (term_width as usize).saturating_sub(3);
+        let max_w = (term_width as usize).saturating_sub(4);
         let (_, caret) = visible_window(&self.input, self.cursor, max_w);
-        2u16.saturating_add(caret as u16)
+        3u16.saturating_add(caret as u16)
     }
 }
 
@@ -1052,24 +1167,32 @@ fn visible_window(input: &str, cursor: usize, max_w: usize) -> (String, usize) {
 
 fn render(f: &mut ratatui::Frame, app: &mut App) {
     let area = f.area();
-    // Layout: header(1) / body (everything else) / input(1) / footer(1).
-    // The old top activity bar + bottom think region are gone: freed rows
-    // belong to the messages area, which now owns inline tool blocks.
+    // Layout: header(1) / body / gap(1) / status(0 when idle, 1 when busy)
+    // / input band(3) / footer(1). Aster-style: the transcript owns every
+    // row above the gap, and the composer is a shaded band with padding.
+    let status_h = match app.busy || !app.pending_approvals.is_empty() {
+        true => 1,
+        false => 0,
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // header
-            Constraint::Min(0),    // blocks
-            Constraint::Length(1), // input
-            Constraint::Length(1), // footer
+            Constraint::Length(1),        // header
+            Constraint::Min(0),           // blocks
+            Constraint::Length(1),        // gap (terminal bg)
+            Constraint::Length(status_h), // busy/approval status
+            Constraint::Length(3),        // shaded input band
+            Constraint::Length(1),        // footer
         ])
         .split(area);
     app.view_h = chunks[1].height;
 
     render_header(f, app, chunks[0]);
     render_body(f, app, chunks[1]);
-    render_input(f, app, chunks[2]);
-    render_footer(f, app, chunks[3]);
+    render_gap(f, chunks[2]);
+    render_status(f, app, chunks[3]);
+    render_input(f, app, chunks[4]);
+    render_footer(f, app, chunks[5]);
     // Approval modal last: centered overlay over the whole frame.
     if let Some(req) = app.pending_approvals.front() {
         render_approval_modal(f, f.area(), req, app.pending_approvals.len());
@@ -1417,92 +1540,118 @@ fn truncate_prompt(p: &str, max: usize) -> String {
     }
 }
 
+/// Gap row between the transcript and the bottom pane. Terminal
+/// background, matching Aster's unshaded gap: the shaded band starts at
+/// the input box, not here.
+fn render_gap(f: &mut ratatui::Frame, area: ratatui::layout::Rect) {
+    f.render_widget(Paragraph::new(Line::from("")), area);
+}
+
+/// Busy/approval status row above the input band (terminal background).
+/// Idle frames give it zero height, so it costs no rows when quiet.
+fn render_status(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
+    if area.height == 0 {
+        return;
+    }
+    if !app.pending_approvals.is_empty() {
+        let line = Line::from(vec![
+            Span::styled("◌ ", Style::default().fg(ACCENT)),
+            Span::styled(
+                format!("waiting approval ({} queued)", app.pending_approvals.len()),
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::styled(
+                " · y approve · n deny · x abort",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+        f.render_widget(Paragraph::new(line), area);
+        return;
+    }
+    if app.busy {
+        let elapsed = app.busy_since.elapsed();
+        let spinner = SPINNER[(elapsed.as_millis() / 100) as usize % SPINNER.len()];
+        let line = Line::from(vec![
+            Span::styled(format!("{spinner} "), Style::default().fg(ACCENT)),
+            Span::styled("working", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!(" · {:.1}s · esc to interrupt", elapsed.as_secs_f32()),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+        f.render_widget(Paragraph::new(line), area);
+        return;
+    }
+    f.render_widget(Paragraph::new(Line::from("")), area);
+}
+
+/// Aster-style composer: a 3-row shaded band (1-row vertical padding around
+/// the text line). Single-line editing: the text line is a 1-column inset
+/// plus `❯ ` plus the visible input window; the placeholder is italic
+/// faint when empty, and a busy hint replaces it while a turn runs.
 fn render_input(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
-    let mut spans = vec![Span::styled(
-        "› ",
-        Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD),
-    )];
+    f.render_widget(Block::default().style(Style::default().bg(PANE_BG)), area);
+    if area.height < 3 || area.width < 8 {
+        return;
+    }
+    let mid = ratatui::layout::Rect::new(area.x, area.y + 1, area.width, 1);
+    let mut spans = vec![
+        Span::raw(" "),
+        Span::styled(
+            "❯ ",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+    ];
     if app.input.is_empty() {
+        let hint = match app.busy {
+            true => "…  (esc to interrupt)",
+            false => "Message rem…  (/ for commands)",
+        };
         spans.push(Span::styled(
-            "Message rem… (/ for commands)",
-            Style::default().fg(Color::DarkGray),
+            hint,
+            Style::default()
+                .fg(PLACEHOLDER)
+                .add_modifier(Modifier::ITALIC),
         ));
     } else {
-        let max_w = (area.width as usize).saturating_sub(3);
+        let max_w = (area.width as usize).saturating_sub(4);
         let (visible, _) = visible_window(&app.input, app.cursor, max_w);
         spans.push(Span::raw(visible));
     }
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
+    f.render_widget(Paragraph::new(Line::from(spans)), mid);
 }
 
+/// Aster-style footer: one left-aligned line — orange `▶▶▶ edit`, faint
+/// model, turn count, and key hints. Busy state lives in the status row
+/// above the input band, so the footer stays quiet during a turn.
 fn render_footer(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
-    let left = vec![
-        Span::styled("▶▶▶ ", Style::default().fg(Color::Yellow)),
+    let faint = Style::default().fg(Color::DarkGray);
+    let mut spans = vec![
+        Span::raw("  "),
+        Span::styled("▶▶▶ edit", Style::default().fg(ACCENT)),
+        Span::styled(format!("  ·  {}", app.model), faint),
         Span::styled(
-            format!("edit · {} · {} turn{}", app.model, app.turns, if app.turns == 1 { "" } else { "s" }),
-            Style::default().fg(Color::DarkGray),
+            format!(
+                "  ·  {} turn{}",
+                app.turns,
+                if app.turns == 1 { "" } else { "s" }
+            ),
+            faint,
         ),
         Span::styled(
             match app.selected {
-                Some(_) => " · enter/space expand · esc input · esc×2 quit",
-                None => " · tab selects block · click toggles · esc×2 quit",
+                Some(_) => "  ·  enter/space expand · esc input",
+                None => "  ·  tab selects block · esc×2 quit",
             },
-            Style::default().fg(Color::DarkGray),
+            faint,
         ),
     ];
-    let right_text = match (&app.status, app.busy) {
-        (_, true) if !app.pending_approvals.is_empty() => {
-            format!("waiting approval ({} queued)", app.pending_approvals.len())
-        }
-        (_, true) => {
-            let dots = 1 + (app.busy_since.elapsed().as_millis() / 400 % 3) as usize;
-            format!("thinking{}", ".".repeat(dots))
-        }
-        (_, _) => match app.status {
-            Status::Ready => "ready".to_string(),
-            Status::Error => "error — see log".to_string(),
-        },
-    };
-    let right_style = match (&app.status, app.busy) {
-        (_, true) if !app.pending_approvals.is_empty() => Style::default().fg(Color::Yellow),
-        (_, true) => Style::default().fg(Color::Yellow),
-        (_, _) => match app.status {
-            Status::Ready => Style::default().fg(Color::DarkGray),
-            Status::Error => Style::default().fg(Color::Red),
-        },
-    };
-    let width = area.width as usize;
-    let left_w: usize = left
-        .iter()
-        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
-        .sum();
-    let right_w = right_text.width();
-    // Narrow terminals: keep the status visible, truncate the hint suffix.
-    let mut spans = left;
-    let avail = width.saturating_sub(right_w + 1);
-    if left_w > avail {
-        // Drop the hint span first, then shorten the model span if needed.
-        spans.pop();
-        let kept: usize = spans
-            .iter()
-            .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
-            .sum();
-        if kept > avail && spans.len() > 1 {
-            spans.pop();
-        }
-        let kept: usize = spans
-            .iter()
-            .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
-            .sum();
-        let pad = avail.saturating_sub(kept);
-        spans.push(Span::raw(" ".repeat(pad)));
-    } else {
-        let pad = avail - left_w;
-        spans.push(Span::raw(" ".repeat(pad)));
+    if matches!(app.status, Status::Error) {
+        spans.push(Span::styled(
+            "  ·  error — see log",
+            Style::default().fg(Color::Red),
+        ));
     }
-    spans.push(Span::styled(right_text, right_style));
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -1704,6 +1853,105 @@ mod tests {
         }
     }
 
+    /// Row text helper for chrome-position assertions: TestBackend exposes
+    /// cells, not string rows, so read the buffer directly.
+    fn row_text(
+        terminal: &ratatui::Terminal<ratatui::backend::TestBackend>,
+        y: u16,
+        w: u16,
+    ) -> String {
+        let buf = terminal.backend().buffer();
+        (0..w)
+            .map(|x| buf.get(x, y).symbol().to_string())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn input_band_renders_aster_chrome() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("test-model".to_string());
+        app.blocks.clear();
+        app.input = "hello".to_string();
+        app.cursor = 5;
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        // Idle 24-row frame: header 0, body 1..=18, gap 19, band 20..=22,
+        // footer 23. Status takes zero rows when idle.
+        let band_top = 24u16 - 4;
+        // Shaded band rows carry the pane background; gap stays terminal bg.
+        for y in band_top..24 - 1 {
+            assert_eq!(
+                terminal.backend().buffer().get(0, y).bg,
+                PANE_BG,
+                "band row {y} should be shaded"
+            );
+        }
+        assert_eq!(
+            terminal.backend().buffer().get(0, band_top - 1).bg,
+            ratatui::style::Color::Reset,
+            "gap row should be terminal bg"
+        );
+        // Prompt + typed text on the band's middle row.
+        let mid = row_text(&terminal, band_top + 1, 80);
+        assert!(mid.contains('❯'), "prompt missing: {mid}");
+        assert!(mid.contains("hello"), "typed text missing: {mid}");
+        // Footer: Aster-style mode/model/turns line.
+        let footer = row_text(&terminal, 24 - 1, 80);
+        assert!(footer.contains("▶▶▶ edit"), "footer mode missing: {footer}");
+        assert!(
+            footer.contains("test-model"),
+            "footer model missing: {footer}"
+        );
+        // Caret accounts for the 1-column inset + 2-column prompt.
+        assert_eq!(app.cursor_x(80), 3 + 5);
+    }
+
+    #[test]
+    fn idle_band_shows_placeholder_and_busy_shows_status() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("test-model".to_string());
+        app.blocks.clear();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let mid = row_text(&terminal, 21, 80);
+        assert!(mid.contains("Message rem…"), "placeholder missing: {mid}");
+
+        app.busy = true;
+        app.busy_since = Instant::now();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        // Busy frame steals one row for the status above the band.
+        let status = row_text(&terminal, 19, 80);
+        assert!(status.contains("working"), "status missing: {status}");
+        assert!(
+            status.contains("esc to interrupt"),
+            "hint missing: {status}"
+        );
+        let mid = row_text(&terminal, 21, 80);
+        assert!(mid.contains("esc to interrupt"), "busy hint missing: {mid}");
+    }
+
+    #[test]
+    fn approval_queues_status_above_input_band() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("test-model".to_string());
+        app.blocks.clear();
+        let (req, _rx) = approval_req("bash", "cargo test");
+        app.pending_approvals.push_back(req);
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        // Status row sits above the band and outside the centered modal.
+        let status = row_text(&terminal, 19, 80);
+        assert!(
+            status.contains("waiting approval"),
+            "approval status missing: {status}"
+        );
+        // Input band still shaded underneath.
+        assert_eq!(terminal.backend().buffer().get(0, 21).bg, PANE_BG);
+    }
+
     #[test]
     fn click_maps_row_to_block_and_toggles() {
         let mut app = App::new("model".to_string());
@@ -1786,6 +2034,57 @@ mod tests {
         assert!(text.contains("cargo test"), "got: {text}");
         assert!(text.contains("[y] approve"), "got: {text}");
         assert!(text.contains("[n] deny"), "got: {text}");
+    }
+
+    #[test]
+    fn esc_while_busy_aborts_turn_and_keeps_partial() {
+        let mut app = App::new("model".to_string());
+        app.blocks.clear();
+        app.busy = true;
+        app.turn_generation = 3;
+        app.blocks.push(MessageBlock::LiveTools {
+            tools: vec![LiveTool {
+                name: "bash".to_string(),
+                preview: "cargo test".to_string(),
+                ok: true,
+                summary: "25 files".to_string(),
+            }],
+        });
+        let agent = std::sync::Arc::new(StubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        // Busy Esc interrupts (false = don't quit); idle double-Esc below
+        // is untouched.
+        assert!(!handle_key(&mut app, &agent, &tx, &think_tx, KeyCode::Esc, KeyModifiers::empty()));
+        assert!(!app.busy);
+        assert!(app.current_turn.is_none());
+        assert!(app.current_watcher.is_none());
+        // Partial tool kept as a final block + interrupted marker + trailer.
+        assert!(app.blocks.iter().any(|b| matches!(b, MessageBlock::ToolCall { name, .. } if name == "bash")));
+        assert!(app.blocks.iter().any(|b| matches!(b, MessageBlock::System { text } if text == "interrupted.")));
+        assert!(app.blocks.iter().any(|b| matches!(b, MessageBlock::Trailer { text } if text == "Interrupted (1 tool)")));
+        // D2: generation bumped, so a late TurnResult with seq 3 is stale.
+        assert_eq!(app.turn_generation, 4);
+    }
+
+    #[test]
+    fn abort_turn_without_live_row_still_marks_interrupted() {
+        let mut app = App::new("model".to_string());
+        app.blocks.clear();
+        app.busy = true;
+        abort_turn(&mut app);
+        assert!(!app.busy);
+        assert!(app.blocks.iter().any(|b| matches!(b, MessageBlock::System { text } if text == "interrupted.")));
+        assert!(!app.blocks.iter().any(|b| matches!(b, MessageBlock::Trailer { .. })));
+    }
+
+    #[test]
+    fn abort_turn_is_noop_when_idle() {
+        let mut app = App::new("model".to_string());
+        let before = app.blocks.len();
+        abort_turn(&mut app);
+        assert_eq!(app.blocks.len(), before);
+        assert_eq!(app.turn_generation, 0);
     }
 
     struct StubAgent;
