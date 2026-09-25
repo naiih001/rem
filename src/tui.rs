@@ -211,16 +211,32 @@ fn is_menu_open(app: &App) -> bool {
     !menu_matches(&app.input).is_empty()
 }
 
-/// Visible menu band height in rows: `min(matches, MENU_MAX_ROWS)` plus
-/// one `+N more` overflow row. Zero when closed.
+fn menu_status_height(app: &App) -> u16 {
+    if is_menu_open(app) && !app.busy && app.pending_approvals.is_empty() {
+        0
+    } else {
+        1
+    }
+}
+
+fn menu_row_capacity(app: &App) -> u16 {
+    PANE_ROWS.saturating_sub(menu_status_height(app) + 3)
+}
+
 fn menu_height(app: &App) -> u16 {
     if !is_menu_open(app) {
         return 0;
     }
-    let n = menu_matches(&app.input).len();
-    let rows = n.min(MENU_MAX_ROWS);
-    let overflow = if n > MENU_MAX_ROWS { 1 } else { 0 };
-    (rows + overflow) as u16
+    (menu_matches(&app.input).len().min(MENU_MAX_ROWS) as u16).min(menu_row_capacity(app))
+}
+
+/// The gap absorbs unused menu rows so the composer stays on the same row.
+fn menu_gap_height(app: &App) -> u16 {
+    if is_menu_open(app) {
+        menu_row_capacity(app).saturating_sub(menu_height(app))
+    } else {
+        1
+    }
 }
 
 /// Reconcile `menu_sel` with the current input after an edit: menu open +
@@ -557,7 +573,7 @@ fn event_loop(
             // Caret lives on the pane's input line in big-screen
             // (absolute) rows: crossterm MoveTo is always absolute, so
             // no viewport-top subtraction. The pane owns the last
-            // PANE_ROWS rows; input text is third from the bottom.
+            // PANE_ROWS rows; the composer row moves up when its padding is restored.
             let area = terminal.size().unwrap_or_default();
             let x = app.cursor_x(area.width);
             let y = area
@@ -1021,15 +1037,18 @@ fn visible_window(input: &str, cursor: usize, max_w: usize) -> (String, usize) {
 /// never resize the fixed-height viewport.
 fn render_pane(f: &mut ratatui::Frame, app: &mut App) {
     let area = f.area();
+    let menu_open = is_menu_open(app);
     let menu_h = menu_height(app);
+    let status_h = menu_status_height(app);
+    let input_h = if menu_open { 2 } else { 3 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),      // gap (terminal bg)
-            Constraint::Length(1),      // status (busy/approval/idle)
-            Constraint::Length(menu_h), // slash-menu popup (0 when closed)
-            Constraint::Length(3),      // shaded input band
-            Constraint::Length(1),      // footer
+            Constraint::Length(menu_gap_height(app)), // gap (terminal bg)
+            Constraint::Length(status_h),             // status (busy/approval/idle)
+            Constraint::Length(menu_h),               // slash-menu popup (0 when closed)
+            Constraint::Length(input_h),              // shaded input band
+            Constraint::Length(1),                    // footer
         ])
         .split(area);
 
@@ -1042,11 +1061,14 @@ fn render_pane(f: &mut ratatui::Frame, app: &mut App) {
     if let Some(req) = app.pending_approvals.front() {
         render_approval_modal(f, f.area(), req, app.pending_approvals.len());
     }
-    // Caret on the input text row in big-screen (absolute) rows:
-    // crossterm MoveTo takes absolute rows, and the input band chunk
-    // already carries the viewport offset. Mid row of the 3-row band.
+    // Keep the caret on the composer's text row in the shaded band.
     let x = app.cursor_x(area.width);
-    f.set_cursor_position(Position::new(x, chunks[3].y.saturating_add(1)));
+    f.set_cursor_position(Position::new(
+        x,
+        chunks[3]
+            .y
+            .saturating_add(chunks[3].height.saturating_sub(1) / 2),
+    ));
 }
 
 /// Bottom-anchored approval sheet: shaded band with the request + key hints.
@@ -1176,8 +1198,20 @@ fn render_menu(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
         area,
     );
     let sel = app.menu_sel.map_or(0, |i| i.min(cmds.len() - 1));
+    let has_overflow = cmds.len() > area.height as usize;
+    let command_rows = if has_overflow {
+        area.height.saturating_sub(1) as usize
+    } else {
+        cmds.len().min(MENU_MAX_ROWS)
+    };
+    let start = if command_rows == 0 {
+        0
+    } else {
+        sel.saturating_sub(command_rows - 1)
+            .min(cmds.len().saturating_sub(command_rows))
+    };
     let mut lines: Vec<Line<'static>> = Vec::new();
-    for (i, cmd) in cmds.iter().take(MENU_MAX_ROWS).enumerate() {
+    for (i, cmd) in cmds.iter().enumerate().skip(start).take(command_rows) {
         let selected = i == sel;
         let row_style = match selected {
             true => Style::default().bg(MENU_SEL_BG),
@@ -1217,9 +1251,9 @@ fn render_menu(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
             line.style = row_style;
         }
     }
-    if cmds.len() > MENU_MAX_ROWS {
+    if has_overflow {
         lines.push(Line::from(vec![Span::styled(
-            format!("  +{} more", cmds.len() - MENU_MAX_ROWS),
+            format!("  +{} more", cmds.len() - command_rows),
             Style::default().fg(Color::DarkGray).bg(history::PANE_BG),
         )]));
     }
@@ -1235,10 +1269,15 @@ fn render_input(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) 
         Block::default().style(Style::default().bg(history::PANE_BG)),
         area,
     );
-    if area.height < 3 || area.width < 8 {
+    if area.height == 0 || area.width < 8 {
         return;
     }
-    let mid = ratatui::layout::Rect::new(area.x, area.y + 1, area.width, 1);
+    let mid = ratatui::layout::Rect::new(
+        area.x,
+        area.y + area.height.saturating_sub(1) / 2,
+        area.width,
+        1,
+    );
     let mut spans = vec![
         Span::raw(" "),
         Span::styled(
@@ -2224,7 +2263,7 @@ mod tests {
     #[test]
     fn slash_menu_renders_rows_above_composer() {
         use ratatui::{Terminal, backend::TestBackend};
-        let backend = TestBackend::new(80, 10);
+        let backend = TestBackend::new(80, PANE_ROWS);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new("test-model".to_string(), "medium".to_string());
         app.input = "/".to_string();
@@ -2242,8 +2281,14 @@ mod tests {
         assert!(text.contains('▸'), "selection marker missing: {text}");
         assert!(!text.contains("more"), "unexpected overflow row: {text}");
         let menu_row = text.lines().position(|l| l.contains("/quit")).unwrap();
-        let input_row = text.lines().position(|l| l.contains('❯')).unwrap();
+        let input_row = text.lines().position(|l| l.contains("❯ /")).unwrap();
         assert!(menu_row < input_row, "menu must render above the composer");
+        assert_eq!(input_row, 3, "composer should remain in its normal row");
+        assert_eq!(
+            terminal.get_cursor_position().unwrap(),
+            Position::new(4, input_row as u16),
+            "caret should stay on the typed slash in the composer"
+        );
 
         let mut app = App::new("test-model".to_string(), "medium".to_string());
         terminal.draw(|f| render_pane(f, &mut app)).unwrap();
@@ -2251,6 +2296,34 @@ mod tests {
         assert!(
             text.contains("Message rem…"),
             "composer placeholder missing: {text}"
+        );
+    }
+
+    #[test]
+    fn slash_menu_keeps_busy_status_and_composer_visible() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let backend = TestBackend::new(80, PANE_ROWS);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("test-model".to_string(), "medium".to_string());
+        app.busy = true;
+        app.input = "/".to_string();
+        app.cursor = 1;
+        app.menu_sel = Some(2);
+
+        terminal.draw(|f| render_pane(f, &mut app)).unwrap();
+
+        let text = terminal.backend().to_string();
+        assert!(text.contains("working"), "busy status missing: {text}");
+        assert!(text.contains("/help"), "selected command missing: {text}");
+        assert!(text.contains("+2 more"), "overflow hint missing: {text}");
+        assert!(
+            text.lines().any(|line| line.contains("❯ /")),
+            "typed input missing: {text}"
+        );
+        assert_eq!(
+            terminal.get_cursor_position().unwrap(),
+            Position::new(4, 3),
+            "caret should stay on the composer's normal row"
         );
     }
 
