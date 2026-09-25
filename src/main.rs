@@ -2,6 +2,7 @@ mod agent;
 mod config;
 mod context;
 mod history;
+mod markdown;
 mod permissions;
 mod tools;
 mod tui;

@@ -24,6 +24,12 @@ elision, and duration-first trailer. No review rows (no engine exists).
 - **Everything else = `•` bullets with hanging indent.** Dim bullet glyph,
   2-column gutter, continuation lines indent under the bullet (Aster
   `hang()` + `bullet()`). Agent text, notices, tool rows, trailer.
+- **Assistant replies use rendered Markdown.** Parse reply bodies as
+  Markdown and render headings, nested ordered/unordered lists, inline
+  emphasis and code, links as `label (URL)`, fenced code blocks, blockquotes,
+  and tables. Code blocks preserve their lines with indentation and a subtle
+  background; table columns fit the available width and wrap cell contents.
+  User prompts and tool output remain plain text.
 - **Flat tool rows, one group per tool.** Bold label line, then dim nested
   sub-rows with `└` branch on the first row (Aster `history::tool` +
   `branch()`). No step grouping; no findings/review rows.
@@ -54,6 +60,8 @@ elision, and duration-first trailer. No review rows (no engine exists).
 - Hiding thinking keeps the transcript a record of what was said and
   done, not internal deliberation; a marker row would add noise with no
   action behind it.
+- Parsing assistant replies as Markdown avoids line-prefix guesses and
+  preserves block and inline semantics without changing prompt or tool rows.
 - Duration-first trailer ships value with zero new plumbing; file/cost
   stats each need data work that deserves its own slice.
 

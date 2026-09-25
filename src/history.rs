@@ -101,7 +101,7 @@ fn wrapped(text: &str, max: usize) -> Vec<String> {
 
 /// Re-flow a styled line to `max` columns, carrying each span's style across
 /// the break.
-fn wrap_line(line: Line<'static>, max: usize) -> Vec<Line<'static>> {
+pub(crate) fn wrap_line(line: Line<'static>, max: usize) -> Vec<Line<'static>> {
     let mut text = String::new();
     let mut runs = Vec::with_capacity(line.spans.len());
     for span in &line.spans {
@@ -215,12 +215,9 @@ pub(crate) fn user_row(text: &str, width: usize) -> Vec<Line<'static>> {
     prepend_blank(out)
 }
 
-/// Model reply: per-line tint (diff colors, fences, headers) under a bullet.
+/// Model reply: rendered Markdown under a bullet.
 pub(crate) fn reply_rows(text: &str, width: usize) -> Vec<Line<'static>> {
-    let lines: Vec<Line<'static>> = text
-        .lines()
-        .map(|l| Line::from(vec![Span::styled(l.to_string(), reply_style(l))]))
-        .collect();
+    let lines = crate::markdown::render(text, body_width(width));
     match lines.is_empty() {
         true => Vec::new(),
         false => prepend_blank(hang(lines, bullet(), width)),
@@ -416,24 +413,6 @@ pub(crate) fn approval_rows(
     prepend_blank(hang(lines, Span::raw(""), width))
 }
 
-/// Lightweight tint for assistant replies: green additions, red deletions,
-/// dim fences, bold headers.
-pub(crate) fn reply_style(line: &str) -> Style {
-    if line.starts_with("```") {
-        Style::default().fg(Color::DarkGray)
-    } else if line.starts_with('+') && !line.starts_with("++") {
-        Style::default().fg(Color::Green)
-    } else if line.starts_with('-') && !line.starts_with("---") {
-        Style::default().fg(Color::Red)
-    } else if line.starts_with('#') {
-        Style::default().add_modifier(Modifier::BOLD)
-    } else if line.starts_with('>') {
-        Style::default().fg(Color::DarkGray)
-    } else {
-        Style::default()
-    }
-}
-
 enum Elided<'a> {
     Text(&'a str),
     Gap(usize),
@@ -467,20 +446,6 @@ mod tests {
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect()
-    }
-
-    #[test]
-    fn reply_styles_cover_diff_headers_and_body() {
-        assert_eq!(reply_style("+ added"), Style::default().fg(Color::Green));
-        assert_eq!(reply_style("- removed"), Style::default().fg(Color::Red));
-        assert_eq!(reply_style("+++ b/file"), Style::default());
-        assert_eq!(reply_style("--- a/file"), Style::default());
-        assert_eq!(reply_style("```rust"), Style::default().fg(Color::DarkGray));
-        assert_eq!(
-            reply_style("# Title"),
-            Style::default().add_modifier(Modifier::BOLD)
-        );
-        assert_eq!(reply_style("plain"), Style::default());
     }
 
     #[test]

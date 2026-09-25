@@ -41,6 +41,10 @@
 ## Message list (ADR-0005, Aster-style)
 
 - **Scrollback model**: Finished rows print into the terminal's own scrollback and are never touched again. Only the bottom pane stays managed. No Tab selection, no expand/collapse, no click-toggle, no in-app scroll.
+- **Rendered Markdown reply**: Assistant reply text parsed as Markdown for headings, nested lists, inline emphasis/code, links, fenced code blocks, blockquotes, and tables. Prompts and tool output remain plain text.
+- **Markdown link**: Rendered as its label followed by its destination in parentheses.
+- **Markdown table**: Columns are sized to fit the available transcript width; cell contents wrap within those columns.
+- **Markdown code block**: Fenced code rendered with preserved line breaks, indentation, and a subtle background.
 - **Chapter mark**: The user row — filled band (`rail_bg`) with accent left rail (`▌`) + `❯ ` prompt. The only banded row; not a bullet.
 - **Bullet row**: Every other row — dim `• ` glyph with hanging indent (continuations indent under the bullet, 2-column gutter).
 - **Tool row**: Flat, one group per tool call. Bold label line + dim nested sub-rows, `└` branch on the first sub-row.
