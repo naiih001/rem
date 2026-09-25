@@ -46,6 +46,11 @@ pub trait AgentLoop {
     fn model_name(&self) -> String {
         "model".to_string()
     }
+    /// Effort level for the TUI footer and the `reasoning_effort` request
+    /// param. Defaulted for other impls.
+    fn effort_name(&self) -> String {
+        "medium".to_string()
+    }
 }
 
 /// One tool execution observed during a turn: what ran, with what args,
@@ -197,6 +202,7 @@ pub struct RigAgent {
     context: tokio::sync::Mutex<Context>,
     recorder: ToolRecorder,
     model_name: String,
+    effort: String,
 }
 
 impl RigAgent {
@@ -239,6 +245,7 @@ impl RigAgent {
             .tool(WebFetchTool)
             .tool(WebSearchTool)
             .default_max_turns(100)
+            .additional_params(serde_json::json!({"reasoning_effort": cfg.effort.clone()}))
             .add_hook(recorder.clone())
             .add_hook(gate)
             .build();
@@ -248,6 +255,7 @@ impl RigAgent {
             context: tokio::sync::Mutex::new(Context::new()),
             recorder,
             model_name: cfg.model.clone(),
+            effort: cfg.effort.clone(),
         })
     }
 }
@@ -324,5 +332,9 @@ impl AgentLoop for RigAgent {
 
     fn model_name(&self) -> String {
         self.model_name.clone()
+    }
+
+    fn effort_name(&self) -> String {
+        self.effort.clone()
     }
 }

@@ -74,6 +74,7 @@ fn run_app(
     approval_rx: ApprovalRx,
 ) -> anyhow::Result<()> {
     let model = agent.model_name();
+    let effort = agent.effort_name();
     let agent = Arc::new(agent);
     let (tx, rx) = mpsc::channel::<TurnResult>();
     let (think_tx, think_rx) = mpsc::channel::<ThinkMsg>();
@@ -110,7 +111,7 @@ fn run_app(
         )?;
     }
 
-    let mut app = App::new(model);
+    let mut app = App::new(model, effort);
     // The approval channel is tokio mpsc; the TUI loop is sync crossterm, so
     // poll with try_recv (never block the 50ms frame).
     let mut approval_rx = approval_rx;
@@ -149,6 +150,7 @@ const ACCENT: Color = Color::Rgb(242, 118, 79);
 /// expand/collapse, no in-app scroll — the terminal owns all of that.
 struct App {
     model: String,
+    effort: String,
     /// Finished transcript groups waiting to print above the viewport.
     /// Each entry is one `history::` row group (already wrapped to
     /// `term_width` at enqueue time... actually wrapped at drain time;
@@ -160,8 +162,6 @@ struct App {
     hist_idx: Option<usize>,
     busy: bool,
     busy_since: Instant,
-    status: Status,
-    turns: usize,
     dirty: bool,
     /// Live tool rows already streamed this turn (count only — the rows
     /// themselves went straight to scrollback). Used by `abort_turn` to
@@ -229,8 +229,6 @@ fn abort_turn(app: &mut App) {
     }
     app.turn_generation += 1;
     app.busy = false;
-    app.turns += 1;
-    app.status = Status::Ready;
     let n = app.streamed_tools;
     app.streamed_tools = 0;
     app.enqueue_notice("interrupted.".to_string());
@@ -244,21 +242,16 @@ fn abort_turn(app: &mut App) {
     app.dirty = true;
 }
 
-#[derive(Clone)]
-enum Status {
-    Ready,
-    Error,
-}
-
 /// Format turn duration like Aster's trailer (`22.4s`).
 fn fmt_elapsed(d: Duration) -> String {
     format!("{:.1}s", d.as_secs_f32())
 }
 
 impl App {
-    fn new(model: String) -> Self {
+    fn new(model: String, effort: String) -> Self {
         let mut app = Self {
             model,
+            effort,
             print_queue: Vec::new(),
             input: String::new(),
             cursor: 0,
@@ -266,8 +259,6 @@ impl App {
             hist_idx: None,
             busy: false,
             busy_since: Instant::now(),
-            status: Status::Ready,
-            turns: 0,
             dirty: true,
             streamed_tools: 0,
             pending_approvals: VecDeque::new(),
@@ -367,7 +358,6 @@ impl App {
             }
             Err(e) => {
                 self.enqueue(history::error_row(&format!("[error] {e}"), w));
-                self.status = Status::Error;
             }
         }
         if !events.is_empty() && result.is_ok() {
@@ -452,10 +442,6 @@ fn event_loop(
             }
             let started = app.busy_since;
             app.busy = false;
-            app.turns += 1;
-            if turn.result.is_ok() {
-                app.status = Status::Ready;
-            }
             // Full-fidelity completion: finish_turn prints every tool in
             // the final event list (authoritative output included), then
             // reply + trailer. Live rows already in scrollback stay as the
@@ -722,7 +708,6 @@ fn submit(
     app.enqueue_user(&text);
     app.busy = true;
     app.busy_since = Instant::now();
-    app.status = Status::Ready;
     app.streamed_tools = 0;
 
     let agent = Arc::clone(agent);
@@ -1061,26 +1046,12 @@ fn render_input(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) 
 /// above the input band, so the footer stays quiet during a turn.
 fn render_footer(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
     let faint = Style::default().fg(Color::DarkGray);
-    let mut spans = vec![
+    let spans = vec![
         Span::raw("  "),
         Span::styled("▶▶▶ edit", Style::default().fg(ACCENT)),
         Span::styled(format!("  ·  {}", app.model), faint),
-        Span::styled(
-            format!(
-                "  ·  {} turn{}",
-                app.turns,
-                if app.turns == 1 { "" } else { "s" }
-            ),
-            faint,
-        ),
-        Span::styled("  ·  esc interrupt · ^D quit", faint),
+        Span::styled(format!("  ·  {}", app.effort), faint),
     ];
-    if matches!(app.status, Status::Error) {
-        spans.push(Span::styled(
-            "  ·  error — see log",
-            Style::default().fg(Color::Red),
-        ));
-    }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -1136,7 +1107,7 @@ mod tests {
 
     #[test]
     fn pane_renders_gap_status_band_footer() {
-        let mut app = App::new("test-model".to_string());
+        let mut app = App::new("test-model".to_string(), "medium".to_string());
         app.term_width = 80;
         let buf = pane_buffer(&mut app, 80);
         // Gap row: terminal background.
@@ -1151,10 +1122,11 @@ mod tests {
         let mid = cell_text(&buf, 3, 80);
         assert!(mid.contains('❯'), "prompt missing: {mid}");
         assert!(mid.contains("Message rem…"), "placeholder missing: {mid}");
-        // Footer: mode/model/turns line.
+        // Footer: mode/model/effort line.
         let footer = cell_text(&buf, 5, 80);
         assert!(footer.contains("▶▶▶ edit"), "footer missing: {footer}");
         assert!(footer.contains("test-model"), "model missing: {footer}");
+        assert!(footer.contains("medium"), "effort missing: {footer}");
         // Caret accounts for the 1-column inset + 2-column prompt.
         app.input = "hello".to_string();
         app.cursor = 5;
@@ -1163,7 +1135,7 @@ mod tests {
 
     #[test]
     fn busy_status_row_shows_spinner_and_hint() {
-        let mut app = App::new("test-model".to_string());
+        let mut app = App::new("test-model".to_string(), "medium".to_string());
         app.term_width = 80;
         app.busy = true;
         app.busy_since = Instant::now();
@@ -1180,7 +1152,7 @@ mod tests {
 
     #[test]
     fn approval_sheet_renders_over_pane() {
-        let mut app = App::new("test-model".to_string());
+        let mut app = App::new("test-model".to_string(), "medium".to_string());
         app.term_width = 80;
         let (req, _rx) = approval_req("bash", "cargo test");
         app.pending_approvals.push_back(req);
@@ -1199,7 +1171,7 @@ mod tests {
 
     #[test]
     fn finish_turn_streams_tools_reply_and_duration_trailer() {
-        let mut app = App::new("model".to_string());
+        let mut app = App::new("model".to_string(), "medium".to_string());
         app.term_width = 80;
         // One tool already streamed live: only the tail prints.
         app.streamed_tools = 1;
@@ -1237,17 +1209,16 @@ mod tests {
 
     #[test]
     fn finish_turn_error_prints_no_trailer() {
-        let mut app = App::new("model".to_string());
+        let mut app = App::new("model".to_string(), "medium".to_string());
         app.term_width = 80;
         let before = app.print_queue.len();
         app.finish_turn(&[], &Err("boom".to_string()), Instant::now());
         assert_eq!(app.print_queue.len(), before + 1);
-        assert!(matches!(app.status, Status::Error));
     }
 
     #[test]
     fn stream_tool_counts_for_abort_trailer() {
-        let mut app = App::new("model".to_string());
+        let mut app = App::new("model".to_string(), "medium".to_string());
         app.term_width = 80;
         let ev = crate::agent::ToolEvent {
             name: "bash".to_string(),
@@ -1264,7 +1235,7 @@ mod tests {
 
     #[test]
     fn git_diff_streams_patch_row_with_counts() {
-        let mut app = App::new("model".to_string());
+        let mut app = App::new("model".to_string(), "medium".to_string());
         app.term_width = 80;
         let ev = crate::agent::ToolEvent {
             name: "git_diff".to_string(),
@@ -1311,7 +1282,7 @@ mod tests {
 
     #[test]
     fn modal_keys_resolve_approval_with_audit_notice() {
-        let mut app = App::new("model".to_string());
+        let mut app = App::new("model".to_string(), "medium".to_string());
         app.print_queue.clear();
         let (req, rx) = approval_req("bash", "cargo test");
         app.pending_approvals.push_back(req);
@@ -1352,7 +1323,7 @@ mod tests {
             (KeyCode::Char('x'), ApprovalDecision::AbortTurn),
             (KeyCode::Char('a'), ApprovalDecision::ApproveAlways),
         ] {
-            let mut app = App::new("model".to_string());
+            let mut app = App::new("model".to_string(), "medium".to_string());
             app.print_queue.clear();
             let (req, rx) = approval_req("write", "a.txt");
             app.pending_approvals.push_back(req);
@@ -1373,7 +1344,7 @@ mod tests {
 
     #[test]
     fn esc_while_busy_aborts_and_queues_interrupted_rows() {
-        let mut app = App::new("model".to_string());
+        let mut app = App::new("model".to_string(), "medium".to_string());
         app.print_queue.clear();
         app.busy = true;
         app.turn_generation = 3;
@@ -1412,7 +1383,7 @@ mod tests {
 
     #[test]
     fn abort_turn_without_streamed_tools_marks_interrupted_only() {
-        let mut app = App::new("model".to_string());
+        let mut app = App::new("model".to_string(), "medium".to_string());
         app.print_queue.clear();
         app.busy = true;
         abort_turn(&mut app);
@@ -1435,7 +1406,7 @@ mod tests {
 
     #[test]
     fn abort_turn_is_noop_when_idle() {
-        let mut app = App::new("model".to_string());
+        let mut app = App::new("model".to_string(), "medium".to_string());
         let before = app.print_queue.len();
         abort_turn(&mut app);
         assert_eq!(app.print_queue.len(), before);
@@ -1444,7 +1415,7 @@ mod tests {
 
     #[test]
     fn ctrl_d_with_text_is_noop() {
-        let mut app = App::new("model".to_string());
+        let mut app = App::new("model".to_string(), "medium".to_string());
         app.input = "hi".to_string();
         app.cursor = 2;
         let agent = std::sync::Arc::new(StubAgent);
@@ -1463,7 +1434,7 @@ mod tests {
 
     #[test]
     fn ctrl_d_empty_idle_quits() {
-        let mut app = App::new("model".to_string());
+        let mut app = App::new("model".to_string(), "medium".to_string());
         let agent = std::sync::Arc::new(StubAgent);
         let (tx, _rx) = mpsc::channel::<TurnResult>();
         let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
@@ -1479,7 +1450,7 @@ mod tests {
 
     #[test]
     fn ctrl_d_empty_busy_aborts_then_quits() {
-        let mut app = App::new("model".to_string());
+        let mut app = App::new("model".to_string(), "medium".to_string());
         app.print_queue.clear();
         app.busy = true;
         app.turn_generation = 5;
@@ -1515,7 +1486,7 @@ mod tests {
 
     #[test]
     fn ctrl_d_empty_modal_resolves_abort_then_quits() {
-        let mut app = App::new("model".to_string());
+        let mut app = App::new("model".to_string(), "medium".to_string());
         app.print_queue.clear();
         app.busy = true;
         let (req, rx) = approval_req("bash", "cargo test");
@@ -1540,7 +1511,7 @@ mod tests {
 
     #[test]
     fn ctrl_c_idle_clears_input_without_quit() {
-        let mut app = App::new("model".to_string());
+        let mut app = App::new("model".to_string(), "medium".to_string());
         app.input = "hello".to_string();
         app.cursor = 5;
         let agent = std::sync::Arc::new(StubAgent);
@@ -1564,7 +1535,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<TurnResult>();
         let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
         // Busy + typed input: clears the line, the turn keeps running.
-        let mut app = App::new("model".to_string());
+        let mut app = App::new("model".to_string(), "medium".to_string());
         app.print_queue.clear();
         app.busy = true;
         app.turn_generation = 7;
@@ -1610,7 +1581,7 @@ mod tests {
 
     #[test]
     fn ctrl_c_in_modal_is_ignored() {
-        let mut app = App::new("model".to_string());
+        let mut app = App::new("model".to_string(), "medium".to_string());
         app.print_queue.clear();
         app.busy = true;
         app.input = "typed".to_string();
@@ -1641,7 +1612,7 @@ mod tests {
 
     #[test]
     fn slash_clear_requests_screen_wipe_and_notice() {
-        let mut app = App::new("model".to_string());
+        let mut app = App::new("model".to_string(), "medium".to_string());
         app.print_queue.clear();
         app.input = "/clear".to_string();
         app.cursor = 6;
@@ -1674,7 +1645,7 @@ mod tests {
 
     #[test]
     fn slash_unknown_queues_notice() {
-        let mut app = App::new("model".to_string());
+        let mut app = App::new("model".to_string(), "medium".to_string());
         app.print_queue.clear();
         app.input = "/nope".to_string();
         app.cursor = 5;
