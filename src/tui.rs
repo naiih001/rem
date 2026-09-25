@@ -143,11 +143,93 @@ const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 
 /// Warm orange accent for the prompt, spinner, and mode glyph.
 const ACCENT: Color = Color::Rgb(242, 118, 79);
+/// Slash-menu popup budget (Aster `menu_lines` 10-cap): max command rows;
+/// one extra `+N more` row appears on overflow.
+const MENU_MAX_ROWS: usize = 10;
+/// Selected menu-row highlight: subtle lift over `PANE_BG`.
+const MENU_SEL_BG: Color = Color::Rgb(0x2e, 0x2e, 0x2e);
 /// Scrollback transcript (ADR-0005): finished rows print into the
 /// terminal's own scrollback via `insert_before` and are never touched
 /// again. `App` holds only a queue of pending `Line` groups; the event
 /// loop drains it above the inline viewport. No selection, no
 /// expand/collapse, no in-app scroll — the terminal owns all of that.
+///
+/// Slash-command registry (ADR-0007): single source of truth for menu
+/// rows and `/help` output. `takes_arg` is reserved for future use.
+struct Command {
+    name: &'static str,
+    takes_arg: bool,
+    desc: &'static str,
+}
+
+static COMMANDS: &[Command] = &[
+    Command {
+        name: "quit",
+        takes_arg: false,
+        desc: "quit the app",
+    },
+    Command {
+        name: "clear",
+        takes_arg: false,
+        desc: "clear transcript",
+    },
+    Command {
+        name: "help",
+        takes_arg: false,
+        desc: "list commands",
+    },
+];
+
+/// Match trimmed input against exact `/name`.
+fn lookup_command(text: &str) -> Option<&'static Command> {
+    let name = text.trim().strip_prefix('/')?;
+    COMMANDS.iter().find(|c| c.name == name)
+}
+
+/// Slash-menu prefix filter: the menu lives only while the input is a bare
+/// `/token` — must start with `/` and contain no whitespace. Empty prefix
+/// (`/`) matches all. Case-sensitive.
+fn menu_matches(input: &str) -> Vec<&'static Command> {
+    let Some(token) = input.strip_prefix('/') else {
+        return Vec::new();
+    };
+    if token.chars().any(|c| c.is_whitespace()) {
+        return Vec::new();
+    }
+    COMMANDS
+        .iter()
+        .filter(|c| c.name.starts_with(token))
+        .collect()
+}
+
+/// True when the slash menu should show: at least one match.
+fn is_menu_open(app: &App) -> bool {
+    !menu_matches(&app.input).is_empty()
+}
+
+/// Visible menu band height in rows: `min(matches, MENU_MAX_ROWS)` plus
+/// one `+N more` overflow row. Zero when closed.
+fn menu_height(app: &App) -> u16 {
+    if !is_menu_open(app) {
+        return 0;
+    }
+    let n = menu_matches(&app.input).len();
+    let rows = n.min(MENU_MAX_ROWS);
+    let overflow = if n > MENU_MAX_ROWS { 1 } else { 0 };
+    (rows + overflow) as u16
+}
+
+/// Reconcile `menu_sel` with the current input after an edit: menu open +
+/// `None` → `Some(0)`; `Some(i)` → clamped; menu closed → `None`.
+fn clamp_menu_sel(app: &mut App) {
+    let n = menu_matches(&app.input).len();
+    if n == 0 {
+        app.menu_sel = None;
+    } else {
+        app.menu_sel = Some(app.menu_sel.map_or(0, |i| i.min(n - 1)));
+    }
+}
+
 struct App {
     model: String,
     effort: String,
@@ -167,6 +249,9 @@ struct App {
     /// themselves went straight to scrollback). Used by `abort_turn` to
     /// synthesize the `Interrupted (N tools)` trailer.
     streamed_tools: usize,
+    /// Slash-menu selection index (ADR-0007). `None` = menu closed;
+    /// `Some(i)` = menu open with row `i` highlighted.
+    menu_sel: Option<usize>,
     /// Pending human approvals (FIFO). Head renders as a blocking modal;
     /// resolving it resumes the parked agent worker in the same run.
     pending_approvals: VecDeque<ApprovalRequest>,
@@ -261,6 +346,7 @@ impl App {
             busy_since: Instant::now(),
             dirty: true,
             streamed_tools: 0,
+            menu_sel: None,
             pending_approvals: VecDeque::new(),
             current_turn: None,
             current_watcher: None,
@@ -576,6 +662,46 @@ fn handle_key(
     if mods.contains(KeyModifiers::CONTROL) {
         return handle_ctrl(app, code);
     }
+    // Slash-menu branch (ADR-0007): menu owns keys when open.
+    if is_menu_open(app) {
+        match code {
+            KeyCode::Up => {
+                let n = menu_matches(&app.input).len();
+                if n > 0 {
+                    let cur = app.menu_sel.unwrap_or(0) % n;
+                    app.menu_sel = Some((cur + n - 1) % n);
+                }
+                return false;
+            }
+            KeyCode::Down => {
+                let n = menu_matches(&app.input).len();
+                if n > 0 {
+                    let cur = app.menu_sel.unwrap_or(0) % n;
+                    app.menu_sel = Some((cur + 1) % n);
+                }
+                return false;
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                let matches = menu_matches(&app.input);
+                if !matches.is_empty() {
+                    let idx = app.menu_sel.unwrap_or(0).min(matches.len() - 1);
+                    app.input = format!("/{}", matches[idx].name);
+                    app.cursor = app.input.chars().count();
+                    clamp_menu_sel(app);
+                }
+                return false;
+            }
+            KeyCode::Enter => return submit(app, agent, tx, think_tx),
+            KeyCode::Esc => {
+                app.menu_sel = None;
+                if app.busy {
+                    abort_turn(app);
+                }
+                return false;
+            }
+            _ => {}
+        }
+    }
     // Esc (Task 2 / ADR-0006, scrollback edition): busy interrupts, idle
     // is a no-op. No selection exists to deselect; no Esc sequence quits.
     if code == KeyCode::Esc {
@@ -594,9 +720,11 @@ fn handle_key(
                 app.cursor -= 1;
                 remove_char_at(&mut app.input, app.cursor);
             }
+            clamp_menu_sel(app);
         }
         KeyCode::Delete => {
             remove_char_at(&mut app.input, app.cursor);
+            clamp_menu_sel(app);
         }
         KeyCode::Left => {
             app.cursor = app.cursor.saturating_sub(1);
@@ -619,6 +747,7 @@ fn handle_key(
         KeyCode::PageUp | KeyCode::PageDown => {}
         KeyCode::Char(c) => {
             insert_char_at(&mut app.input, &mut app.cursor, c);
+            clamp_menu_sel(app);
         }
         _ => {}
     }
@@ -634,15 +763,18 @@ fn handle_ctrl(app: &mut App, code: KeyCode) -> bool {
         KeyCode::Char('c') => {
             app.input.clear();
             app.cursor = 0;
+            clamp_menu_sel(app);
             false
         }
         KeyCode::Char('u') => {
             app.input.clear();
             app.cursor = 0;
+            clamp_menu_sel(app);
             false
         }
         KeyCode::Char('w') => {
             delete_word_before(&mut app.input, &mut app.cursor);
+            clamp_menu_sel(app);
             false
         }
         KeyCode::Char('d') => {
@@ -680,28 +812,45 @@ fn submit(
     tx: &mpsc::Sender<TurnResult>,
     think_tx: &mpsc::Sender<ThinkMsg>,
 ) -> bool {
-    let text = app.input.trim().to_string();
+    let mut text = app.input.trim().to_string();
     if text.is_empty() || app.busy {
         return false;
     }
+    // Prefix-run (ADR-0007): a menu-eligible prefix resolves to the
+    // highlighted match before dispatch, so `/c` + Enter runs `/clear`.
+    if !menu_matches(&text).is_empty() {
+        let matches = menu_matches(&text);
+        let idx = app.menu_sel.unwrap_or(0).min(matches.len() - 1);
+        text = format!("/{}", matches[idx].name);
+    }
     app.input.clear();
     app.cursor = 0;
+    app.menu_sel = None;
     app.history.push(text.clone());
     app.hist_idx = None;
 
-    if text == "/quit" {
-        return true;
-    }
-    if text == "/clear" {
-        // Scrollback model: clear the screen + scrollback, print a fresh
-        // notice above the pane. The drain runs before the next pane draw
-        // so the notice lands above the composer.
-        app.request_clear_screen = true;
-        app.enqueue_notice("cleared.".to_string());
-        return false;
+    if let Some(cmd) = lookup_command(&text) {
+        match cmd.name {
+            "quit" => return true,
+            "clear" => {
+                app.request_clear_screen = true;
+                app.enqueue_notice("cleared.".to_string());
+                return false;
+            }
+            "help" => {
+                let mut msg = String::from("commands:");
+                for c in COMMANDS {
+                    let usage = if c.takes_arg { " <arg>" } else { "" };
+                    msg.push_str(&format!("\n  /{}{usage} — {}", c.name, c.desc));
+                }
+                app.enqueue_notice(msg);
+                return false;
+            }
+            _ => {}
+        }
     }
     if text.starts_with('/') {
-        app.enqueue_notice(format!("unknown command \"{text}\". Try /clear or /quit."));
+        app.enqueue_notice(format!("unknown command \"{text}\". Try /help."));
         return false;
     }
 
@@ -779,6 +928,7 @@ fn recall_history(app: &mut App, older: bool) {
     app.hist_idx = next;
     app.input = next.map(|i| app.history[i].clone()).unwrap_or_default();
     app.cursor = app.input.chars().count();
+    clamp_menu_sel(app);
 }
 
 fn byte_idx(s: &str, char_idx: usize) -> usize {
@@ -870,20 +1020,23 @@ fn visible_window(input: &str, cursor: usize, max_w: usize) -> (String, usize) {
 /// never resize the fixed-height viewport.
 fn render_pane(f: &mut ratatui::Frame, app: &mut App) {
     let area = f.area();
+    let menu_h = menu_height(app);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // gap (terminal bg)
-            Constraint::Length(1), // status (busy/approval/idle)
-            Constraint::Length(3), // shaded input band
-            Constraint::Length(1), // footer
+            Constraint::Length(1),      // gap (terminal bg)
+            Constraint::Length(1),      // status (busy/approval/idle)
+            Constraint::Length(menu_h), // slash-menu popup (0 when closed)
+            Constraint::Length(3),      // shaded input band
+            Constraint::Length(1),      // footer
         ])
         .split(area);
 
     render_gap(f, chunks[0]);
     render_status(f, app, chunks[1]);
-    render_input(f, app, chunks[2]);
-    render_footer(f, app, chunks[3]);
+    render_menu(f, app, chunks[2]);
+    render_input(f, app, chunks[3]);
+    render_footer(f, app, chunks[4]);
     // Approval modal last: bottom-anchored sheet over the pane.
     if let Some(req) = app.pending_approvals.front() {
         render_approval_modal(f, f.area(), req, app.pending_approvals.len());
@@ -1000,6 +1153,74 @@ fn render_status(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect)
         return;
     }
     f.render_widget(Paragraph::new(Line::from("")), area);
+}
+
+/// Slash-menu popup directly above the composer (ADR-0007): `PANE_BG`
+/// shaded band, one row per match as `▸ /name  desc` — selected row
+/// highlighted (`MENU_SEL_BG` + bold `ACCENT` name + `▸` marker), rest
+/// dim — capped at `MENU_MAX_ROWS` with a trailing dim `+N more` overflow
+/// row. Zero-height chunk when closed.
+fn render_menu(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let cmds = menu_matches(&app.input);
+    if cmds.is_empty() {
+        return;
+    }
+    f.render_widget(
+        Block::default().style(Style::default().bg(history::PANE_BG)),
+        area,
+    );
+    let sel = app.menu_sel.map_or(0, |i| i.min(cmds.len() - 1));
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (i, cmd) in cmds.iter().take(MENU_MAX_ROWS).enumerate() {
+        let selected = i == sel;
+        let row_style = match selected {
+            true => Style::default().bg(MENU_SEL_BG),
+            false => Style::default().bg(history::PANE_BG),
+        };
+        let (marker, name_style) = match selected {
+            true => (
+                Span::styled(
+                    "▸ ",
+                    Style::default()
+                        .fg(ACCENT)
+                        .add_modifier(Modifier::BOLD)
+                        .bg(MENU_SEL_BG),
+                ),
+                Style::default()
+                    .fg(ACCENT)
+                    .add_modifier(Modifier::BOLD)
+                    .bg(MENU_SEL_BG),
+            ),
+            false => (
+                Span::styled("  ", Style::default().bg(history::PANE_BG)),
+                Style::default().fg(Color::DarkGray).bg(history::PANE_BG),
+            ),
+        };
+        lines.push(Line::from(vec![
+            marker,
+            Span::styled(format!("/{}", cmd.name), name_style),
+            Span::styled(
+                format!("  {}", cmd.desc),
+                Style::default().fg(Color::DarkGray).bg(match selected {
+                    true => MENU_SEL_BG,
+                    false => history::PANE_BG,
+                }),
+            ),
+        ]));
+        if let Some(line) = lines.last_mut() {
+            line.style = row_style;
+        }
+    }
+    if cmds.len() > MENU_MAX_ROWS {
+        lines.push(Line::from(vec![Span::styled(
+            format!("  +{} more", cmds.len() - MENU_MAX_ROWS),
+            Style::default().fg(Color::DarkGray).bg(history::PANE_BG),
+        )]));
+    }
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 /// Aster-style composer: a 3-row shaded band (1-row vertical padding around
@@ -1673,6 +1894,361 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(flat.contains("unknown command"), "got: {flat}");
+    }
+
+    // ---- ADR-0007 slash-menu regression tests ----
+
+    #[test]
+    fn slash_menu_filter_is_prefix_case_sensitive_no_whitespace() {
+        assert!(menu_matches("").is_empty());
+        assert!(menu_matches("hello /").is_empty());
+        assert!(menu_matches(" /").is_empty());
+        assert_eq!(menu_matches("/").len(), COMMANDS.len());
+        let names = |input: &str| {
+            menu_matches(input)
+                .iter()
+                .map(|c| c.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names("/c"), vec!["clear"]);
+        assert_eq!(names("/qu"), vec!["quit"]);
+        assert_eq!(names("/h"), vec!["help"]);
+        assert!(menu_matches("/C").is_empty());
+        assert!(menu_matches("/CLEAR").is_empty());
+        assert!(menu_matches("/ ").is_empty());
+        assert!(menu_matches("/foo bar").is_empty());
+        assert!(menu_matches("/clear ").is_empty());
+        assert!(menu_matches("/bogus").is_empty());
+    }
+
+    #[test]
+    fn slash_menu_open_and_height_follow_matches() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        assert!(!is_menu_open(&app));
+        assert_eq!(menu_height(&app), 0);
+        app.input = "/".to_string();
+        app.cursor = 1;
+        assert!(is_menu_open(&app));
+        assert_eq!(menu_height(&app), COMMANDS.len() as u16);
+        assert_eq!(MENU_MAX_ROWS, 10);
+        app.input = "/bogus".to_string();
+        app.cursor = 6;
+        assert!(!is_menu_open(&app));
+        assert_eq!(menu_height(&app), 0);
+    }
+
+    #[test]
+    fn slash_menu_clamp_reconciles_selection_after_edits() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.input = "/".to_string();
+        clamp_menu_sel(&mut app);
+        assert_eq!(app.menu_sel, Some(0));
+        app.input = "/c".to_string();
+        app.menu_sel = Some(2);
+        clamp_menu_sel(&mut app);
+        assert_eq!(app.menu_sel, Some(0));
+        app.input = "hello".to_string();
+        clamp_menu_sel(&mut app);
+        assert_eq!(app.menu_sel, None);
+        app.input = "/foo bar".to_string();
+        app.menu_sel = Some(0);
+        clamp_menu_sel(&mut app);
+        assert_eq!(app.menu_sel, None);
+    }
+
+    #[test]
+    fn slash_menu_up_down_wrap_and_never_touch_history() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        let agent = std::sync::Arc::new(StubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        app.input = "/".to_string();
+        app.cursor = 1;
+        app.menu_sel = Some(0);
+        app.history = vec!["old turn".to_string()];
+        for expect in [1, 2, 0] {
+            assert!(!handle_key(
+                &mut app,
+                &agent,
+                &tx,
+                &think_tx,
+                KeyCode::Down,
+                KeyModifiers::empty()
+            ));
+            assert_eq!(app.menu_sel, Some(expect));
+        }
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Up,
+            KeyModifiers::empty()
+        ));
+        assert_eq!(app.menu_sel, Some(2));
+        assert_eq!(app.hist_idx, None);
+        assert_eq!(app.input, "/");
+        assert_eq!(app.history, vec!["old turn".to_string()]);
+    }
+
+    #[test]
+    fn slash_menu_tab_completes_highlighted_name() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        let agent = std::sync::Arc::new(StubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        app.input = "/c".to_string();
+        app.cursor = 2;
+        app.menu_sel = Some(0);
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Tab,
+            KeyModifiers::empty()
+        ));
+        assert_eq!(app.input, "/clear");
+        assert_eq!(app.cursor, 6);
+        assert!(is_menu_open(&app));
+        assert_eq!(app.menu_sel, Some(0));
+    }
+
+    #[test]
+    fn slash_menu_esc_idle_only_dismisses() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        let agent = std::sync::Arc::new(StubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        app.input = "/".to_string();
+        app.cursor = 1;
+        app.menu_sel = Some(1);
+        let before = app.print_queue.len();
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Esc,
+            KeyModifiers::empty()
+        ));
+        assert_eq!(app.menu_sel, None);
+        assert!(!app.busy);
+        assert_eq!(app.print_queue.len(), before);
+        assert!(is_menu_open(&app));
+    }
+
+    #[test]
+    fn slash_menu_esc_busy_aborts_and_dismisses() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        let agent = std::sync::Arc::new(StubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        app.busy = true;
+        app.turn_generation = 3;
+        app.input = "/".to_string();
+        app.cursor = 1;
+        app.menu_sel = Some(0);
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Esc,
+            KeyModifiers::empty()
+        ));
+        assert_eq!(app.menu_sel, None);
+        assert!(!app.busy);
+        assert_eq!(app.turn_generation, 4);
+        let flat: String = app
+            .print_queue
+            .iter()
+            .flatten()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(flat.contains("interrupted."), "got: {flat}");
+    }
+
+    #[test]
+    fn slash_menu_typing_space_closes_menu() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        let agent = std::sync::Arc::new(StubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        app.input = "/".to_string();
+        app.cursor = 1;
+        app.menu_sel = Some(0);
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Char(' '),
+            KeyModifiers::empty()
+        ));
+        assert_eq!(app.input, "/ ");
+        assert_eq!(app.menu_sel, None);
+        assert!(!is_menu_open(&app));
+    }
+
+    #[test]
+    fn slash_submit_prefix_runs_highlighted_command() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        let agent = std::sync::Arc::new(StubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        app.input = "/c".to_string();
+        app.cursor = 2;
+        app.menu_sel = Some(0);
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Enter,
+            KeyModifiers::empty()
+        ));
+        assert_eq!(app.menu_sel, None);
+        assert_eq!(app.history.last().map(String::as_str), Some("/clear"));
+        let flat: String = app
+            .print_queue
+            .iter()
+            .flatten()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(flat.contains("cleared."), "got: {flat}");
+    }
+
+    #[test]
+    fn slash_submit_bare_slash_runs_top_match_quit() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        let agent = std::sync::Arc::new(StubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        app.input = "/".to_string();
+        app.cursor = 1;
+        app.menu_sel = Some(0);
+        assert!(handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Enter,
+            KeyModifiers::empty()
+        ));
+    }
+
+    #[test]
+    fn slash_submit_help_lists_every_registry_command() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        let agent = std::sync::Arc::new(StubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        app.input = "/h".to_string();
+        app.cursor = 2;
+        app.menu_sel = Some(0);
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Enter,
+            KeyModifiers::empty()
+        ));
+        let flat: String = app
+            .print_queue
+            .iter()
+            .flatten()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for name in ["/quit", "/clear", "/help"] {
+            assert!(flat.contains(name), "help missing {name}: {flat}");
+        }
+        assert!(flat.contains("quit the app"), "help missing desc: {flat}");
+    }
+
+    #[test]
+    fn slash_submit_unknown_points_at_help() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        let agent = std::sync::Arc::new(StubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        app.input = "/bogus".to_string();
+        app.cursor = 6;
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Enter,
+            KeyModifiers::empty()
+        ));
+        assert!(!app.busy, "unknown slash must not start a turn");
+        let flat: String = app
+            .print_queue
+            .iter()
+            .flatten()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(flat.contains("unknown command"), "got: {flat}");
+        assert!(flat.contains("Try /help."), "got: {flat}");
+    }
+
+    #[test]
+    fn slash_menu_renders_rows_above_composer() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let backend = TestBackend::new(80, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("test-model".to_string(), "medium".to_string());
+        app.input = "/".to_string();
+        app.cursor = 1;
+        app.menu_sel = Some(0);
+        terminal.draw(|f| render_pane(f, &mut app)).unwrap();
+        let text = terminal.backend().to_string();
+        for name in ["/quit", "/clear", "/help"] {
+            assert!(text.contains(name), "menu row missing {name}: {text}");
+        }
+        assert!(
+            text.contains("clear transcript"),
+            "menu desc missing: {text}"
+        );
+        assert!(text.contains('▸'), "selection marker missing: {text}");
+        assert!(!text.contains("more"), "unexpected overflow row: {text}");
+        let menu_row = text.lines().position(|l| l.contains("/quit")).unwrap();
+        let input_row = text.lines().position(|l| l.contains('❯')).unwrap();
+        assert!(menu_row < input_row, "menu must render above the composer");
+
+        let mut app = App::new("test-model".to_string(), "medium".to_string());
+        terminal.draw(|f| render_pane(f, &mut app)).unwrap();
+        let text = terminal.backend().to_string();
+        assert!(
+            text.contains("Message rem…"),
+            "composer placeholder missing: {text}"
+        );
     }
 
     struct StubAgent;
