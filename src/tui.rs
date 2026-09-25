@@ -86,6 +86,26 @@ fn run_app(
     // selection, and copy. No mouse capture: it would steal the terminal's
     // own selection over the scrollback transcript.
     enable_raw_mode().context("enable raw mode")?;
+    // Wipe the terminal so rem owns the full screen from the start,
+    // matching Aster's clear_screen on launch. Purge clears the
+    // scrollback (cargo output, shell prompt) above the viewport.
+    // The inline viewport anchors at the cursor position when the
+    // terminal is created, so park the cursor at the bottom FIRST:
+    // the viewport then owns the last PANE_ROWS rows (big-screen rows).
+    {
+        use crossterm::{
+            cursor::MoveTo,
+            execute,
+            terminal::{Clear, ClearType, size as term_size},
+        };
+        let (_, h) = term_size().context("terminal size")?;
+        execute!(
+            io::stdout(),
+            Clear(ClearType::All),
+            Clear(ClearType::Purge),
+            MoveTo(0, h.saturating_sub(PANE_ROWS)),
+        )?;
+    }
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::with_options(
         backend,
@@ -94,22 +114,6 @@ fn run_app(
         },
     )
     .context("create terminal")?;
-    // Wipe the terminal so rem owns the full screen from the start,
-    // matching Aster's clear_screen on launch. Purge clears the
-    // scrollback (cargo output, shell prompt) above the viewport.
-    {
-        use crossterm::{
-            cursor::MoveTo,
-            execute,
-            terminal::{Clear, ClearType},
-        };
-        execute!(
-            io::stdout(),
-            Clear(ClearType::All),
-            Clear(ClearType::Purge),
-            MoveTo(0, 0),
-        )?;
-    }
 
     let mut app = App::new(model, effort);
     // The approval channel is tokio mpsc; the TUI loop is sync crossterm, so
@@ -550,20 +554,17 @@ fn event_loop(
             terminal
                 .draw(|f| render_pane(f, app))
                 .context("draw frame")?;
-            // Caret lives on the pane's input line: pane occupies the last
-            // PANE_ROWS rows, input text is the third from the bottom.
+            // Caret lives on the pane's input line in big-screen
+            // (absolute) rows: crossterm MoveTo is always absolute, so
+            // no viewport-top subtraction. The pane owns the last
+            // PANE_ROWS rows; input text is third from the bottom.
             let area = terminal.size().unwrap_or_default();
             let x = app.cursor_x(area.width);
             let y = area
                 .height
                 .saturating_sub(3)
                 .min(area.height.saturating_sub(1));
-            // Inline viewport: coordinates are viewport-relative. The pane
-            // fills the viewport, so subtract the viewport top.
-            let top = area.height.saturating_sub(PANE_ROWS);
-            terminal
-                .set_cursor_position(Position::new(x, y.saturating_sub(top)))
-                .ok();
+            terminal.set_cursor_position(Position::new(x, y)).ok();
             terminal.show_cursor().ok();
             app.dirty = false;
         }
@@ -1041,9 +1042,11 @@ fn render_pane(f: &mut ratatui::Frame, app: &mut App) {
     if let Some(req) = app.pending_approvals.front() {
         render_approval_modal(f, f.area(), req, app.pending_approvals.len());
     }
-    // Caret on the input line, viewport-relative.
+    // Caret on the input text row in big-screen (absolute) rows:
+    // crossterm MoveTo takes absolute rows, and the input band chunk
+    // already carries the viewport offset. Mid row of the 3-row band.
     let x = app.cursor_x(area.width);
-    f.set_cursor_position(Position::new(x, 3));
+    f.set_cursor_position(Position::new(x, chunks[3].y.saturating_add(1)));
 }
 
 /// Bottom-anchored approval sheet: shaded band with the request + key hints.
@@ -1269,7 +1272,7 @@ fn render_footer(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect)
     let faint = Style::default().fg(Color::DarkGray);
     let spans = vec![
         Span::raw("  "),
-        Span::styled("▶▶▶ edit", Style::default().fg(ACCENT)),
+        Span::styled("▶ manual", Style::default().fg(ACCENT)),
         Span::styled(format!("  ·  {}", app.model), faint),
         Span::styled(format!("  ·  {}", app.effort), faint),
     ];
@@ -1345,7 +1348,7 @@ mod tests {
         assert!(mid.contains("Message rem…"), "placeholder missing: {mid}");
         // Footer: mode/model/effort line.
         let footer = cell_text(&buf, 5, 80);
-        assert!(footer.contains("▶▶▶ edit"), "footer missing: {footer}");
+        assert!(footer.contains("▶ manual"), "footer missing: {footer}");
         assert!(footer.contains("test-model"), "model missing: {footer}");
         assert!(footer.contains("medium"), "effort missing: {footer}");
         // Caret accounts for the 1-column inset + 2-column prompt.
