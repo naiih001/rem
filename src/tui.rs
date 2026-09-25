@@ -10,7 +10,7 @@ use crossterm::{
 };
 use ratatui::{
     Terminal, TerminalOptions, Viewport,
-    backend::CrosstermBackend,
+    backend::{Backend, CrosstermBackend},
     layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -141,6 +141,42 @@ fn run_app(
 /// input band(3) + footer(1). The status slot always reserves its row so
 /// busy/approval transitions never resize the viewport (fixed height).
 const PANE_ROWS: u16 = 6;
+const PANE_CURSOR_ROW: u16 = 3;
+
+fn resize_cursor_row(height: u16) -> u16 {
+    height
+        .saturating_sub(PANE_ROWS)
+        .saturating_add(PANE_CURSOR_ROW)
+        .min(height.saturating_sub(1))
+}
+
+fn resize_inline_viewport<B: Backend>(
+    terminal: &mut Terminal<B>,
+    width: u16,
+    height: u16,
+) -> io::Result<()> {
+    let area = Rect::new(0, 0, width, height);
+    terminal
+        .backend_mut()
+        .set_cursor_position(Position::new(0, resize_cursor_row(height)))?;
+    terminal.resize(area)?;
+
+    let viewport = terminal.get_frame().area();
+    let cursor_y = if height >= PANE_ROWS {
+        viewport.y.saturating_add(PANE_CURSOR_ROW)
+    } else {
+        viewport.y.saturating_add(viewport.height.saturating_sub(1))
+    };
+    terminal.set_cursor_position(Position::new(0, cursor_y))?;
+
+    if height >= PANE_ROWS {
+        terminal
+            .backend_mut()
+            .set_cursor_position(Position::new(0, resize_cursor_row(height)))?;
+        terminal.resize(area)?;
+    }
+    Ok(())
+}
 
 /// Braille spinner frames for the busy status row (same set Aster uses).
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -564,20 +600,6 @@ fn event_loop(
             terminal
                 .draw(|f| render_pane(f, app))
                 .context("draw frame")?;
-            // Caret lives on the pane's input line in big-screen
-            // (absolute) rows: crossterm MoveTo is always absolute, so
-            // no viewport-top subtraction. The pane owns the last
-            // PANE_ROWS rows; input text is third from the bottom.
-            let area = terminal.size().unwrap_or_default();
-            let x = app
-                .cursor_x(area.width)
-                .min(area.width.saturating_sub(1));
-            let y = area
-                .height
-                .saturating_sub(3)
-                .min(area.height.saturating_sub(1));
-            terminal.set_cursor_position(Position::new(x, y)).ok();
-            terminal.show_cursor().ok();
             app.dirty = false;
         }
 
@@ -591,15 +613,18 @@ fn event_loop(
                 }
                 // No mouse handling (ADR-0005): the transcript is terminal
                 // scrollback, so the terminal keeps selection and copy.
-                Event::Resize(w, _h) => {
+                Event::Resize(w, h) => {
                     // Phase 1: use the event args directly (no
                     // `terminal.size()` query) and redraw immediately so
                     // `Terminal::draw` autoresize applies this frame
                     // instead of waiting for the next 50ms poll. Stores
                     // the real width for wrapping; layout floors stay at
-                    // the render site (Phase 2/3). Cursor/layout/insert
-                    // handling untouched (later phases).
+                    // the render site (Phase 2/3).
                     app.term_width = w.max(1);
+                    // Ratatui moves a horizontally-shrunk inline viewport
+                    // to row zero to avoid wrapped-cell artifacts. Re-anchor
+                    // it at the bottom before painting the resized frame.
+                    resize_inline_viewport(terminal, w, h).context("resize inline viewport")?;
                     // Phase 3B2: freeze `insert_before` for the next frame
                     // so the transcript drain can't race the viewport move.
                     app.skip_drain_once = true;
@@ -1070,11 +1095,11 @@ fn render_pane(f: &mut ratatui::Frame, app: &mut App) {
         Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1), // gap (terminal bg)
-                Constraint::Length(1), // status (busy/approval/idle)
+                Constraint::Length(1),         // gap (terminal bg)
+                Constraint::Length(1),         // status (busy/approval/idle)
                 Constraint::Length(menu_full), // slash-menu popup (0 when closed)
-                Constraint::Min(3),   // shaded input band (absorbs extra rows)
-                Constraint::Length(1), // footer
+                Constraint::Min(3),            // shaded input band (absorbs extra rows)
+                Constraint::Length(1),         // footer
             ])
             .split(area)
     } else {
@@ -1082,11 +1107,11 @@ fn render_pane(f: &mut ratatui::Frame, app: &mut App) {
         Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Max(1), // gap (terminal bg)
-                Constraint::Max(1), // status (busy/approval/idle)
+                Constraint::Max(1),      // gap (terminal bg)
+                Constraint::Max(1),      // status (busy/approval/idle)
                 Constraint::Max(menu_h), // slash-menu popup (0 when closed/capped)
-                Constraint::Min(3), // shaded input band (absorbs extra rows)
-                Constraint::Max(1), // footer
+                Constraint::Min(3),      // shaded input band (absorbs extra rows)
+                Constraint::Max(1),      // footer
             ])
             .split(area)
     };
@@ -1352,6 +1377,71 @@ fn render_footer(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inline_pane_stays_bottom_anchored_across_terminal_resizes() {
+        use ratatui::{Terminal, TerminalOptions, Viewport, backend::TestBackend};
+
+        let mut backend = TestBackend::new(80, 24);
+        backend.set_cursor_position(Position::new(0, 18)).unwrap();
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(PANE_ROWS),
+            },
+        )
+        .unwrap();
+        let mut app = App::new("test-model".to_string(), "medium".to_string());
+        let mut area = Rect::default();
+
+        terminal
+            .draw(|f| {
+                area = f.area();
+                render_pane(f, &mut app);
+            })
+            .unwrap();
+        assert_eq!(area, Rect::new(0, 18, 80, PANE_ROWS));
+
+        terminal.backend_mut().resize(40, 24);
+        resize_inline_viewport(&mut terminal, 40, 24).unwrap();
+        terminal
+            .draw(|f| {
+                area = f.area();
+                render_pane(f, &mut app);
+            })
+            .unwrap();
+        assert_eq!(area, Rect::new(0, 18, 40, PANE_ROWS));
+
+        terminal.backend_mut().resize(120, 32);
+        resize_inline_viewport(&mut terminal, 120, 32).unwrap();
+        terminal
+            .draw(|f| {
+                area = f.area();
+                render_pane(f, &mut app);
+            })
+            .unwrap();
+        assert_eq!(area, Rect::new(0, 26, 120, PANE_ROWS));
+
+        terminal.backend_mut().resize(20, 4);
+        resize_inline_viewport(&mut terminal, 20, 4).unwrap();
+        terminal
+            .draw(|f| {
+                area = f.area();
+                render_pane(f, &mut app);
+            })
+            .unwrap();
+        assert_eq!(area, Rect::new(0, 0, 20, 4));
+
+        terminal.backend_mut().resize(80, 24);
+        resize_inline_viewport(&mut terminal, 80, 24).unwrap();
+        terminal
+            .draw(|f| {
+                area = f.area();
+                render_pane(f, &mut app);
+            })
+            .unwrap();
+        assert_eq!(area, Rect::new(0, 18, 80, PANE_ROWS));
+    }
 
     fn cell_text(buf: &ratatui::buffer::Buffer, y: u16, w: u16) -> String {
         (0..w)
