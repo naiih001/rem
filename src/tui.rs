@@ -237,6 +237,21 @@ static COMMANDS: &[Command] = &[
         takes_arg: true,
         desc: "list or switch color themes",
     },
+    Command {
+        name: "resume",
+        takes_arg: true,
+        desc: "resume a saved session",
+    },
+    Command {
+        name: "rename",
+        takes_arg: true,
+        desc: "rename current session",
+    },
+    Command {
+        name: "fork",
+        takes_arg: false,
+        desc: "fork session from here",
+    },
 ];
 
 /// Split `/name arg...` into the registry command + trailing arg.
@@ -311,6 +326,12 @@ fn clamp_menu_sel(app: &mut App) {
     }
 }
 
+struct SessionPicker {
+    items: Vec<crate::sessions::Session>,
+    sel: usize,
+    show_all: bool,
+}
+
 struct App {
     model: String,
     effort: String,
@@ -326,6 +347,9 @@ struct App {
     cursor: usize, // char index into `input`
     history: Vec<String>,
     hist_idx: Option<usize>,
+    session_id: String,
+    session_title: String,
+    session_picker: Option<SessionPicker>,
     busy: bool,
     busy_since: Instant,
     dirty: bool,
@@ -436,6 +460,9 @@ impl App {
             cursor: 0,
             history: Vec::new(),
             hist_idx: None,
+            session_id: std::env::var("REM_SESSION_ID").unwrap_or_default(),
+            session_title: std::env::var("REM_SESSION_TITLE").unwrap_or_default(),
+            session_picker: None,
             busy: false,
             busy_since: Instant::now(),
             dirty: true,
@@ -632,6 +659,21 @@ fn event_loop(
             // in-progress record; the completed rows are the final record.
             app.streamed_tools = 0;
             app.finish_turn(&turn.events, &turn.result, started);
+            if turn.result.is_ok() {
+                if let Ok(msgs) = agent.export_sync() {
+                    if let Ok(conn) = crate::sessions::open() {
+                        let _ = crate::sessions::save_messages(&conn, &app.session_id, &msgs);
+                        let _ = crate::sessions::touch(&conn, &app.session_id);
+                        // Fallback title from user text; TODO: LLM generate_title (needs async).
+                        if app.session_title.is_empty() || app.session_title == "untitled" {
+                            if let Some(first) = app.history.iter().rev().find(|h| !h.starts_with('/')) {
+                                let t: String = first.chars().take(40).collect();
+                                if !t.is_empty() { let _ = crate::sessions::update_title(&conn, &app.session_id, &t); app.session_title = t; }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // Print queued transcript groups above the viewport first, so the
@@ -768,6 +810,66 @@ fn handle_key(
     }
     if mods.contains(KeyModifiers::CONTROL) {
         return handle_ctrl(app, code);
+    }
+    // Session picker owns keys while open (Phase 3b).
+    if app.session_picker.is_some() {
+        match code {
+            KeyCode::Up => {
+                if let Some(p) = app.session_picker.as_mut() {
+                    let n = p.items.len().max(1);
+                    p.sel = (p.sel + n - 1) % n;
+                }
+            }
+            KeyCode::Down => {
+                if let Some(p) = app.session_picker.as_mut() {
+                    let n = p.items.len().max(1);
+                    p.sel = (p.sel + 1) % n;
+                }
+            }
+            KeyCode::Esc => {
+                app.session_picker = None;
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                let show_all = !app.session_picker.as_ref().map(|p| p.show_all).unwrap_or(false);
+                let root = picker_project_root();
+                match crate::sessions::open() {
+                    Err(e) => app.enqueue_notice(format!("sessions: {e}")),
+                    Ok(conn) => {
+                        let res = if show_all { crate::sessions::list_all(&conn) } else { crate::sessions::list_for_project(&conn, &root) };
+                        match res {
+                            Err(e) => app.enqueue_notice(format!("sessions: {e}")),
+                            Ok(items) => {
+                                app.session_picker = Some(SessionPicker { items, sel: 0, show_all });
+                            }
+                        }
+                    }
+                }
+            }
+            KeyCode::Enter => {
+                let picked = app.session_picker.as_ref().and_then(|p| p.items.get(p.sel).map(|s| (s.id.clone(), s.title.clone())));
+                app.session_picker = None;
+                match picked {
+                    None => app.enqueue_notice("no session selected".to_string()),
+                    Some((id, title)) => match crate::sessions::open() {
+                        Err(e) => app.enqueue_notice(format!("resume failed: {e}")),
+                        Ok(conn) => match crate::sessions::get_session(&conn, &id) {
+                            Ok(Some(s)) => {
+                                app.session_id = s.id.clone();
+                                app.session_title = s.title.clone();
+                                match agent.import_sync(&s.messages_json) {
+                                    Ok(()) => app.enqueue_notice(format!("resumed {title}")),
+                                    Err(e) => app.enqueue_notice(format!("resumed {title} (history import failed: {e})")),
+                                }
+                            }
+                            Ok(None) => app.enqueue_notice(format!("no session {id}")),
+                            Err(e) => app.enqueue_notice(format!("resume failed: {e}")),
+                        },
+                    },
+                }
+            }
+            _ => {}
+        }
+        return false;
     }
     // Slash-menu branch (ADR-0007): menu owns keys when open.
     if is_menu_open(app) {
@@ -1000,6 +1102,78 @@ fn submit(
                 handle_theme_command(app, &arg);
                 return false;
             }
+            "resume" => {
+                if arg.is_empty() {
+                    match crate::sessions::open() {
+                        Err(e) => app.enqueue_notice(format!("sessions: {e}")),
+                        Ok(conn) => {
+                            let root = picker_project_root();
+                            match crate::sessions::list_for_project(&conn, &root) {
+                                Err(e) => app.enqueue_notice(format!("sessions: {e}")),
+                                Ok(items) => {
+                                    if items.is_empty() {
+                                        app.enqueue_notice("no sessions for this project (a: all)".to_string());
+                                    }
+                                    app.session_picker = Some(SessionPicker { items, sel: 0, show_all: false });
+                                }
+                            }
+                        }
+                    }
+                    return false;
+                }
+                match crate::sessions::open() {
+                    Err(e) => {
+                        app.enqueue_notice(format!("resume failed: {e}"));
+                    }
+                    Ok(conn) => match crate::sessions::get_session(&conn, &arg) {
+                        Ok(Some(s)) => {
+                            app.session_id = s.id.clone();
+                            app.session_title = s.title.clone();
+                            match agent.import_sync(&s.messages_json) {
+                                Ok(()) => app.enqueue_notice(format!("resumed {}", s.title)),
+                                Err(e) => app.enqueue_notice(format!("resumed {} (history import failed: {e})", s.title)),
+                            }
+                        }
+                        Ok(None) => {
+                            app.enqueue_notice(format!("no session {arg}"));
+                        }
+                        Err(e) => {
+                            app.enqueue_notice(format!("resume failed: {e}"));
+                        }
+                    },
+                }
+                return false;
+            }
+            "rename" => {
+                if arg.is_empty() {
+                    app.enqueue_notice("usage: /rename <name>".to_string());
+                    return false;
+                }
+                match crate::sessions::open() {
+                    Err(e) => {
+                        app.enqueue_notice(format!("rename failed: {e}"));
+                    }
+                    Ok(conn) => match crate::sessions::update_title(&conn, &app.session_id, &arg) {
+                        Ok(()) => {
+                            app.session_title = arg.clone();
+                            app.enqueue_notice(format!("renamed to {arg}"));
+                        }
+                        Err(e) => {
+                            app.enqueue_notice(format!("rename failed: {e}"));
+                        }
+                    },
+                }
+                return false;
+            }
+            "fork" => {
+                let msgs = match agent.export_sync() { Ok(m) => m, Err(e) => { app.enqueue_notice(format!("fork failed: {e}")); return false; } };
+                let conn = match crate::sessions::open() { Ok(c) => c, Err(e) => { app.enqueue_notice(format!("fork failed: {e}")); return false; } };
+                match crate::sessions::create_session(&conn, &picker_project_root(), &agent.model_name()) {
+                    Err(e) => app.enqueue_notice(format!("fork failed: {e}")),
+                    Ok(ns) => { let title = format!("{} (fork)", app.session_title); let _ = crate::sessions::save_messages(&conn, &ns.id, &msgs); let _ = crate::sessions::update_title(&conn, &ns.id, &title); app.session_id = ns.id.clone(); app.session_title = title.clone(); app.enqueue_notice(format!("forked as {title}")); }
+                }
+                return false;
+            }
             _ => {}
         }
     }
@@ -1217,6 +1391,9 @@ fn render_pane(f: &mut ratatui::Frame, app: &mut App) {
         };
         render_approval_modal(f, f.area(), &display, queued, &app.theme);
     }
+    if app.session_picker.is_some() {
+        render_session_picker(f, app, f.area(), &app.theme);
+    }
     // Keep the caret on the composer's text row in the shaded band.
     let x = app.cursor_x(area.width);
     f.set_cursor_position(Position::new(
@@ -1302,6 +1479,85 @@ fn render_approval_modal(
             Style::default().fg(Color::DarkGray),
         )]),
     ];
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+fn picker_project_root() -> String {
+    std::env::current_dir()
+        .ok()
+        .and_then(|p| std::fs::canonicalize(p).ok())
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
+fn picker_ago(updated_at: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(updated_at);
+    let d = (now - updated_at).max(0);
+    if d < 60 {
+        "just now".to_string()
+    } else if d < 3600 {
+        format!("{}m ago", d / 60)
+    } else if d < 86400 {
+        format!("{}h ago", d / 3600)
+    } else {
+        format!("{}d ago", d / 86400)
+    }
+}
+
+fn render_session_picker(
+    f: &mut ratatui::Frame,
+    app: &App,
+    area: Rect,
+    theme: &Theme,
+) {
+    let Some(picker) = app.session_picker.as_ref() else { return; };
+    let w = (area.width * 60 / 100).clamp(50, area.width.max(1)).min(area.width);
+    let h = ((picker.items.len() as u16 + 4).max(12)).min(area.height.max(1));
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let sheet = Rect::new(x, y, w, h);
+    f.render_widget(
+        Block::default().style(Style::default().bg(theme.pane_bg)),
+        sheet,
+    );
+    if sheet.width < 20 || sheet.height < 6 {
+        return;
+    }
+    let inner = Rect::new(
+        sheet.x + 2,
+        sheet.y + 1,
+        sheet.width.saturating_sub(4),
+        sheet.height.saturating_sub(3),
+    );
+    let scope = if picker.show_all { "all" } else { "this project" };
+    let mut lines: Vec<Line<'static>> = vec![Line::from(vec![Span::styled(
+        format!("sessions ({scope})"),
+        Style::default().add_modifier(Modifier::BOLD),
+    )])];
+    if picker.items.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "(no sessions)".to_string(),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    for (i, s) in picker.items.iter().enumerate().take(inner.height.saturating_sub(2) as usize) {
+        let short_proj = s.project_root.rsplit('/').next().unwrap_or(s.project_root.as_str()).to_string();
+        let id8: String = s.id.chars().take(8).collect();
+        let row = format!("{} — {} — {} · {}", s.title, short_proj, picker_ago(s.updated_at), id8);
+        let style = if i == picker.sel {
+            Style::default().bg(theme.menu_sel_bg)
+        } else {
+            Style::default().bg(theme.pane_bg)
+        };
+        lines.push(Line::from(Span::styled(row, style)));
+    }
+    lines.push(Line::from(Span::styled(
+        "enter resume · a all/mine · esc close".to_string(),
+        Style::default().fg(Color::DarkGray),
+    )));
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
@@ -2263,7 +2519,7 @@ mod tests {
         app.cursor = 1;
         app.menu_sel = Some(0);
         app.history = vec!["old turn".to_string()];
-        for expect in [1, 2, 3, 0] {
+        for expect in [1, 2, 3, 4, 5, 6, 0] {
             assert!(!handle_key(
                 &mut app,
                 &agent,
@@ -2282,7 +2538,7 @@ mod tests {
             KeyCode::Up,
             KeyModifiers::empty()
         ));
-        assert_eq!(app.menu_sel, Some(3));
+        assert_eq!(app.menu_sel, Some(6));
         assert_eq!(app.hist_idx, None);
         assert_eq!(app.input, "/");
         assert_eq!(app.history, vec!["old turn".to_string()]);
@@ -2526,8 +2782,8 @@ mod tests {
         app.menu_sel = Some(0);
         terminal.draw(|f| render_pane(f, &mut app)).unwrap();
         let text = terminal.backend().to_string();
-        // Idle capacity fits 3 rows; 4 registry commands spill into
-        // 2 visible rows + a `+2 more` overflow row.
+        // Idle capacity fits 3 rows; 7 registry commands spill into
+        // 2 visible rows + a `+5 more` overflow row.
         for name in ["/quit", "/clear"] {
             assert!(text.contains(name), "menu row missing {name}: {text}");
         }
@@ -2536,7 +2792,7 @@ mod tests {
             "menu desc missing: {text}"
         );
         assert!(text.contains('▸'), "selection marker missing: {text}");
-        assert!(text.contains("+2 more"), "overflow row missing: {text}");
+        assert!(text.contains("+5 more"), "overflow row missing: {text}");
         let menu_row = text.lines().position(|l| l.contains("/quit")).unwrap();
         let input_row = text.lines().position(|l| l.contains("❯ /")).unwrap();
         assert!(menu_row < input_row, "menu must render above the composer");
@@ -2572,7 +2828,7 @@ mod tests {
         let text = terminal.backend().to_string();
         assert!(text.contains("working"), "busy status missing: {text}");
         assert!(text.contains("/help"), "selected command missing: {text}");
-        assert!(text.contains("+3 more"), "overflow hint missing: {text}");
+        assert!(text.contains("+6 more"), "overflow hint missing: {text}");
         assert!(
             text.lines().any(|line| line.contains("❯ /")),
             "typed input missing: {text}"
