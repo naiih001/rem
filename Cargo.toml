@@ -18,3 +18,5 @@ glob = "0.3"
 pulldown-cmark = "0.13"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 html-escape = "0.2"
+toml = "0.8"
+dirs = "7.0"
