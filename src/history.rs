@@ -15,20 +15,7 @@ use ratatui::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-/// Shaded band backgrounds (input band + user chapter band).
-pub(crate) const PANE_BG: Color = Color::Rgb(0x19, 0x19, 0x19);
-pub(crate) const RAIL_BG: Color = Color::Rgb(0x19, 0x19, 0x19);
-/// Warm orange accent for the prompt, spinner, rails, and mode glyph.
-pub(crate) const ACCENT: Color = Color::Rgb(242, 118, 79);
-/// Faint placeholder gray.
-pub(crate) const PLACEHOLDER: Color = Color::Rgb(0x4d, 0x4d, 0x4d);
-/// Diff band tints: full-row backgrounds with a darker mark glyph.
-pub(crate) const ADD_BG: Color = Color::Rgb(0x12, 0x24, 0x0f);
-pub(crate) const ADD_FG: Color = Color::Rgb(0x9e, 0xcb, 0x84);
-pub(crate) const ADD_MARK: Color = Color::Rgb(0x5f, 0x8f, 0x4a);
-pub(crate) const DEL_BG: Color = Color::Rgb(0x2a, 0x15, 0x18);
-pub(crate) const DEL_FG: Color = Color::Rgb(0xe0, 0x8b, 0x8b);
-pub(crate) const DEL_MARK: Color = Color::Rgb(0xa3, 0x4f, 0x4f);
+use crate::theme::Theme;
 
 /// Hanging-indent gutter: `• ` on the first wrapped row, spaces after.
 const GUTTER: usize = 2;
@@ -184,8 +171,8 @@ fn prepend_blank(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
 
 /// A message the user sent: accent rail on a filled band, the only chapter
 /// mark in the transcript. Multi-line prompts continue under `❯ `.
-pub(crate) fn user_row(text: &str, width: usize) -> Vec<Line<'static>> {
-    let fill = Style::default().bg(RAIL_BG);
+pub(crate) fn user_row(text: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+    let fill = Style::default().bg(theme.rail_bg);
     let body = body_width(width);
     let mut out = Vec::new();
     let mut first = true;
@@ -201,8 +188,8 @@ pub(crate) fn user_row(text: &str, width: usize) -> Vec<Line<'static>> {
                 false => "  ",
             };
             let line = Line::from(vec![
-                Span::styled("▌", Style::default().fg(ACCENT).bg(RAIL_BG)),
-                Span::styled(lead, Style::default().fg(ACCENT).bg(RAIL_BG)),
+                Span::styled("▌", Style::default().fg(theme.accent).bg(theme.rail_bg)),
+                Span::styled(lead, Style::default().fg(theme.accent).bg(theme.rail_bg)),
                 Span::styled(chunk, fill),
             ]);
             out.push(pad_to(line, width.max(1), fill));
@@ -216,8 +203,8 @@ pub(crate) fn user_row(text: &str, width: usize) -> Vec<Line<'static>> {
 }
 
 /// Model reply: rendered Markdown under a bullet.
-pub(crate) fn reply_rows(text: &str, width: usize) -> Vec<Line<'static>> {
-    let lines = crate::markdown::render(text, body_width(width));
+pub(crate) fn reply_rows(text: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+    let lines = crate::markdown::render(text, body_width(width), theme);
     match lines.is_empty() {
         true => Vec::new(),
         false => prepend_blank(hang(lines, bullet(), width)),
@@ -305,7 +292,7 @@ pub(crate) fn tool_row(
 
 /// A diff body (`git_diff` output): `verb path` header with `+N −M` counts
 /// pushed right, then full-row tinted bands with a darker mark glyph.
-pub(crate) fn patch_row(verb: &str, path: &str, body: &str, width: usize) -> Vec<Line<'static>> {
+pub(crate) fn patch_row(verb: &str, path: &str, body: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
     // `+++`/`---` file headers are not changed lines.
     let added = body
         .lines()
@@ -330,24 +317,24 @@ pub(crate) fn patch_row(verb: &str, path: &str, body: &str, width: usize) -> Vec
         ),
         Span::styled(path.to_string(), Style::default().fg(Color::Blue)),
         Span::raw(" ".repeat(gap + 1)),
-        Span::styled(format!("+{added}"), Style::default().fg(ADD_FG)),
+        Span::styled(format!("+{added}"), Style::default().fg(theme.add_fg)),
         Span::raw(" "),
-        Span::styled(format!("−{removed}"), Style::default().fg(DEL_FG)),
+        Span::styled(format!("−{removed}"), Style::default().fg(theme.del_fg)),
     ]);
 
     let mut lines = vec![header];
-    lines.extend(diff_lines(body, inner));
+    lines.extend(diff_lines(body, inner, theme));
     prepend_blank(hang(lines, bullet(), width))
 }
 
 /// Tint a unified-ish patch body row by row. Context lines stay faint on the
 /// terminal background; added/removed lines get full-width bands.
-fn diff_lines(body: &str, width: usize) -> Vec<Line<'static>> {
+fn diff_lines(body: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
     body.lines()
         .map(|raw| {
             let (fg, bg, mark) = match raw.chars().next() {
-                Some('+') if !raw.starts_with("+++") => (ADD_FG, ADD_BG, Some(ADD_MARK)),
-                Some('-') if !raw.starts_with("---") => (DEL_FG, DEL_BG, Some(DEL_MARK)),
+                Some('+') if !raw.starts_with("+++") => (theme.add_fg, theme.add_bg, Some(theme.add_mark)),
+                Some('-') if !raw.starts_with("---") => (theme.del_fg, theme.del_bg, Some(theme.del_mark)),
                 _ => (Color::DarkGray, Color::Reset, None),
             };
             let style = Style::default().fg(fg).bg(bg);
@@ -375,9 +362,10 @@ pub(crate) fn approval_rows(
     reason: &str,
     queued: usize,
     width: usize,
+    theme: &Theme,
 ) -> Vec<Line<'static>> {
     let mut head: Vec<Span<'static>> = vec![
-        Span::styled("◌ ", Style::default().fg(ACCENT)),
+        Span::styled("◌ ", Style::default().fg(theme.accent)),
         Span::styled(
             "permission — approval needed".to_string(),
             Style::default().add_modifier(Modifier::BOLD),
@@ -480,7 +468,8 @@ mod tests {
 
     #[test]
     fn user_row_renders_rail_prompt_and_full_width_band() {
-        let out = user_row("hello", 20);
+        let theme = Theme::default();
+        let out = user_row("hello", 20, &theme);
         assert_eq!(out.len(), 2); // blank + band
         let text: Vec<String> = plain(&out);
         assert!(text[1].contains('▌'), "got: {}", text[1]);
@@ -489,8 +478,8 @@ mod tests {
         assert_eq!(col_width(&text[1]), 20, "got: {}", text[1]);
         // Rail carries the accent.
         let rail = &out[1].spans[0];
-        assert_eq!(rail.style.fg, Some(ACCENT));
-        assert_eq!(rail.style.bg, Some(RAIL_BG));
+        assert_eq!(rail.style.fg, Some(theme.accent));
+        assert_eq!(rail.style.bg, Some(theme.rail_bg));
     }
 
     #[test]
@@ -527,8 +516,9 @@ mod tests {
 
     #[test]
     fn patch_row_counts_and_tints_bands() {
+        let theme = Theme::default();
         let body = "--- a/f\n+++ b/f\n ctx\n+ add\n- del";
-        let out = patch_row("Diff", "f", body, 40);
+        let out = patch_row("Diff", "f", body, 40, &theme);
         let text: Vec<String> = plain(&out);
         assert!(text[1].contains("+1"), "got: {:?}", text);
         assert!(text[1].contains("−1"), "got: {:?}", text);
@@ -537,7 +527,7 @@ mod tests {
             .iter()
             .find(|l| plain(std::slice::from_ref(l))[0].contains("+ add"));
         let add_line = add_line.expect("added line present");
-        assert_eq!(add_line.spans.last().unwrap().style.bg, Some(ADD_BG));
+        assert_eq!(add_line.spans.last().unwrap().style.bg, Some(theme.add_bg));
         let ctx_line = out
             .iter()
             .find(|l| plain(std::slice::from_ref(l))[0].contains(" ctx"))
