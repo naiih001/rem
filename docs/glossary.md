@@ -54,6 +54,15 @@
 - **Live stream**: Each resolved tool prints immediately into scrollback.
 - **Trailer**: `• Done ({elapsed}s · N tools)`. File counts, `+/-`, cost are later slices.
 
+## Sessions (ADR-0010)
+
+- **Session**: One persisted conversation row in `sessions.db` (`id, project_root, title, created, updated, model, messages_json`). Created at startup, resumed via `--resume <id>` or `/resume`.
+- **Picker**: Centered popup listing project sessions by `updated_at DESC`. Opened by bare `/resume`; `/resume <id>` bypasses it.
+- **Fork**: Clone of the current session's `messages_json` into a new session id. History verbatim, title reset.
+- **Title**: Human label for a session row. Fallback is first user message truncated to 40 chars; LLM title (`generate_title`, 2-5 words) is TODO.
+- **Autosave**: Per-turn persist via `blocking_lock` `export_sync` -> `save_messages`. Sync TUI submit path; failures must surface, never silent.
+- **Project key**: Literal canonicalized cwd string stored as `project_root`. Picker filters by exact match (`list_for_project`), no prefix/glob.
+
 ## Non-goals (v1)
 
 - True OS sandboxing (namespaces, seccomp, grsecurity). The gate is a *policy + human* layer, not a kernel boundary.

@@ -30,6 +30,20 @@ impl Context {
         &mut self.messages
     }
 
+    pub fn set_messages(&mut self, msgs: Vec<Message>) {
+        self.messages = msgs;
+    }
+
+    pub fn to_json(&self) -> Result<String, String> {
+        serde_json::to_string(&self.messages).map_err(|e| e.to_string())
+    }
+
+    pub fn from_json(s: &str) -> Result<Self, String> {
+        serde_json::from_str::<Vec<Message>>(s)
+            .map_err(|e| e.to_string())
+            .map(|messages| Self { messages })
+    }
+
     #[cfg(test)]
     fn messages(&self) -> &Vec<Message> {
         &self.messages
