@@ -282,9 +282,63 @@ fn menu_matches(input: &str) -> Vec<&'static Command> {
         .collect()
 }
 
+/// Theme-arg partial: the menu suggests installed theme names while the
+/// input is `/theme <partial>` — the `theme` command, exactly one
+/// whitespace run, then a partial name with no whitespace. Returns the
+/// partial (empty = bare `/theme `, list everything). `None` for anything
+/// else: bare `/theme` belongs to the command menu, multi-token args
+/// dispatch directly. Case-sensitive, mirroring `menu_matches`.
+fn theme_arg_partial(input: &str) -> Option<String> {
+    let rest = input.strip_prefix('/')?;
+    let partial = rest.strip_prefix("theme")?;
+    if partial.is_empty() || !partial.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let partial = partial.trim_start();
+    if partial.chars().any(|c| c.is_whitespace()) {
+        return None;
+    }
+    Some(partial.to_string())
+}
+
+/// Prefix-filter installed theme names, order preserved (`list_themes`
+/// already sorts). Pure seam for tests; the live path composes this with
+/// `Theme::list_themes()`.
+fn match_theme_names(names: &[String], partial: &str) -> Vec<String> {
+    names
+        .iter()
+        .filter(|n| n.starts_with(partial))
+        .cloned()
+        .collect()
+}
+
+/// Live theme suggestions for `/theme <partial>`: installed names filtered
+/// by prefix. Filesystem errors → no suggestions (menu stays closed).
+fn theme_arg_matches(input: &str) -> Vec<String> {
+    let Some(partial) = theme_arg_partial(input) else {
+        return Vec::new();
+    };
+    match Theme::list_themes() {
+        Ok(names) => match_theme_names(&names, &partial),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Total menu rows: command rows for a bare `/token`, theme-name rows for
+/// `/theme <partial>`. Mutually exclusive by construction (whitespace
+/// decides), so this is one mode's count — never a mixed sum.
+fn menu_row_count(input: &str) -> usize {
+    let n = menu_matches(input).len();
+    if n > 0 {
+        n
+    } else {
+        theme_arg_matches(input).len()
+    }
+}
+
 /// True when the slash menu should show: at least one match.
 fn is_menu_open(app: &App) -> bool {
-    !menu_matches(&app.input).is_empty()
+    menu_row_count(&app.input) > 0
 }
 
 fn menu_status_height(app: &App) -> u16 {
@@ -303,7 +357,7 @@ fn menu_height(app: &App) -> u16 {
     if !is_menu_open(app) {
         return 0;
     }
-    (menu_matches(&app.input).len().min(MENU_MAX_ROWS) as u16).min(menu_row_capacity(app))
+    (menu_row_count(&app.input).min(MENU_MAX_ROWS) as u16).min(menu_row_capacity(app))
 }
 
 /// The gap absorbs unused menu rows so the composer stays on the same row.
@@ -318,7 +372,7 @@ fn menu_gap_height(app: &App) -> u16 {
 /// Reconcile `menu_sel` with the current input after an edit: menu open +
 /// `None` → `Some(0)`; `Some(i)` → clamped; menu closed → `None`.
 fn clamp_menu_sel(app: &mut App) {
-    let n = menu_matches(&app.input).len();
+    let n = menu_row_count(&app.input);
     if n == 0 {
         app.menu_sel = None;
     } else {
@@ -788,7 +842,7 @@ fn handle_key(
     if is_menu_open(app) {
         match code {
             KeyCode::Up => {
-                let n = menu_matches(&app.input).len();
+                let n = menu_row_count(&app.input);
                 if n > 0 {
                     let cur = app.menu_sel.unwrap_or(0) % n;
                     app.menu_sel = Some((cur + n - 1) % n);
@@ -796,7 +850,7 @@ fn handle_key(
                 return false;
             }
             KeyCode::Down => {
-                let n = menu_matches(&app.input).len();
+                let n = menu_row_count(&app.input);
                 if n > 0 {
                     let cur = app.menu_sel.unwrap_or(0) % n;
                     app.menu_sel = Some((cur + 1) % n);
@@ -810,6 +864,16 @@ fn handle_key(
                     app.input = format!("/{}", matches[idx].name);
                     app.cursor = app.input.chars().count();
                     clamp_menu_sel(app);
+                } else {
+                    // Theme-arg mode (ADR-0010): complete `/theme <partial>`
+                    // to the highlighted theme name.
+                    let names = theme_arg_matches(&app.input);
+                    if !names.is_empty() {
+                        let idx = app.menu_sel.unwrap_or(0).min(names.len() - 1);
+                        app.input = format!("/theme {}", names[idx]);
+                        app.cursor = app.input.chars().count();
+                        clamp_menu_sel(app);
+                    }
                 }
                 return false;
             }
@@ -980,6 +1044,17 @@ fn submit(
     let mut text = app.input.trim().to_string();
     if text.is_empty() || app.busy {
         return false;
+    }
+    // Theme-arg accept (ADR-0010, mirrors the command prefix-run below):
+    // `/theme <partial>` with suggestions open resolves the highlighted
+    // theme name first, so Enter picks a suggestion. Bare `/theme` and
+    // unmatched args fall through to normal dispatch.
+    if menu_matches(&text).is_empty() {
+        let names = theme_arg_matches(&text);
+        if !names.is_empty() {
+            let idx = app.menu_sel.unwrap_or(0).min(names.len() - 1);
+            text = format!("/theme {}", names[idx]);
+        }
     }
     // Prefix-run (ADR-0007): a menu-eligible prefix resolves to the
     // highlighted match before dispatch, so `/c` + Enter runs `/clear`.
@@ -1381,38 +1456,98 @@ fn render_status(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect)
     f.render_widget(Paragraph::new(Line::from("")), area);
 }
 
-/// Slash-menu popup directly above the composer (ADR-0007): themed
-/// shaded band, one row per match as `▸ /name  desc` — selected row
-/// highlighted (theme `menu_sel_bg` + bold accent name + `▸` marker),
-/// rest dim — capped at `MENU_MAX_ROWS` with a trailing dim `+N more`
-/// overflow row. Zero-height chunk when closed.
+/// Slash-menu popup directly above the composer (ADR-0007, ADR-0010):
+/// themed shaded band, one row per match — selected row highlighted (theme
+/// `menu_sel_bg` + bold accent name + `▸` marker), rest dim — capped at
+/// `MENU_MAX_ROWS` with a trailing dim `+N more` overflow row. Zero-height
+/// chunk when closed. Command mode renders `▸ /name  desc`; theme-arg mode
+/// (`/theme <partial>`) renders `▸ <name>` rows instead.
 fn render_menu(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
     if area.height == 0 || area.width == 0 {
         return;
     }
     let cmds = menu_matches(&app.input);
-    if cmds.is_empty() {
+    let theme_names: Vec<String>;
+    let names: &[String] = if cmds.is_empty() {
+        theme_names = theme_arg_matches(&app.input);
+        &theme_names
+    } else {
+        &[]
+    };
+    let from_themes = !names.is_empty() || theme_arg_partial(&app.input).is_some();
+    if cmds.is_empty() && names.is_empty() {
         return;
     }
+    // Single total across both modes (ADR-0010): the modes are mutually
+    // exclusive, so this is one mode's count.
+    let total = if from_themes { names.len() } else { cmds.len() };
     let theme = &app.theme;
     f.render_widget(
         Block::default().style(Style::default().bg(theme.pane_bg)),
         area,
     );
-    let sel = app.menu_sel.map_or(0, |i| i.min(cmds.len() - 1));
-    let has_overflow = cmds.len() > area.height as usize;
+    let sel = app.menu_sel.map_or(0, |i| i.min(total.saturating_sub(1)));
+    let has_overflow = total > area.height as usize;
     let command_rows = if has_overflow {
         area.height.saturating_sub(1) as usize
     } else {
-        cmds.len().min(MENU_MAX_ROWS)
+        total.min(MENU_MAX_ROWS)
     };
     let start = if command_rows == 0 {
         0
     } else {
         sel.saturating_sub(command_rows - 1)
-            .min(cmds.len().saturating_sub(command_rows))
+            .min(total.saturating_sub(command_rows))
     };
     let mut lines: Vec<Line<'static>> = Vec::new();
+    // Theme-arg mode: `▸ <name>` rows (no leading slash, no desc).
+    for (i, name) in names.iter().enumerate().skip(start).take(command_rows) {
+        let selected = i == sel;
+        let row_style = match selected {
+            true => Style::default().bg(theme.menu_sel_bg),
+            false => Style::default().bg(theme.pane_bg),
+        };
+        let (marker, name_style) = match selected {
+            true => (
+                Span::styled(
+                    "▸ ",
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD)
+                        .bg(theme.menu_sel_bg),
+                ),
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD)
+                    .bg(theme.menu_sel_bg),
+            ),
+            false => (
+                Span::styled("  ", Style::default().bg(theme.pane_bg)),
+                Style::default().fg(Color::DarkGray).bg(theme.pane_bg),
+            ),
+        };
+        // Current theme gets a trailing `●` so the list doubles as
+        // the "which is active" answer (same info as bare `/theme`).
+        let is_current = *name == app.theme.name;
+        let label = match (selected, is_current) {
+            (_, true) => format!("{name}  ●"),
+            _ => name.clone(),
+        };
+        lines.push(Line::from(vec![marker, Span::styled(label, name_style)]));
+        if let Some(line) = lines.last_mut() {
+            line.style = row_style;
+        }
+    }
+    if from_themes {
+        if has_overflow {
+            lines.push(Line::from(vec![Span::styled(
+                format!("  +{} more", total - command_rows),
+                Style::default().fg(Color::DarkGray).bg(theme.pane_bg),
+            )]));
+        }
+        f.render_widget(Paragraph::new(lines), area);
+        return;
+    }
     for (i, cmd) in cmds.iter().enumerate().skip(start).take(command_rows) {
         let selected = i == sel;
         let row_style = match selected {
@@ -1455,7 +1590,7 @@ fn render_menu(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
     }
     if has_overflow {
         lines.push(Line::from(vec![Span::styled(
-            format!("  +{} more", cmds.len() - command_rows),
+            format!("  +{} more", total - command_rows),
             Style::default().fg(Color::DarkGray).bg(theme.pane_bg),
         )]));
     }
@@ -2738,6 +2873,224 @@ mod tests {
             .join("\n");
         assert!(flat.contains("unknown theme"), "got: {flat}");
         assert!(!app.busy, "/theme must not start a turn");
+    }
+
+    // ---- ADR-0010 theme-arg suggestions ----
+
+    #[test]
+    fn theme_arg_partial_only_matches_single_arg_form() {
+        assert_eq!(theme_arg_partial("/theme "), Some(String::new()));
+        assert_eq!(theme_arg_partial("/theme d"), Some("d".to_string()));
+        assert_eq!(theme_arg_partial("/theme dark"), Some("dark".to_string()));
+        // Bare `/theme` belongs to the command menu, not arg mode.
+        assert_eq!(theme_arg_partial("/theme"), None);
+        assert_eq!(theme_arg_partial("/the"), None);
+        // Other commands never trigger arg mode.
+        assert_eq!(theme_arg_partial("/clear "), None);
+        assert_eq!(theme_arg_partial("/ " ), None);
+        // Multi-token args dispatch directly, no suggestions.
+        assert_eq!(theme_arg_partial("/theme a b"), None);
+        assert_eq!(theme_arg_partial("/theme dark "), None);
+        // Lookalike prefixes must not trigger (`/themedark`, `/themes`).
+        assert_eq!(theme_arg_partial("/themedark"), None);
+        assert_eq!(theme_arg_partial("/themes x"), None);
+        assert_eq!(theme_arg_partial("theme "), None);
+        assert_eq!(theme_arg_partial("/THEME "), None);
+    }
+
+    #[test]
+    fn match_theme_names_filters_by_prefix_in_order() {
+        let names = vec![
+            "dark".to_string(),
+            "dracula".to_string(),
+            "gruvbox".to_string(),
+        ];
+        assert_eq!(
+            match_theme_names(&names, ""),
+            names,
+            "empty partial lists everything"
+        );
+        assert_eq!(
+            match_theme_names(&names, "d"),
+            vec!["dark".to_string(), "dracula".to_string()]
+        );
+        assert_eq!(
+            match_theme_names(&names, "dar"),
+            vec!["dark".to_string()]
+        );
+        assert_eq!(
+            match_theme_names(&names, "gr"),
+            vec!["gruvbox".to_string()]
+        );
+        assert!(match_theme_names(&names, "xyz").is_empty());
+        assert!(match_theme_names(&names, "DR").is_empty(), "case-sensitive");
+    }
+
+    #[test]
+    fn theme_arg_menu_opens_for_partial_and_tab_completes() {
+        // Uses the real ~/.config/rem/themes dir (10 themes installed).
+        // If run on a machine with no themes, this degrades to the
+        // closed-menu path — still asserts no crash and clean dispatch.
+        let installed = crate::theme::Theme::list_themes().unwrap_or_default();
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        let agent = std::sync::Arc::new(StubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        // Typing a space after the command closes the command menu…
+        app.input = "/theme ".to_string();
+        app.cursor = app.input.chars().count();
+        assert!(menu_matches(&app.input).is_empty());
+        clamp_menu_sel(&mut app);
+        if installed.is_empty() {
+            // …and with no themes installed the menu stays closed.
+            assert!(!is_menu_open(&app));
+            assert_eq!(app.menu_sel, None);
+            return;
+        }
+        // …and opens the theme-arg menu listing every installed theme.
+        let names = theme_arg_matches(&app.input);
+        assert_eq!(names, installed);
+        assert!(is_menu_open(&app));
+        assert_eq!(app.menu_sel, Some(0));
+        // Partial filters the list.
+        app.input = "/theme gruvbox".to_string();
+        app.cursor = app.input.chars().count();
+        clamp_menu_sel(&mut app);
+        let filtered = theme_arg_matches(&app.input);
+        assert!(!filtered.is_empty(), "expected gruvbox-* themes installed");
+        assert!(filtered.iter().all(|n| n.starts_with("gruvbox")));
+        // Up/Down wrap within the theme list, never touching history.
+        let n = filtered.len();
+        let before_hist = app.history.len();
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Down,
+            KeyModifiers::empty()
+        ));
+        assert_eq!(app.menu_sel, Some(1 % n));
+        assert_eq!(app.history.len(), before_hist);
+        // Tab completes the highlighted theme name into the input.
+        app.menu_sel = Some(0);
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Tab,
+            KeyModifiers::empty()
+        ));
+        assert_eq!(app.input, format!("/theme {}", filtered[0]));
+        // Enter switches to the completed theme and clears the line.
+        // Snapshot the real config file first: Enter persists the choice
+        // via save_active, and tests must not leave side effects.
+        let config_path = crate::config::Config::path().expect("config path");
+        let config_before = std::fs::read(&config_path).ok();
+        app.menu_sel = Some(0);
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Enter,
+            KeyModifiers::empty()
+        ));
+        assert_eq!(app.theme.name, filtered[0]);
+        assert_eq!(app.input, "");
+        assert!(!app.busy, "/theme must not start a turn");
+        // The switch persisted, then restore the file byte-for-byte.
+        let saved = std::fs::read_to_string(&config_path).expect("config saved");
+        assert!(
+            saved.contains(&format!("theme = \"{}\"", filtered[0])),
+            "switch must persist: {saved}"
+        );
+        match config_before {
+            Some(bytes) => std::fs::write(&config_path, bytes).expect("restore config"),
+            None => { std::fs::remove_file(&config_path).ok(); }
+        };
+    }
+
+    #[test]
+    fn theme_arg_enter_without_suggestions_dispatches_normally() {
+        // `/theme nope-xyz` with nothing installed: no suggestions, so
+        // Enter falls through to the unknown-theme error (existing path).
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        app.input = "/theme nope-xyz".to_string();
+        app.cursor = app.input.chars().count();
+        let agent = std::sync::Arc::new(StubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        assert!(!is_menu_open(&app));
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Enter,
+            KeyModifiers::empty()
+        ));
+        assert_eq!(
+            app.history.last().map(String::as_str),
+            Some("/theme nope-xyz")
+        );
+        let flat: String = app
+            .print_queue
+            .iter()
+            .flatten()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(flat.contains("unknown theme"), "got: {flat}");
+    }
+
+    #[test]
+    fn theme_arg_menu_renders_name_rows_above_composer() {
+        use ratatui::{Terminal, backend::TestBackend};
+        // Needs real theme files; skip gracefully when none installed.
+        if crate::theme::Theme::list_themes()
+            .unwrap_or_default()
+            .is_empty()
+        {
+            return;
+        }
+        let backend = TestBackend::new(80, PANE_ROWS);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.input = "/theme ".to_string();
+        app.cursor = app.input.chars().count();
+        clamp_menu_sel(&mut app);
+        assert!(is_menu_open(&app));
+        terminal.draw(|f| render_pane(f, &mut app)).unwrap();
+        let text = terminal.backend().to_string();
+        let installed = crate::theme::Theme::list_themes().unwrap();
+        assert!(
+            text.contains(&installed[0]),
+            "theme row missing {}: {text}",
+            installed[0]
+        );
+        assert!(text.contains('▸'), "selection marker missing: {text}");
+        assert!(
+            text.lines().any(|l| l.contains("❯ /theme ")),
+            "typed input missing: {text}"
+        );
+        // Theme rows carry no slash-command prefix or desc.
+        assert!(!text.contains("/gruvbox"), "theme rows need no slash: {text}");
+        // Partial narrows the painted rows.
+        app.input = "/theme gruvbox".to_string();
+        app.cursor = app.input.chars().count();
+        clamp_menu_sel(&mut app);
+        terminal.draw(|f| render_pane(f, &mut app)).unwrap();
+        let text = terminal.backend().to_string();
+        assert!(text.contains("gruvbox"), "filtered row missing: {text}");
+        assert!(!text.contains("nord"), "unmatched row leaked: {text}");
     }
 
     #[test]

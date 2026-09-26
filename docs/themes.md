@@ -17,6 +17,21 @@ the render path: `history.rs`, `markdown.rs`, and `tui.rs` all take a
   `config.toml` so the next launch uses it.
 - Unknown names queue an error notice; nothing crashes.
 
+## Inline suggestions (menu)
+
+Typing `/theme ` keeps the slash-menu popup open, now listing installed
+theme names filtered by what you typed (`/theme gruvbox` narrows to
+`gruvbox-*`). The active theme carries a trailing `●`. Keys work exactly
+like the command menu:
+
+- `Up` / `Down` — move through suggestions (wraps, never touches history).
+- `Tab` — complete the highlighted name into the input line.
+- `Enter` — switch to the highlighted suggestion immediately.
+- `Esc` — dismiss suggestions, keep your typed text.
+
+With no themes installed the popup stays closed and `/theme` behaves as
+before (prints the current theme name).
+
 ## Theme file format
 
 ```toml
