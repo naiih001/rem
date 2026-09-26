@@ -5,12 +5,15 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{
+        self, Event, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
     terminal::{disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
     Terminal, TerminalOptions, Viewport,
-    backend::{Backend, CrosstermBackend},
+    backend::{Backend, ClearType, CrosstermBackend},
     layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -70,6 +73,59 @@ struct ThinkMsg {
     summary: String,
 }
 
+struct TerminalInputMode {
+    keyboard_enhancement: bool,
+    active: bool,
+}
+
+impl TerminalInputMode {
+    fn enable() -> anyhow::Result<Self> {
+        enable_raw_mode().context("enable raw mode")?;
+        let keyboard_enhancement = matches!(
+            crossterm::terminal::supports_keyboard_enhancement(),
+            Ok(true)
+        );
+        if keyboard_enhancement
+            && let Err(error) = crossterm::execute!(
+                io::stdout(),
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            )
+        {
+            disable_raw_mode().ok();
+            return Err(error).context("enable terminal keyboard enhancement");
+        }
+        Ok(Self {
+            keyboard_enhancement,
+            active: true,
+        })
+    }
+
+    fn restore(&mut self) -> io::Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        self.active = false;
+        let keyboard_result = if self.keyboard_enhancement {
+            crossterm::execute!(io::stdout(), PopKeyboardEnhancementFlags)
+        } else {
+            Ok(())
+        };
+        let raw_mode_result = disable_raw_mode();
+        keyboard_result.and(raw_mode_result)
+    }
+}
+
+impl Drop for TerminalInputMode {
+    fn drop(&mut self) {
+        if self.active {
+            if self.keyboard_enhancement {
+                crossterm::execute!(io::stdout(), PopKeyboardEnhancementFlags).ok();
+            }
+            disable_raw_mode().ok();
+        }
+    }
+}
+
 fn run_app(
     agent: impl AgentLoop + Send + Sync + 'static,
     approval_rx: ApprovalRx,
@@ -80,102 +136,90 @@ fn run_app(
     let (tx, rx) = mpsc::channel::<TurnResult>();
     let (think_tx, think_rx) = mpsc::channel::<ThinkMsg>();
 
-    // Inline viewport (ADR-0005): the bottom pane (gap + status + input
-    // band + footer) owns PANE_ROWS rows at the cursor; finished transcript
-    // rows print into the terminal's own scrollback above it via
-    // `insert_before`. Leaving the alternate screen keeps native scroll,
-    // selection, and copy. No mouse capture: it would steal the terminal's
-    // own selection over the scrollback transcript.
-    enable_raw_mode().context("enable raw mode")?;
+    // The bottom-anchored pane leaves finished transcript rows in terminal
+    // scrollback via `insert_before`. No mouse capture: it would steal the
+    // terminal's own selection over the scrollback transcript.
+    let mut input_mode = TerminalInputMode::enable()?;
     // Wipe the terminal so rem owns the full screen from the start,
     // matching Aster's clear_screen on launch. Purge clears the
     // scrollback (cargo output, shell prompt) above the viewport.
-    // The inline viewport anchors at the cursor position when the
-    // terminal is created, so park the cursor at the bottom FIRST:
-    // the viewport then owns the last PANE_ROWS rows (big-screen rows).
-    {
-        use crossterm::{
-            cursor::MoveTo,
-            execute,
-            terminal::{Clear, ClearType, size as term_size},
-        };
-        let (_, h) = term_size().context("terminal size")?;
-        execute!(
-            io::stdout(),
-            Clear(ClearType::All),
-            Clear(ClearType::Purge),
-            MoveTo(0, h.saturating_sub(PANE_ROWS)),
-        )?;
-    }
+    // The inline viewport is recreated at its new height as the editor grows.
+    use crossterm::{
+        cursor::MoveTo,
+        execute,
+        terminal::{Clear, ClearType, size as term_size},
+    };
+    let (_, h) = term_size().context("terminal size")?;
+    let pane_height = PANE_ROWS.min(h);
+    execute!(
+        io::stdout(),
+        Clear(ClearType::All),
+        Clear(ClearType::Purge),
+        MoveTo(0, h.saturating_sub(pane_height))
+    )?;
     let backend = CrosstermBackend::new(io::stdout());
-    let mut terminal = Terminal::with_options(
-        backend,
-        TerminalOptions {
-            viewport: Viewport::Inline(PANE_ROWS),
-        },
-    )
-    .context("create terminal")?;
+    let outcome = {
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(pane_height),
+            },
+        )
+        .context("create terminal")?;
 
-    let mut app = App::new(model, effort);
-    // The approval channel is tokio mpsc; the TUI loop is sync crossterm, so
-    // poll with try_recv (never block the 50ms frame).
-    let mut approval_rx = approval_rx;
-    let outcome = event_loop(
-        &mut terminal,
-        &mut app,
-        agent,
-        &rx,
-        tx,
-        &think_rx,
-        think_tx,
-        &mut approval_rx,
-    );
+        let mut app = App::new(model, effort);
+        let mut approval_rx = approval_rx;
+        event_loop(
+            &mut terminal,
+            &mut app,
+            agent,
+            &rx,
+            tx,
+            &think_rx,
+            think_tx,
+            &mut approval_rx,
+        )
+    };
 
-    // Inline viewport: leave the transcript in scrollback and park the
-    // cursor below the pane. Ratatui's Drop restores the cursor state.
-    disable_raw_mode().ok();
+    input_mode
+        .restore()
+        .context("restore terminal input mode")?;
     println!();
     outcome
 }
 
-/// Bottom-pane rows owned by the inline viewport: gap(1) + status(1) +
-/// input band(3) + footer(1). The status slot always reserves its row so
-/// busy/approval transitions never resize the viewport (fixed height).
+/// Minimum bottom-pane height: gap(1) + status(1) + input band(3) + footer(1).
 const PANE_ROWS: u16 = 6;
-const PANE_CURSOR_ROW: u16 = 3;
+const MAX_INPUT_LINES: usize = 5;
 
-fn resize_cursor_row(height: u16) -> u16 {
-    height
-        .saturating_sub(PANE_ROWS)
-        .saturating_add(PANE_CURSOR_ROW)
-        .min(height.saturating_sub(1))
+fn pane_viewport_area(width: u16, height: u16, pane_height: u16) -> Rect {
+    let pane_height = pane_height.min(height);
+    Rect::new(0, height.saturating_sub(pane_height), width, pane_height)
 }
 
-fn resize_inline_viewport<B: Backend>(
+fn resize_pane_viewport<B: Backend>(
     terminal: &mut Terminal<B>,
+    backend: impl FnOnce() -> B,
     width: u16,
     height: u16,
+    pane_height: u16,
 ) -> io::Result<()> {
-    let area = Rect::new(0, 0, width, height);
-    terminal
-        .backend_mut()
-        .set_cursor_position(Position::new(0, resize_cursor_row(height)))?;
-    terminal.resize(area)?;
-
-    let viewport = terminal.get_frame().area();
-    let cursor_y = if height >= PANE_ROWS {
-        viewport.y.saturating_add(PANE_CURSOR_ROW)
-    } else {
-        viewport.y.saturating_add(viewport.height.saturating_sub(1))
-    };
-    terminal.set_cursor_position(Position::new(0, cursor_y))?;
-
-    if height >= PANE_ROWS {
-        terminal
-            .backend_mut()
-            .set_cursor_position(Position::new(0, resize_cursor_row(height)))?;
-        terminal.resize(area)?;
+    let area = pane_viewport_area(width, height, pane_height);
+    if terminal.get_frame().area() == area {
+        return Ok(());
     }
+    let previous = terminal.get_frame().area();
+    let clear_from = previous.y.min(area.y).min(height.saturating_sub(1));
+    let mut backend = backend();
+    backend.set_cursor_position(Position::new(0, clear_from))?;
+    backend.clear_region(ClearType::AfterCursor)?;
+    backend.set_cursor_position(Position::new(0, area.y))?;
+    *terminal = Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(area.height),
+        },
+    )?;
     Ok(())
 }
 
@@ -205,7 +249,7 @@ const MENU_MAX_ROWS: usize = 10;
 /// Scrollback transcript (ADR-0005): finished rows print into the
 /// terminal's own scrollback via `insert_before` and are never touched
 /// again. `App` holds only a queue of pending `Line` groups; the event
-/// loop drains it above the inline viewport. No selection, no
+/// loop drains it above the bottom-anchored viewport. No selection, no
 /// expand/collapse, no in-app scroll — the terminal owns all of that.
 ///
 /// Slash-command registry (ADR-0007): single source of truth for menu
@@ -350,7 +394,8 @@ fn menu_status_height(app: &App) -> u16 {
 }
 
 fn menu_row_capacity(app: &App) -> u16 {
-    PANE_ROWS.saturating_sub(menu_status_height(app) + 3)
+    app.pane_height(app.term_width)
+        .saturating_sub(menu_status_height(app) + app.input_band_height(app.term_width, true) + 1)
 }
 
 fn menu_height(app: &App) -> u16 {
@@ -393,6 +438,8 @@ struct App {
     print_queue: Vec<Vec<Line<'static>>>,
     input: String,
     cursor: usize, // char index into `input`
+    input_scroll: usize,
+    max_visible_input_lines: usize,
     history: Vec<String>,
     hist_idx: Option<usize>,
     busy: bool,
@@ -422,10 +469,8 @@ struct App {
     turn_generation: u64,
     /// Last terminal width seen; row groups wrap to this at drain time.
     term_width: u16,
-    /// Freeze transcript drain for one frame after a resize (Phase 3B2):
-    /// `insert_before` during a resize races the viewport move and tears
-    /// the transcript; the Resize handler sets this, the next
-    /// `drain_print_queue` skips (queue kept) and clears it.
+    /// Freeze transcript drain for one frame after a terminal resize so
+    /// queued rows cannot race viewport repositioning.
     skip_drain_once: bool,
 }
 
@@ -503,6 +548,8 @@ impl App {
             print_queue: Vec::new(),
             input: String::new(),
             cursor: 0,
+            input_scroll: 0,
+            max_visible_input_lines: MAX_INPUT_LINES,
             history: Vec::new(),
             hist_idx: None,
             busy: false,
@@ -626,7 +673,7 @@ impl App {
 }
 
 /// Main loop: drains turn/live/approval channels, prints finished rows
-/// above the inline viewport, renders the fixed bottom pane, routes input.
+/// above the bottom-anchored pane, renders it, and routes input.
 /// Eight args is one over the default lint: the five channels plus terminal,
 /// app, and agent are each a distinct pipe and bundling them would obscure
 /// the drain order below.
@@ -715,6 +762,15 @@ fn event_loop(
             // stays local to the render site, never written back here.
             if let Ok(size) = terminal.size() {
                 app.term_width = size.width.max(1);
+                app.set_available_height(size.height);
+                resize_pane_viewport(
+                    terminal,
+                    || CrosstermBackend::new(io::stdout()),
+                    size.width,
+                    size.height,
+                    app.pane_height(size.width),
+                )
+                .context("resize composer viewport")?;
             }
             terminal
                 .draw(|f| render_pane(f, app))
@@ -733,19 +789,18 @@ fn event_loop(
                 // No mouse handling (ADR-0005): the transcript is terminal
                 // scrollback, so the terminal keeps selection and copy.
                 Event::Resize(w, h) => {
-                    // Phase 1: use the event args directly (no
-                    // `terminal.size()` query) and redraw immediately so
-                    // `Terminal::draw` autoresize applies this frame
-                    // instead of waiting for the next 50ms poll. Stores
-                    // the real width for wrapping; layout floors stay at
-                    // the render site (Phase 2/3).
+                    // Use event dimensions directly and redraw immediately.
                     app.term_width = w.max(1);
-                    // Ratatui moves a horizontally-shrunk inline viewport
-                    // to row zero to avoid wrapped-cell artifacts. Re-anchor
-                    // it at the bottom before painting the resized frame.
-                    resize_inline_viewport(terminal, w, h).context("resize inline viewport")?;
-                    // Phase 3B2: freeze `insert_before` for the next frame
-                    // so the transcript drain can't race the viewport move.
+                    app.set_available_height(h);
+                    resize_pane_viewport(
+                        terminal,
+                        || CrosstermBackend::new(io::stdout()),
+                        w,
+                        h,
+                        app.pane_height(w),
+                    )
+                    .context("resize composer viewport")?;
+                    // Freeze transcript insertion for one frame after resize.
                     app.skip_drain_once = true;
                     terminal
                         .draw(|f| render_pane(f, app))
@@ -758,7 +813,7 @@ fn event_loop(
     }
 }
 
-/// Print every queued transcript group above the inline viewport.
+/// Print every queued transcript group above the bottom-anchored viewport.
 /// Each group is one `history::` row block; `insert_before` scrolls it
 /// into real scrollback. No-op when the queue is empty. A pending
 /// `/clear` wipes the screen + scrollback first (like Aster's `clear_all`).
@@ -766,9 +821,8 @@ fn drain_print_queue(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
 ) -> anyhow::Result<()> {
-    // Phase 3B2: skip `insert_before` for one frame after a resize —
-    // the inline viewport move races the insert and tears the
-    // transcript. Queue is kept; the next frame drains normally.
+    // Skip `insert_before` for one frame after a terminal resize so the
+    // transcript drain cannot race viewport repositioning.
     if app.skip_drain_once {
         app.skip_drain_once = false;
         return Ok(());
@@ -877,6 +931,10 @@ fn handle_key(
                 }
                 return false;
             }
+            KeyCode::Enter if mods.contains(KeyModifiers::SHIFT) => {
+                insert_newline(app);
+                return false;
+            }
             KeyCode::Enter => return submit(app, agent, tx, think_tx),
             KeyCode::Esc => {
                 app.menu_sel = None;
@@ -897,6 +955,9 @@ fn handle_key(
         return false;
     }
     match code {
+        KeyCode::Enter if mods.contains(KeyModifiers::SHIFT) => {
+            insert_newline(app);
+        }
         KeyCode::Enter => return submit(app, agent, tx, think_tx),
         // Tab is unbound in the scrollback model (ADR-0005): no block
         // selection exists. Kept as a no-op so the key stays free.
@@ -918,17 +979,27 @@ fn handle_key(
         KeyCode::Right => {
             app.cursor = (app.cursor + 1).min(app.input.chars().count());
         }
-        KeyCode::Home => app.cursor = 0,
-        KeyCode::End => {
-            app.cursor = app.input.chars().count();
+        KeyCode::Home => {
+            app.cursor = line_edge_cursor(
+                &app.input,
+                app.cursor,
+                (app.term_width as usize).saturating_sub(4),
+                false,
+            );
         }
-        // Up/Down = prompt history only (ADR-0005): the terminal owns
-        // transcript scroll, so Shift+Up/Down and PgUp/PgDn do nothing.
+        KeyCode::End => {
+            app.cursor = line_edge_cursor(
+                &app.input,
+                app.cursor,
+                (app.term_width as usize).saturating_sub(4),
+                true,
+            );
+        }
         KeyCode::Up => {
-            recall_history(app, true);
+            move_cursor_at_edge(app, true);
         }
         KeyCode::Down => {
-            recall_history(app, false);
+            move_cursor_at_edge(app, false);
         }
         KeyCode::PageUp | KeyCode::PageDown => {}
         KeyCode::Char(c) => {
@@ -942,6 +1013,10 @@ fn handle_key(
 
 fn handle_ctrl(app: &mut App, code: KeyCode) -> bool {
     match code {
+        KeyCode::Char('o') => {
+            insert_newline(app);
+            false
+        }
         // Task 4 / ADR-0006: Ctrl+C is strict clear-only — clears the
         // input line, never interrupts, never quits (quit is Ctrl+D-on-empty
         // or /quit). Ignored in the modal via the CONTROL early-return in
@@ -1024,13 +1099,17 @@ fn handle_theme_command(app: &mut App, arg: &str) {
             let name = theme.name.clone();
             app.theme = theme;
             if let Err(e) = Theme::save_active(&name) {
-                app.enqueue_notice(format!("theme: switched to \"{name}\" but could not persist: {e:#}"));
+                app.enqueue_notice(format!(
+                    "theme: switched to \"{name}\" but could not persist: {e:#}"
+                ));
             } else {
                 app.enqueue_notice(format!("theme: switched to \"{name}\"."));
             }
         }
         Err(e) => {
-            app.enqueue_notice(format!("theme: unknown theme \"{arg}\" ({e:#}). Try /theme."));
+            app.enqueue_notice(format!(
+                "theme: unknown theme \"{arg}\" ({e:#}). Try /theme."
+            ));
         }
     }
 }
@@ -1224,62 +1303,256 @@ fn delete_word_before(input: &mut String, cursor: &mut usize) {
 }
 
 impl App {
-    /// Terminal x-coordinate of the cursor within the input line.
-    /// Shares [`visible_window`] with the renderer so the hardware caret
-    /// always sits on the displayed caret column, even mid-line in overflow.
-    /// The text line sits inside the shaded band with a 1-column inset plus
-    /// the 2-column `❯ ` prompt, hence the +3 and the -4 width budget.
-    fn cursor_x(&self, term_width: u16) -> u16 {
-        let max_w = (term_width as usize).saturating_sub(4);
-        let (_, caret) = visible_window(&self.input, self.cursor, max_w);
-        3u16.saturating_add(caret as u16)
+    fn set_available_height(&mut self, height: u16) {
+        self.max_visible_input_lines = height
+            .saturating_sub(PANE_ROWS - 1)
+            .clamp(1, MAX_INPUT_LINES as u16) as usize;
     }
-}
 
-/// Visible slice of a single-line input plus the caret column within it.
-/// Left-trims by display columns so the caret stays on screen: tail-anchored
-/// while typing at the end, following the caret when it moves left.
-fn visible_window(input: &str, cursor: usize, max_w: usize) -> (String, usize) {
-    if max_w == 0 {
-        return (String::new(), 0);
+    fn visible_input_lines(&self, term_width: u16) -> usize {
+        input_layout(&self.input, (term_width as usize).saturating_sub(4))
+            .rows
+            .len()
+            .min(self.max_visible_input_lines)
+            .max(1)
     }
-    let chars: Vec<char> = input.chars().collect();
-    let cursor = cursor.min(chars.len());
-    let widths: Vec<usize> = chars
-        .iter()
-        .map(|c| UnicodeWidthStr::width(c.to_string().as_str()))
-        .collect();
-    let caret_col: usize = widths[..cursor].iter().sum();
-    let keep = max_w.saturating_sub(1).max(1);
-    let skip_col = caret_col.saturating_sub(keep);
-    let mut consumed = 0usize;
-    let mut start = 0usize;
-    while start < chars.len() && consumed + widths[start] <= skip_col {
-        consumed += widths[start];
-        start += 1;
+
+    fn pane_height(&self, term_width: u16) -> u16 {
+        PANE_ROWS.saturating_add(self.visible_input_lines(term_width).saturating_sub(1) as u16)
     }
-    let mut visible = String::new();
-    let mut shown = 0usize;
-    for (i, c) in chars.iter().enumerate().skip(start) {
-        if shown + widths[i] > max_w {
-            break;
+
+    fn input_band_height(&self, term_width: u16, menu_open: bool) -> u16 {
+        let lines = self.visible_input_lines(term_width) as u16;
+        lines + u16::from(!(menu_open && lines == 1)) + 1
+    }
+
+    fn sync_input_scroll(&mut self, max_width: usize) {
+        let layout = input_layout(&self.input, max_width);
+        let visible = layout.rows.len().min(self.max_visible_input_lines).max(1);
+        let caret_row = layout.positions[self.cursor.min(layout.positions.len() - 1)].0;
+        let max_scroll = layout.rows.len().saturating_sub(visible);
+        self.input_scroll = self.input_scroll.min(max_scroll);
+        if caret_row < self.input_scroll {
+            self.input_scroll = caret_row;
+        } else if caret_row >= self.input_scroll + visible {
+            self.input_scroll = caret_row + 1 - visible;
         }
-        visible.push(*c);
-        shown += widths[i];
     }
-    (visible, caret_col.saturating_sub(consumed))
 }
 
-/// Bottom pane: gap(1) + status(1) + input band(3) + footer(1) = PANE_ROWS.
-/// The transcript lives in scrollback above; the viewport holds only this.
-/// The status slot always reserves its row so busy/approval transitions
-/// never resize the fixed-height viewport.
+struct InputLayout {
+    rows: Vec<String>,
+    positions: Vec<(usize, usize)>,
+}
+
+fn input_layout(input: &str, max_width: usize) -> InputLayout {
+    let max_width = max_width.max(1);
+    let chars: Vec<char> = input.chars().collect();
+    let mut rows = vec![String::new()];
+    let mut positions = vec![(0, 0); chars.len() + 1];
+    let mut row = 0;
+    let mut column = 0;
+
+    for (index, ch) in chars.iter().copied().enumerate() {
+        if ch == '\n' {
+            positions[index] = (row, column);
+            rows.push(String::new());
+            row += 1;
+            column = 0;
+            positions[index + 1] = (row, column);
+            continue;
+        }
+
+        let width = UnicodeWidthStr::width(ch.to_string().as_str());
+        if column > 0 && column + width > max_width {
+            rows.push(String::new());
+            row += 1;
+            column = 0;
+        }
+        positions[index] = (row, column);
+        rows[row].push(ch);
+        column += width;
+        positions[index + 1] = (row, column);
+    }
+
+    InputLayout { rows, positions }
+}
+
+fn move_cursor_vertical(input: &str, cursor: usize, max_width: usize, down: bool) -> Option<usize> {
+    let layout = input_layout(input, max_width);
+    let (row, column) = layout.positions[cursor.min(layout.positions.len() - 1)];
+    let target_row = if down {
+        row.checked_add(1)
+            .filter(|next| *next < layout.rows.len())?
+    } else {
+        row.checked_sub(1)?
+    };
+    layout
+        .positions
+        .iter()
+        .enumerate()
+        .filter(|(_, (candidate_row, _))| *candidate_row == target_row)
+        .min_by_key(|(_, (_, candidate_column))| candidate_column.abs_diff(column))
+        .map(|(index, _)| index)
+}
+
+fn line_edge_cursor(input: &str, cursor: usize, max_width: usize, end: bool) -> usize {
+    let layout = input_layout(input, max_width);
+    let row = layout.positions[cursor.min(layout.positions.len() - 1)].0;
+    let mut positions = layout
+        .positions
+        .iter()
+        .enumerate()
+        .filter(|(_, (candidate_row, _))| *candidate_row == row)
+        .map(|(index, _)| index);
+    let first = positions.next().unwrap_or(0);
+    if end {
+        positions.next_back().unwrap_or(first)
+    } else {
+        first
+    }
+}
+
+fn move_cursor_at_edge(app: &mut App, older: bool) {
+    if app.input.is_empty() {
+        recall_history(app, older);
+        return;
+    }
+    let max_width = (app.term_width as usize).saturating_sub(4);
+    let layout = input_layout(&app.input, max_width);
+    let row = layout.positions[app.cursor.min(layout.positions.len() - 1)].0;
+    let last_row = layout.rows.len().saturating_sub(1);
+    if (older && row == 0) || (!older && row == last_row) {
+        recall_history(app, older);
+    } else if let Some(cursor) = move_cursor_vertical(&app.input, app.cursor, max_width, !older) {
+        app.cursor = cursor;
+    }
+}
+
+fn insert_newline(app: &mut App) {
+    insert_char_at(&mut app.input, &mut app.cursor, '\n');
+    clamp_menu_sel(app);
+}
+
+fn render_overflow_line(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    show_up: bool,
+    show_down: bool,
+    theme: &Theme,
+) {
+    if !show_up && !show_down {
+        return;
+    }
+    let left = if show_up { "  ↑ more above" } else { "" };
+    let right = if show_down { "↓ more below  " } else { "" };
+    let used = UnicodeWidthStr::width(left) + UnicodeWidthStr::width(right);
+    let spaces = (area.width as usize).saturating_sub(used);
+    let line = Line::from(vec![
+        Span::styled(left, Style::default().fg(theme.accent)),
+        Span::raw(" ".repeat(spaces)),
+        Span::styled(right, Style::default().fg(theme.accent)),
+    ]);
+    f.render_widget(Paragraph::new(line), area);
+}
+
+fn cursor_position(app: &App, area: Rect) -> Position {
+    let max_width = (area.width as usize).saturating_sub(4).max(1);
+    let layout = input_layout(&app.input, max_width);
+    let visible = layout.rows.len().min(app.max_visible_input_lines).max(1);
+    let cursor = app.cursor.min(layout.positions.len() - 1);
+    let (row, column) = layout.positions[cursor];
+    let top_padding = area.height.saturating_sub(visible as u16).saturating_div(2);
+    let visible_row = row.saturating_sub(app.input_scroll);
+    Position::new(
+        area.x
+            .saturating_add(3)
+            .saturating_add(column.min(max_width) as u16)
+            .min(area.right().saturating_sub(1)),
+        area.y
+            .saturating_add(top_padding)
+            .saturating_add(visible_row as u16)
+            .min(area.bottom().saturating_sub(1)),
+    )
+}
+
+fn render_input(f: &mut ratatui::Frame, app: &App, area: Rect) {
+    f.render_widget(
+        Block::default().style(Style::default().bg(app.theme.pane_bg)),
+        area,
+    );
+    if area.height == 0 || area.width < 8 {
+        return;
+    }
+    let max_width = (area.width as usize).saturating_sub(4).max(1);
+    let layout = input_layout(&app.input, max_width);
+    let visible = layout.rows.len().min(app.max_visible_input_lines).max(1);
+    let top_padding = area.height.saturating_sub(visible as u16) / 2;
+    let bottom_padding = area.height.saturating_sub(visible as u16 + top_padding);
+    let show_up = app.input_scroll > 0;
+    let show_down = app.input_scroll + visible < layout.rows.len();
+
+    if top_padding > 0 {
+        render_overflow_line(
+            f,
+            Rect::new(area.x, area.y, area.width, 1),
+            show_up,
+            show_down && bottom_padding == 0,
+            &app.theme,
+        );
+    }
+    let first = app.input_scroll.min(layout.rows.len().saturating_sub(1));
+    for (offset, text) in layout.rows.iter().skip(first).take(visible).enumerate() {
+        let prompt = first + offset == 0;
+        let prefix = if prompt { " " } else { "   " };
+        let mut body = vec![Span::raw(prefix)];
+        if prompt {
+            body.push(Span::styled(
+                "❯ ",
+                Style::default()
+                    .fg(app.theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        let body = if app.input.is_empty() {
+            let hint = match app.busy {
+                true => "…  (esc to interrupt)",
+                false => "Message rem…  (/ for commands)",
+            };
+            body.push(Span::styled(
+                hint,
+                Style::default()
+                    .fg(app.theme.placeholder)
+                    .add_modifier(Modifier::ITALIC),
+            ));
+            body
+        } else {
+            body.push(Span::raw(text.clone()));
+            body
+        };
+        let y = area.y + top_padding + offset as u16;
+        f.render_widget(
+            Paragraph::new(Line::from(body)),
+            Rect::new(area.x, y, area.width, 1),
+        );
+    }
+    if bottom_padding > 0 {
+        render_overflow_line(
+            f,
+            Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1),
+            show_up && top_padding == 0,
+            show_down,
+            &app.theme,
+        );
+    }
+}
+
+/// The transcript lives in scrollback above; the viewport holds only the
+/// bottom pane, whose height follows the composer's visible line count.
 fn render_pane(f: &mut ratatui::Frame, app: &mut App) {
     let area = f.area();
-    // Phase 3B2 min-size fallback: below 20xPANE_ROWS the pane geometry can't
-    // hold — show a single notice instead of a blank/clipped pane.
-    // Menu/modal/cursor skipped; the next full-size draw restores all.
-    if area.width < 20 || area.height < PANE_ROWS {
+    let required_height = app.pane_height(area.width);
+    if area.width < 20 || area.height < required_height {
         f.render_widget(
             Paragraph::new(Line::from("terminal too small — resize to continue")),
             area,
@@ -1289,7 +1562,7 @@ fn render_pane(f: &mut ratatui::Frame, app: &mut App) {
     let menu_open = is_menu_open(app);
     let menu_h = menu_height(app);
     let status_h = menu_status_height(app);
-    let input_h = if menu_open { 2 } else { 3 };
+    let input_h = app.input_band_height(area.width, menu_open);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1304,6 +1577,7 @@ fn render_pane(f: &mut ratatui::Frame, app: &mut App) {
     render_gap(f, chunks[0]);
     render_status(f, app, chunks[1]);
     render_menu(f, app, chunks[2]);
+    app.sync_input_scroll((area.width as usize).saturating_sub(4));
     render_input(f, app, chunks[3]);
     render_footer(f, app, chunks[4]);
     // Approval modal last: bottom-anchored sheet over the pane.
@@ -1319,14 +1593,7 @@ fn render_pane(f: &mut ratatui::Frame, app: &mut App) {
         };
         render_approval_modal(f, f.area(), &display, queued, &app.theme);
     }
-    // Keep the caret on the composer's text row in the shaded band.
-    let x = app.cursor_x(area.width);
-    f.set_cursor_position(Position::new(
-        x,
-        chunks[3]
-            .y
-            .saturating_add(chunks[3].height.saturating_sub(1) / 2),
-    ));
+    f.set_cursor_position(cursor_position(app, chunks[3]));
 }
 
 /// Bottom-anchored approval sheet: shaded band with the request + key hints.
@@ -1440,10 +1707,7 @@ fn render_status(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect)
         let spinner = SPINNER[(elapsed.as_millis() / 100) as usize % SPINNER.len()];
         let verb = BUSY_VERBS[(elapsed.as_secs() / BUSY_VERB_SECS) as usize % BUSY_VERBS.len()];
         let line = Line::from(vec![
-            Span::styled(
-                format!("{spinner} "),
-                Style::default().fg(app.theme.accent),
-            ),
+            Span::styled(format!("{spinner} "), Style::default().fg(app.theme.accent)),
             Span::styled(verb, Style::default().fg(Color::DarkGray)),
             Span::styled(
                 format!(" · {:.1}s · esc to interrupt", elapsed.as_secs_f32()),
@@ -1597,52 +1861,6 @@ fn render_menu(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
-/// Aster-style composer: a 3-row shaded band (1-row vertical padding around
-/// the text line). Single-line editing: the text line is a 1-column inset
-/// plus `❯ ` plus the visible input window; the placeholder is italic
-/// faint when empty, and a busy hint replaces it while a turn runs.
-fn render_input(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
-    f.render_widget(
-        Block::default().style(Style::default().bg(app.theme.pane_bg)),
-        area,
-    );
-    if area.height == 0 || area.width < 8 {
-        return;
-    }
-    let mid = ratatui::layout::Rect::new(
-        area.x,
-        area.y + area.height.saturating_sub(1) / 2,
-        area.width,
-        1,
-    );
-    let mut spans = vec![
-        Span::raw(" "),
-        Span::styled(
-            "❯ ",
-            Style::default()
-                .fg(app.theme.accent)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ];
-    if app.input.is_empty() {
-        let hint = match app.busy {
-            true => "…  (esc to interrupt)",
-            false => "Message rem…  (/ for commands)",
-        };
-        spans.push(Span::styled(
-            hint,
-            Style::default()
-                .fg(app.theme.placeholder)
-                .add_modifier(Modifier::ITALIC),
-        ));
-    } else {
-        let max_w = (area.width as usize).saturating_sub(4);
-        let (visible, _) = visible_window(&app.input, app.cursor, max_w);
-        spans.push(Span::raw(visible));
-    }
-    f.render_widget(Paragraph::new(Line::from(spans)), mid);
-}
-
 /// Aster-style footer: one left-aligned line — orange `▶▶▶ edit`, faint
 /// model, turn count, and key hints. Busy state lives in the status row
 /// above the input band, so the footer stays quiet during a turn.
@@ -1662,7 +1880,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn inline_pane_stays_bottom_anchored_across_terminal_resizes() {
+    fn pane_stays_bottom_anchored_across_terminal_resizes() {
         use ratatui::{Terminal, TerminalOptions, Viewport, backend::TestBackend};
 
         let mut backend = TestBackend::new(80, 24);
@@ -1684,9 +1902,25 @@ mod tests {
             })
             .unwrap();
         assert_eq!(area, Rect::new(0, 18, 80, PANE_ROWS));
+        resize_pane_viewport(&mut terminal, || TestBackend::new(80, 24), 80, 24, 10).unwrap();
+        assert_eq!(terminal.get_frame().area(), Rect::new(0, 14, 80, 10));
+        resize_pane_viewport(
+            &mut terminal,
+            || TestBackend::new(80, 24),
+            80,
+            24,
+            PANE_ROWS,
+        )
+        .unwrap();
 
-        terminal.backend_mut().resize(40, 24);
-        resize_inline_viewport(&mut terminal, 40, 24).unwrap();
+        resize_pane_viewport(
+            &mut terminal,
+            || TestBackend::new(40, 24),
+            40,
+            24,
+            PANE_ROWS,
+        )
+        .unwrap();
         terminal
             .draw(|f| {
                 area = f.area();
@@ -1695,8 +1929,14 @@ mod tests {
             .unwrap();
         assert_eq!(area, Rect::new(0, 18, 40, PANE_ROWS));
 
-        terminal.backend_mut().resize(120, 32);
-        resize_inline_viewport(&mut terminal, 120, 32).unwrap();
+        resize_pane_viewport(
+            &mut terminal,
+            || TestBackend::new(120, 32),
+            120,
+            32,
+            PANE_ROWS,
+        )
+        .unwrap();
         terminal
             .draw(|f| {
                 area = f.area();
@@ -1705,8 +1945,7 @@ mod tests {
             .unwrap();
         assert_eq!(area, Rect::new(0, 26, 120, PANE_ROWS));
 
-        terminal.backend_mut().resize(20, 4);
-        resize_inline_viewport(&mut terminal, 20, 4).unwrap();
+        resize_pane_viewport(&mut terminal, || TestBackend::new(20, 4), 20, 4, PANE_ROWS).unwrap();
         terminal
             .draw(|f| {
                 area = f.area();
@@ -1715,8 +1954,14 @@ mod tests {
             .unwrap();
         assert_eq!(area, Rect::new(0, 0, 20, 4));
 
-        terminal.backend_mut().resize(80, 24);
-        resize_inline_viewport(&mut terminal, 80, 24).unwrap();
+        resize_pane_viewport(
+            &mut terminal,
+            || TestBackend::new(80, 24),
+            80,
+            24,
+            PANE_ROWS,
+        )
+        .unwrap();
         terminal
             .draw(|f| {
                 area = f.area();
@@ -1724,6 +1969,14 @@ mod tests {
             })
             .unwrap();
         assert_eq!(area, Rect::new(0, 18, 80, PANE_ROWS));
+        let mut inserted = false;
+        terminal
+            .insert_before(1, |buffer| {
+                Paragraph::new("transcript").render(Rect::new(0, 0, buffer.area.width, 1), buffer);
+                inserted = true;
+            })
+            .unwrap();
+        assert!(inserted, "dynamic inline viewport must preserve scrollback");
     }
 
     fn cell_text(buf: &ratatui::buffer::Buffer, y: u16, w: u16) -> String {
@@ -1734,10 +1987,17 @@ mod tests {
 
     fn pane_buffer(app: &mut App, w: u16) -> ratatui::buffer::Buffer {
         use ratatui::{Terminal, backend::TestBackend};
-        let backend = TestBackend::new(w, PANE_ROWS);
+        let backend = TestBackend::new(w, app.pane_height(w));
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| render_pane(f, app)).unwrap();
         terminal.backend().buffer().clone()
+    }
+
+    fn press(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
+        let agent = Arc::new(StubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        assert!(!handle_key(app, &agent, &tx, &think_tx, code, modifiers));
     }
 
     #[test]
@@ -1758,18 +2018,96 @@ mod tests {
     }
 
     #[test]
-    fn visible_window_keeps_caret_on_screen() {
-        // Fits: whole input, caret at end.
-        let (v, c) = visible_window("hi", 2, 10);
-        assert_eq!((v.as_str(), c), ("hi", 2));
-        // Overflow at end: tail anchored, caret on last column.
-        let (v, c) = visible_window("abcdefgh", 8, 5);
-        assert_eq!(v, "efgh");
-        assert_eq!(c, 4);
-        // Overflow mid-line: window follows the caret.
-        let (v, c) = visible_window("abcdefgh", 2, 5);
-        assert_eq!(v, "abcde");
-        assert_eq!(c, 2);
+    fn input_layout_wraps_text_and_tracks_caret_rows() {
+        let layout = input_layout("abcdef\n界ghij", 4);
+        assert_eq!(layout.rows, ["abcd", "ef", "界gh", "ij"]);
+        assert_eq!(layout.positions[7], (2, 0));
+        assert_eq!(layout.positions[10], (3, 0));
+        assert_eq!(layout.positions[12], (3, 2));
+    }
+
+    #[test]
+    fn vertical_cursor_moves_across_wrapped_and_explicit_lines() {
+        let input = "abcdefghijklmnopq\nlast";
+        let start = input.chars().count();
+        let up = move_cursor_vertical(input, start, 16, false).unwrap();
+        assert_eq!(up, 17);
+        assert_eq!(move_cursor_vertical(input, up, 16, true), Some(19));
+
+        let input = "abc\ndefgh";
+        assert_eq!(move_cursor_vertical(input, 7, 16, false), Some(3));
+        assert_eq!(move_cursor_vertical(input, 3, 16, true), Some(7));
+    }
+
+    #[test]
+    fn shift_enter_inserts_newline_and_vertical_edges_recall_history() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.term_width = 20;
+        app.input = "hello".to_string();
+        app.cursor = 5;
+        press(&mut app, KeyCode::Enter, KeyModifiers::SHIFT);
+        assert_eq!(app.input, "hello\n");
+        assert_eq!(app.cursor, 6);
+        app.history.push(app.input.clone());
+
+        app.input = "first\nsecond".to_string();
+        app.cursor = 8;
+        press(&mut app, KeyCode::Up, KeyModifiers::empty());
+        assert_eq!(app.cursor, 2);
+        press(&mut app, KeyCode::Up, KeyModifiers::empty());
+        assert_eq!(app.input, "hello\n");
+        assert_eq!(app.cursor, 6);
+    }
+
+    #[test]
+    fn ctrl_o_inserts_newline_when_shift_enter_is_unavailable() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.input = "firstsecond".to_string();
+        app.cursor = 5;
+
+        press(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+
+        assert_eq!(app.input, "first\nsecond");
+        assert_eq!(app.cursor, 6);
+    }
+
+    #[tokio::test]
+    async fn enter_submits_all_composer_lines() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.input = "first line\nsecond line".to_string();
+        app.cursor = app.input.chars().count();
+        let agent = Arc::new(StubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Enter,
+            KeyModifiers::empty()
+        ));
+
+        assert!(app.busy);
+        assert_eq!(
+            app.history.last().map(String::as_str),
+            Some("first line\nsecond line")
+        );
+        let rendered = app
+            .print_queue
+            .iter()
+            .flatten()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("first line"), "{rendered}");
+        assert!(rendered.contains("second line"), "{rendered}");
     }
 
     #[test]
@@ -1797,7 +2135,46 @@ mod tests {
         // Caret accounts for the 1-column inset + 2-column prompt.
         app.input = "hello".to_string();
         app.cursor = 5;
-        assert_eq!(app.cursor_x(80), 3 + 5);
+        let position = cursor_position(&app, Rect::new(0, 2, 80, 3));
+        assert_eq!(position, Position::new(8, 3));
+    }
+
+    #[test]
+    fn composer_grows_and_shows_overflow_cues() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.term_width = 40;
+        app.input = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight".to_string();
+        app.cursor = "one\ntwo\nthree\nfour\nfive\n".chars().count() + 1;
+        let buffer = pane_buffer(&mut app, 40);
+        let rendered = (0..buffer.area.height)
+            .map(|y| cell_text(&buffer, y, 40))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(app.pane_height(40), 10);
+        assert!(rendered.contains("↑ more above"), "{rendered}");
+        assert!(rendered.contains("↓ more below"), "{rendered}");
+        assert!(rendered.contains("four"), "{rendered}");
+        assert!(!rendered.contains("one"), "{rendered}");
+    }
+
+    #[test]
+    fn short_terminal_reduces_visible_rows_without_hiding_the_composer() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.term_width = 40;
+        app.set_available_height(8);
+        app.input = "one\ntwo\nthree\nfour\nfive\nsix".to_string();
+        app.cursor = app.input.chars().count();
+
+        let buffer = pane_buffer(&mut app, 40);
+        let rendered = (0..buffer.area.height)
+            .map(|y| cell_text(&buffer, y, 40))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(app.pane_height(40), 8);
+        assert!(rendered.contains("↑ more above"), "{rendered}");
+        assert!(rendered.contains("six"), "{rendered}");
+        assert!(!rendered.contains("one"), "{rendered}");
     }
 
     #[test]
@@ -2887,7 +3264,7 @@ mod tests {
         assert_eq!(theme_arg_partial("/the"), None);
         // Other commands never trigger arg mode.
         assert_eq!(theme_arg_partial("/clear "), None);
-        assert_eq!(theme_arg_partial("/ " ), None);
+        assert_eq!(theme_arg_partial("/ "), None);
         // Multi-token args dispatch directly, no suggestions.
         assert_eq!(theme_arg_partial("/theme a b"), None);
         assert_eq!(theme_arg_partial("/theme dark "), None);
@@ -2914,14 +3291,8 @@ mod tests {
             match_theme_names(&names, "d"),
             vec!["dark".to_string(), "dracula".to_string()]
         );
-        assert_eq!(
-            match_theme_names(&names, "dar"),
-            vec!["dark".to_string()]
-        );
-        assert_eq!(
-            match_theme_names(&names, "gr"),
-            vec!["gruvbox".to_string()]
-        );
+        assert_eq!(match_theme_names(&names, "dar"), vec!["dark".to_string()]);
+        assert_eq!(match_theme_names(&names, "gr"), vec!["gruvbox".to_string()]);
         assert!(match_theme_names(&names, "xyz").is_empty());
         assert!(match_theme_names(&names, "DR").is_empty(), "case-sensitive");
     }
@@ -3008,7 +3379,9 @@ mod tests {
         );
         match config_before {
             Some(bytes) => std::fs::write(&config_path, bytes).expect("restore config"),
-            None => { std::fs::remove_file(&config_path).ok(); }
+            None => {
+                std::fs::remove_file(&config_path).ok();
+            }
         };
     }
 
@@ -3082,7 +3455,10 @@ mod tests {
             "typed input missing: {text}"
         );
         // Theme rows carry no slash-command prefix or desc.
-        assert!(!text.contains("/gruvbox"), "theme rows need no slash: {text}");
+        assert!(
+            !text.contains("/gruvbox"),
+            "theme rows need no slash: {text}"
+        );
         // Partial narrows the painted rows.
         app.input = "/theme gruvbox".to_string();
         app.cursor = app.input.chars().count();
