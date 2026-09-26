@@ -11,9 +11,9 @@ Context: rem has slash commands but no popup today: `Tab`=block-select, `Up/Down
   - Registry is the single source for menu rows and `/help` output.
 - Trigger + filter + layout (clone Aster):
   - Menu opens on `/` prefix; prefix-filters on first token only; any whitespace closes menu.
-  - Cap 10 rows + `+N more` overflow line.
+  - Cap 10 rows + `+N more` overflow line, windowed around the selected command when the pane cannot show every match.
   - Two columns: command + description; selected row has marker/highlight.
-  - Renders directly above composer in the shaded input band.
+  - Renders directly above the composer. In rem's fixed six-row inline pane, the menu uses the idle gap/status space and the composer's vertical padding; while busy, the status remains visible and the menu uses fewer rows. The composer and caret stay on their normal row. If matches exceed the available menu rows, the selected window is shown with `+N more`.
 - Menu owns keys when open:
   - `Up/Down` move selection (not history), `Tab` completes selection into input (not block-select), `Enter` runs highlighted command (not raw submit), `Esc` dismisses menu (NOT interrupt).
   - Busy+menu-open `Esc` precedence (dismiss-first vs interrupt-first) is explicitly LEFT OPEN as a plan-time D-question (see below); menu-open `Esc` never interrupts on its own.
@@ -27,9 +27,10 @@ Context: rem has slash commands but no popup today: `Tab`=block-select, `Up/Down
 ## Consequences
 
 - `handle_key` needs a menu-open branch ahead of history/block-select/submit dispatch; `submit()` slash routing stays but runs post-completion.
+- The inline viewport remains six rows; menu rows are fitted into the available pane space instead of extending past the viewport and covering the composer.
 - Footer/hint and input placeholder need no change (`(/ for commands)` becomes true); `Up/Down` history and `Tab` block-select are shadowed only while menu is open.
 - ADR-0006 keymap work must account for the menu layer: `Ctrl+C` (clear-only) and `Ctrl+D` (quit-on-empty) behavior while menu-open falls out of the `Esc`-precedence decision.
-- Tests: `/` opens, prefix filters, whitespace closes, 10-cap + `+N more`, `Up/Down`/`Tab`/`Enter`/`Esc` ownership, `/help` lists registry, `/unknown` path unchanged.
+- Tests: `/` opens without hiding the composer or caret in the fixed inline pane, prefix filters, whitespace closes, 10-cap + `+N more`, `Up/Down`/`Tab`/`Enter`/`Esc` ownership, `/help` lists registry, `/unknown` path unchanged.
 
 ## Open Questions (plan-time)
 
