@@ -205,6 +205,17 @@ pub struct RigAgent {
     effort: String,
 }
 
+/// Project instructions file name, loaded from the project root only.
+const AGENTS_MD: &str = "AGENTS.md";
+/// Header separating static instructions from project context in the preamble.
+const AGENTS_MD_HEADER: &str = "\n\nProject context from AGENTS.md:\n";
+
+/// Load project-root `AGENTS.md` verbatim. No cap, no transform.
+/// Returns `None` when missing/unreadable (caller silently skips).
+fn load_agents_md(project_root: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(project_root.join(AGENTS_MD)).ok()
+}
+
 impl RigAgent {
     pub fn new(
         cfg: &Config,
@@ -222,17 +233,24 @@ impl RigAgent {
 
         let recorder = ToolRecorder::default();
         // Observer first (see everything), gate second (steers). ADR-0001.
-        let gate = PermissionHook::new(approval_tx, project_root);
+        let gate = PermissionHook::new(approval_tx, project_root.clone());
 
-        let agent = AgentBuilder::new(model)
-            .preamble(
-                "You are rem, a coding agent in a terminal TUI. \
-                 Use the read/write/edit/bash/list_directory/git_status/git_diff/grep/glob/web_fetch/web_search tools to inspect and change files. \
-                 list_directory lists a dir, glob finds files by pattern, grep searches contents, git_status/git_diff inspect git state. \
-                 web_search searches the web (DuckDuckGo, no key), web_fetch reads a URL as text. \
-                 Bash runs `sh -c` in the project dir (30s timeout). Destructive shell patterns are blocked outright; other mutations and network access ask the human for approval mid-run — if a call is denied, replan without it. \
-                 Prefer reading a file before editing it. Keep replies concise.",
-            )
+        let mut preamble = String::from(
+            "You are rem, a coding agent in a terminal TUI. \
+             Use the read/write/edit/bash/list_directory/git_status/git_diff/grep/glob/web_fetch/web_search tools to inspect and change files. \
+             list_directory lists a dir, glob finds files by pattern, grep searches contents, git_status/git_diff inspect git state. \
+             web_search searches the web (DuckDuckGo, no key), web_fetch reads a URL as text. \
+             Bash runs `sh -c` in the project dir (30s timeout). Destructive shell patterns are blocked outright; other mutations and network access ask the human for approval mid-run — if a call is denied, replan without it. \
+             Prefer reading a file before editing it. Keep replies concise.",
+        );
+        // Project context (ADR-0009): project-root AGENTS.md only, appended
+        // after static instructions, silently skipped when missing.
+        if let Some(body) = load_agents_md(&project_root) {
+            preamble.push_str(AGENTS_MD_HEADER);
+            preamble.push_str(&body);
+        }
+
+        let agent = AgentBuilder::new(model).preamble(&preamble)
             .tool(ReadTool)
             .tool(WriteTool)
             .tool(EditTool)
@@ -336,5 +354,32 @@ impl AgentLoop for RigAgent {
 
     fn effort_name(&self) -> String {
         self.effort.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_agents_md_returns_none_when_missing() {
+        let dir = std::env::temp_dir().join("rem-test-no-agents-md-xyz");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(load_agents_md(&dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_agents_md_returns_verbatim_body() {
+        let dir = std::env::temp_dir().join("rem-test-agents-md-xyz");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "# rules\nUse tabs.\n").unwrap();
+        assert_eq!(
+            load_agents_md(&dir).as_deref(),
+            Some("# rules\nUse tabs.\n")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

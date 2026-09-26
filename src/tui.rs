@@ -237,7 +237,22 @@ static COMMANDS: &[Command] = &[
         takes_arg: true,
         desc: "list or switch color themes",
     },
+    Command {
+        name: "init",
+        takes_arg: false,
+        desc: "generate AGENTS.md for this project",
+    },
 ];
+
+/// Fixed instruction for `/init` (ADR-0009): runs as a normal agent turn so
+/// the model inspects the repo with read/glob/grep tools and overwrites
+/// project-root `AGENTS.md`. Takes effect on next restart (preamble is
+/// frozen at startup).
+const INIT_PROMPT: &str = "Generate an AGENTS.md file for this project. \
+Inspect the repository with the read/list_directory/glob/grep/git_status tools to learn its layout, languages, build/test commands, and conventions. \
+Then write a concise AGENTS.md to the project root with the write tool, overwriting any existing file. \
+Keep it factual and repo-specific: project overview, layout, build/test/lint commands, code conventions, and anything an agent needs to work here. \
+Reply with a one-line summary of what you wrote.";
 
 /// Split `/name arg...` into the registry command + trailing arg.
 /// Returns `None` when the input is not a slash command or the name is
@@ -1000,6 +1015,11 @@ fn submit(
                 handle_theme_command(app, &arg);
                 return false;
             }
+            "init" => {
+                // ADR-0009: rewrite to the fixed init instruction and fall
+                // through to the normal turn path below.
+                text = INIT_PROMPT.to_string();
+            }
             _ => {}
         }
     }
@@ -1008,7 +1028,14 @@ fn submit(
         return false;
     }
 
-    app.enqueue_user(&text);
+    // `/init` shows the short command in the transcript while the agent
+    // receives the full fixed instruction.
+    let display = if text.as_str() == INIT_PROMPT {
+        "/init"
+    } else {
+        text.as_str()
+    };
+    app.enqueue_user(display);
     app.busy = true;
     app.busy_since = Instant::now();
     app.streamed_tools = 0;
@@ -2221,7 +2248,7 @@ mod tests {
         app.input = "/".to_string();
         app.cursor = 1;
         assert!(is_menu_open(&app));
-        // 4 registry commands, 3-row idle capacity: the menu caps at
+        // 5 registry commands, 3-row idle capacity: the menu caps at
         // capacity and spills into a `+N more` overflow row.
         assert_eq!(
             menu_height(&app),
@@ -2263,7 +2290,7 @@ mod tests {
         app.cursor = 1;
         app.menu_sel = Some(0);
         app.history = vec!["old turn".to_string()];
-        for expect in [1, 2, 3, 0] {
+        for expect in [1, 2, 3, 4, 0] {
             assert!(!handle_key(
                 &mut app,
                 &agent,
@@ -2282,10 +2309,50 @@ mod tests {
             KeyCode::Up,
             KeyModifiers::empty()
         ));
-        assert_eq!(app.menu_sel, Some(3));
+        assert_eq!(app.menu_sel, Some(4));
         assert_eq!(app.hist_idx, None);
         assert_eq!(app.input, "/");
         assert_eq!(app.history, vec!["old turn".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn slash_init_starts_turn_with_display_short() {
+        // ADR-0009: `/init` rewrites to INIT_PROMPT and runs a normal turn;
+        // the transcript shows `/init`, not the full instruction.
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        let agent = std::sync::Arc::new(StubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        app.input = "/init".to_string();
+        app.cursor = 5;
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Enter,
+            KeyModifiers::empty()
+        ));
+        assert_eq!(app.history.last().map(String::as_str), Some("/init"));
+        assert!(app.busy, "/init must start a turn");
+        let flat: String = app
+            .print_queue
+            .iter()
+            .flatten()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(flat.contains("/init"), "transcript must show /init: {flat}");
+        assert!(
+            !flat.contains("Generate an AGENTS.md"),
+            "transcript must not leak full prompt: {flat}"
+        );
     }
 
     #[test]
@@ -2476,7 +2543,7 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        for name in ["/quit", "/clear", "/help", "/theme"] {
+        for name in ["/quit", "/clear", "/help", "/theme", "/init"] {
             assert!(flat.contains(name), "help missing {name}: {flat}");
         }
         assert!(flat.contains("quit the app"), "help missing desc: {flat}");
@@ -2526,8 +2593,8 @@ mod tests {
         app.menu_sel = Some(0);
         terminal.draw(|f| render_pane(f, &mut app)).unwrap();
         let text = terminal.backend().to_string();
-        // Idle capacity fits 3 rows; 4 registry commands spill into
-        // 2 visible rows + a `+2 more` overflow row.
+        // Idle capacity fits 3 rows; 5 registry commands spill into
+        // 2 visible rows + a `+3 more` overflow row.
         for name in ["/quit", "/clear"] {
             assert!(text.contains(name), "menu row missing {name}: {text}");
         }
@@ -2536,7 +2603,7 @@ mod tests {
             "menu desc missing: {text}"
         );
         assert!(text.contains('▸'), "selection marker missing: {text}");
-        assert!(text.contains("+2 more"), "overflow row missing: {text}");
+        assert!(text.contains("+3 more"), "overflow row missing: {text}");
         let menu_row = text.lines().position(|l| l.contains("/quit")).unwrap();
         let input_row = text.lines().position(|l| l.contains("❯ /")).unwrap();
         assert!(menu_row < input_row, "menu must render above the composer");
@@ -2572,7 +2639,7 @@ mod tests {
         let text = terminal.backend().to_string();
         assert!(text.contains("working"), "busy status missing: {text}");
         assert!(text.contains("/help"), "selected command missing: {text}");
-        assert!(text.contains("+3 more"), "overflow hint missing: {text}");
+        assert!(text.contains("+4 more"), "overflow hint missing: {text}");
         assert!(
             text.lines().any(|line| line.contains("❯ /")),
             "typed input missing: {text}"

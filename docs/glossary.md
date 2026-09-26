@@ -59,3 +59,8 @@
 - True OS sandboxing (namespaces, seccomp, grsecurity). The gate is a *policy + human* layer, not a kernel boundary.
 - Secrets redaction on read.
 - Multi-user / remote approver.
+
+## Project instructions (ADR-0009)
+
+- **AGENTS.md**: Verbatim project instructions loaded once at startup from `<project_root>/AGENTS.md` only (no walk-up, no global file, no cap). Appended after the static preamble under a `Project context from AGENTS.md:` header; silently skipped when missing. Outranks history, survives compaction, takes effect on next restart.
+- **/init**: Slash command that rewrites to a fixed instruction and runs a normal agent turn — the model inspects the repo and overwrites project-root `AGENTS.md`. Transcript shows `/init`; standard write/approval flow applies.
