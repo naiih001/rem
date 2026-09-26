@@ -181,6 +181,24 @@ fn resize_inline_viewport<B: Backend>(
 /// Braille spinner frames for the busy status row (same set Aster uses).
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/// Cycling busy-status verbs (Claude Code / Aster style): sequential rotation,
+/// restarting at `working` each task. Word index derives from busy-elapsed
+/// time so it advances with the existing 50ms frame loop — no new plumbing.
+const BUSY_VERBS: [&str; 10] = [
+    "working",
+    "thinking",
+    "cooking",
+    "pondering",
+    "reasoning",
+    "crafting",
+    "brewing",
+    "scheming",
+    "conjuring",
+    "noodling",
+];
+/// Seconds each busy verb stays on screen before rotating to the next.
+const BUSY_VERB_SECS: u64 = 2;
+
 /// Warm orange accent for the prompt, spinner, and mode glyph.
 const ACCENT: Color = Color::Rgb(242, 118, 79);
 /// Slash-menu popup budget (Aster `menu_lines` 10-cap): max command rows;
@@ -1232,9 +1250,10 @@ fn render_status(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect)
     if app.busy {
         let elapsed = app.busy_since.elapsed();
         let spinner = SPINNER[(elapsed.as_millis() / 100) as usize % SPINNER.len()];
+        let verb = BUSY_VERBS[(elapsed.as_secs() / BUSY_VERB_SECS) as usize % BUSY_VERBS.len()];
         let line = Line::from(vec![
             Span::styled(format!("{spinner} "), Style::default().fg(ACCENT)),
-            Span::styled("working", Style::default().fg(Color::DarkGray)),
+            Span::styled(verb, Style::default().fg(Color::DarkGray)),
             Span::styled(
                 format!(" · {:.1}s · esc to interrupt", elapsed.as_secs_f32()),
                 Style::default().fg(Color::DarkGray),
@@ -1539,6 +1558,14 @@ mod tests {
         assert!(
             status.contains("esc to interrupt"),
             "hint missing: {status}"
+        );
+        // Backdate the task clock: the verb rotates every BUSY_VERB_SECS.
+        app.busy_since = Instant::now() - Duration::from_secs(BUSY_VERB_SECS);
+        let buf = pane_buffer(&mut app, 80);
+        let status = cell_text(&buf, 1, 80);
+        assert!(
+            status.contains(BUSY_VERBS[1]),
+            "verb did not rotate: {status}"
         );
         let mid = cell_text(&buf, 3, 80);
         assert!(mid.contains("esc to interrupt"), "busy hint missing: {mid}");

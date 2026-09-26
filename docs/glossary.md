@@ -34,7 +34,7 @@
 ## Input area (ADR-0004, Aster-style)
 
 - **Input band**: 3-row shaded composer (`PANE_BG` `#191919`): 1-row vertical padding around the text line. Middle row = 1-column inset + `❯ ` prompt + input window.
-- **Status row**: Zero-height when idle; 1 row when busy or approvals queued. Busy = braille spinner + `working · {s}s · esc to interrupt`. Approval = `waiting approval (N queued)` + key hints.
+- **Status row**: Zero-height when idle; 1 row when busy or approvals queued. Busy = braille spinner + `{verb} · {s}s · esc to interrupt`, where `{verb}` cycles sequentially through 10 verbs (`working, thinking, cooking, pondering, reasoning, crafting, brewing, scheming, conjuring, noodling`), advancing every 2s and restarting at `working` each task (ADR-0008). Approval = `waiting approval (N queued)` + key hints.
 - **Gap row**: 1 terminal-bg row separating the transcript from the bottom pane. The shaded band starts at the input, not the gap.
 - **Footer**: Single quiet line: `▶▶▶ edit · {model} · {N} turns · hints`. No busy readout; busy state lives in the status row.
 
