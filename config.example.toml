@@ -1,0 +1,16 @@
+# rem example configuration
+# Copy to ~/.config/rem/config.toml and fill in real values.
+# Never commit your real config.
+
+[api]
+key = "sk-your-key-here"
+base_url = "https://api.example.com/v1"
+
+[model]
+default = "gpt-4o"
+effort = "medium"
+
+# Active color theme: names a file in ~/.config/rem/themes/
+# (e.g. theme = "gruvbox" loads ~/.config/rem/themes/gruvbox.toml).
+# Comment out or remove for the built-in default palette.
+# theme = "gruvbox"

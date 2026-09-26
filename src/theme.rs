@@ -5,6 +5,8 @@ use anyhow::{Context, Result};
 use ratatui::style::Color;
 use serde::Deserialize;
 
+use crate::config::Config;
+
 /// Full application theme. Every hardcoded color in the app maps to a field
 /// here. Missing keys in the TOML fall back to `Theme::default()` values.
 #[derive(Debug, Clone)]
@@ -66,12 +68,12 @@ impl Default for Theme {
 
 // ── TOML deserialization ────────────────────────────────────────────────
 
+/// Shape of a `~/.config/rem/themes/<name>.toml` theme file.
+/// (Theme files use `name`; the main `config.toml` points at them with a
+/// top-level `theme = "<name>"` parsed via [`Config`].)
 #[derive(Debug, Deserialize, Default)]
 struct ThemeToml {
     name: Option<String>,
-    /// Active-theme pointer in `config.toml` (`theme = "<name>"`).
-    /// Theme files use `name`; the config file uses `theme`.
-    theme: Option<String>,
     colors: Option<ColorsToml>,
 }
 
@@ -130,6 +132,39 @@ fn opt_color(s: Option<&str>, fallback: Color) -> Color {
 
 // ── Loading ─────────────────────────────────────────────────────────────
 
+/// Insert or replace the top-level `theme = "<name>"` line in the raw
+/// `config.toml` text. Every other line passes through untouched, so
+/// comments and the `[api]` / `[model]` blocks survive a `/theme` switch.
+fn upsert_theme_line(existing: &str, name: &str) -> String {
+    let replacement = format!("theme = \"{name}\"");
+    let mut replaced = false;
+    let mut out: Vec<String> = Vec::new();
+    for line in existing.lines() {
+        let trimmed = line.trim_start();
+        // Skip comments and indented keys inside `[tables]`.
+        let is_top_level_theme = !line.starts_with([' ', '\t'])
+            && (trimmed == "theme" || trimmed.starts_with("theme ="));
+        if is_top_level_theme && !replaced {
+            out.push(replacement.clone());
+            replaced = true;
+        } else if is_top_level_theme {
+            // Drop duplicate theme lines; the first one wins.
+            continue;
+        } else {
+            out.push(line.to_string());
+        }
+    }
+    if !replaced {
+        out.insert(0, replacement);
+    }
+    let mut text = out.join("\n");
+    // Preserve the file's trailing newline convention.
+    if existing.ends_with('\n') || !existing.is_empty() {
+        text.push('\n');
+    }
+    text
+}
+
 impl Theme {
     /// Parse a `.toml` theme file. Missing keys fall back to `Theme::default()`.
     pub fn load(path: &std::path::Path) -> Result<Self> {
@@ -170,20 +205,14 @@ impl Theme {
         })
     }
 
-    /// XDG-compliant config directory for rem.
-    fn config_dir() -> Result<PathBuf> {
-        let base = dirs::config_dir().context("cannot determine XDG config directory")?;
-        Ok(base.join("rem"))
-    }
-
-    /// Path to the themes directory.
+    /// Path to the themes directory. Derived from [`Config::path`] so the
+    /// config location has a single source of truth.
     fn themes_dir() -> Result<PathBuf> {
-        Ok(Self::config_dir()?.join("themes"))
-    }
-
-    /// Path to the persistent config file.
-    fn config_file() -> Result<PathBuf> {
-        Ok(Self::config_dir()?.join("config.toml"))
+        let config_file = Config::path().map_err(anyhow::Error::msg)?;
+        Ok(config_file
+            .parent()
+            .map(|p| p.join("themes"))
+            .unwrap_or_else(|| PathBuf::from("themes")))
     }
 
     /// List available theme names (basenames without `.toml`).
@@ -217,36 +246,34 @@ impl Theme {
         Self::load(&path)
     }
 
-    /// Load the active theme from `config.toml`. Falls back to `Theme::default()`.
+    /// Load the active theme named by `config.toml` (via [`Config`]).
+    /// Falls back to `Theme::default()` when unset or unloadable.
     pub fn load_active() -> Self {
-        let config_file = match Self::config_file() {
-            Ok(p) => p,
-            Err(_) => return Self::default(),
-        };
-        let text = match fs::read_to_string(&config_file) {
-            Ok(t) => t,
-            Err(_) => return Self::default(),
-        };
-        let parsed: ThemeToml = match toml::from_str(&text) {
-            Ok(p) => p,
-            Err(_) => return Self::default(),
-        };
-        let theme_name = match parsed.theme.or(parsed.name) {
-            Some(n) => n,
-            None => return Self::default(),
-        };
-        Self::load_named(&theme_name).unwrap_or_default()
+        let name = Config::from_file().ok().and_then(|c| c.theme.name);
+        match name {
+            Some(n) => Self::load_named(&n).unwrap_or_default(),
+            None => Self::default(),
+        }
     }
 
     /// Persist the active theme name to `config.toml`.
+    /// Only the top-level `theme = "<name>"` line is touched — every other
+    /// line (comments, `[api]`, `[model]`) is preserved byte-for-byte.
     pub fn save_active(name: &str) -> Result<()> {
-        let config_dir = Self::config_dir()?;
-        fs::create_dir_all(&config_dir)
-            .with_context(|| format!("creating config dir {}", config_dir.display()))?;
+        let config_file = Config::path().map_err(anyhow::Error::msg)?;
+        if let Some(parent) = config_file.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("creating config dir {}", parent.display()))?;
+        }
 
-        let config_file = Self::config_file()?;
-        let content = format!("theme = \"{name}\"\n");
-        fs::write(&config_file, content)
+        let updated = match fs::read_to_string(&config_file) {
+            Ok(existing) => upsert_theme_line(&existing, name),
+            // No config file yet: the app cannot have started (startup
+            // requires `[api]` + `[model]`), so this is unreachable in
+            // practice. Still, write a valid top-level line.
+            Err(_) => format!("theme = \"{name}\"\n"),
+        };
+        fs::write(&config_file, updated)
             .with_context(|| format!("writing config file {}", config_file.display()))?;
         Ok(())
     }
@@ -349,6 +376,31 @@ blockquote_fg = "#928374"
             .unwrap();
         assert!(Theme::load(&path).is_err());
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn upsert_theme_line_preserves_api_and_model() {
+        let existing = "# my config\n\n[api]\nkey = \"sk-x\"\nbase_url = \"https://x\"\n\n[model]\ndefault = \"m\"\neffort = \"high\"\n";
+        let out = upsert_theme_line(existing, "gruvbox");
+        assert!(out.contains("theme = \"gruvbox\""), "theme line missing: {out}");
+        assert!(out.contains("[api]"), "api block lost: {out}");
+        assert!(out.contains("key = \"sk-x\""), "api key lost: {out}");
+        assert!(out.contains("[model]"), "model block lost: {out}");
+        assert!(out.contains("# my config"), "comment lost: {out}");
+        // The result must still parse as a full Config.
+        let cfg: crate::config::Config = toml::from_str(&out).unwrap();
+        assert_eq!(cfg.theme.name.as_deref(), Some("gruvbox"));
+        assert_eq!(cfg.api.key, "sk-x");
+        assert_eq!(cfg.model.effort, "high");
+    }
+
+    #[test]
+    fn upsert_theme_line_replaces_existing() {
+        let existing = "theme = \"old\"\n\n[api]\nkey = \"k\"\n";
+        let out = upsert_theme_line(existing, "new");
+        assert_eq!(out.matches("theme =").count(), 1, "duplicate theme lines: {out}");
+        assert!(out.contains("theme = \"new\""), "not replaced: {out}");
+        assert!(out.contains("[api]"), "api block lost: {out}");
     }
 
     #[test]

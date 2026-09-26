@@ -5,6 +5,10 @@ use serde::Deserialize;
 pub struct Config {
     pub api: ApiConfig,
     pub model: ModelConfig,
+    /// Active color theme. Top-level `theme = "<name>"` in `config.toml`.
+    /// `None` = built-in default. Names a file in `~/.config/rem/themes/`.
+    #[serde(default)]
+    pub theme: ThemeConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -26,12 +30,27 @@ fn default_effort() -> String {
     "medium".to_string()
 }
 
+/// Active-theme pointer. A transparent wrapper so the TOML stays a plain
+/// top-level string (`theme = "gruvbox"`) while the Rust side keeps the
+/// same sub-struct pattern as `ApiConfig` / `ModelConfig`.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(transparent)]
+pub struct ThemeConfig {
+    pub name: Option<String>,
+}
+
 impl Config {
-    /// Load config from `~/.config/rem/config.toml`.
-    pub fn from_file() -> Result<Self, String> {
+    /// Canonical path to the config file (`~/.config/rem/config.toml`).
+    /// Single source of truth — every module resolves config paths from here.
+    pub fn path() -> Result<std::path::PathBuf, String> {
         let config_dir =
             dirs::config_dir().ok_or("could not determine platform config directory")?;
-        let config_path = config_dir.join("rem").join("config.toml");
+        Ok(config_dir.join("rem").join("config.toml"))
+    }
+
+    /// Load config from `~/.config/rem/config.toml`.
+    pub fn from_file() -> Result<Self, String> {
+        let config_path = Self::path()?;
 
         let content = std::fs::read_to_string(&config_path)
             .map_err(|e| format!("failed to read {}: {e}", config_path.display()))?;
@@ -77,6 +96,36 @@ default = "gpt-4o"
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.model.effort, "medium");
+    }
+
+    #[test]
+    fn theme_defaults_to_none_when_missing() {
+        let toml_str = r#"
+[api]
+key = "sk-test"
+base_url = "https://api.example.com/v1"
+
+[model]
+default = "gpt-4o"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.theme.name, None);
+    }
+
+    #[test]
+    fn theme_parses_top_level_string() {
+        let toml_str = r#"
+theme = "gruvbox"
+
+[api]
+key = "sk-test"
+base_url = "https://api.example.com/v1"
+
+[model]
+default = "gpt-4o"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.theme.name.as_deref(), Some("gruvbox"));
     }
 
     #[test]
