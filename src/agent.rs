@@ -213,12 +213,12 @@ impl RigAgent {
     ) -> Result<Self, String> {
         // Explicit `.base_url()` per spec — no reliance on OPENAI_BASE_URL env.
         let client = openai::CompletionsClient::builder()
-            .api_key(cfg.api_key.clone())
-            .base_url(cfg.base_url.clone())
+            .api_key(cfg.api.key.clone())
+            .base_url(cfg.api.base_url.clone())
             .build()
             .map_err(|e| format!("failed to build LLM client: {e}"))?;
 
-        let model = client.completion_model(cfg.model.clone());
+        let model = client.completion_model(cfg.model.default.clone());
 
         let recorder = ToolRecorder::default();
         // Observer first (see everything), gate second (steers). ADR-0001.
@@ -245,7 +245,7 @@ impl RigAgent {
             .tool(WebFetchTool)
             .tool(WebSearchTool)
             .default_max_turns(100)
-            .additional_params(serde_json::json!({"reasoning_effort": cfg.effort.clone()}))
+            .additional_params(serde_json::json!({"reasoning_effort": cfg.model.effort.clone()}))
             .add_hook(recorder.clone())
             .add_hook(gate)
             .build();
@@ -254,8 +254,8 @@ impl RigAgent {
             agent,
             context: tokio::sync::Mutex::new(Context::new()),
             recorder,
-            model_name: cfg.model.clone(),
-            effort: cfg.effort.clone(),
+            model_name: cfg.model.default.clone(),
+            effort: cfg.model.effort.clone(),
         })
     }
 }

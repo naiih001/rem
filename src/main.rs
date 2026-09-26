@@ -13,11 +13,11 @@ use tui::{RatatuiBackend, TuiBackend};
 
 #[tokio::main]
 async fn main() {
-    let cfg = match Config::from_env() {
+    let cfg = match Config::from_file() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("rem: {e}");
-            eprintln!("hint: cp .env.example .env, fill in REM_* values, then `cargo run`");
+            eprintln!("hint: create ~/.config/rem/config.toml with [api] and [model] sections");
             std::process::exit(1);
         }
     };
