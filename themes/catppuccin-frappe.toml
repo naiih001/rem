@@ -1,0 +1,30 @@
+# Catppuccin Frappé — upstream: github.com/catppuccin/palette (frappe)
+# base #303446 · mantle #292c3c · text #c6d0f5
+name = "catppuccin-frappe"
+
+[colors]
+accent = "#ca9ee6"
+pane_bg = "#303446"
+rail_bg = "#292c3c"
+placeholder = "#737994"
+menu_sel_bg = "#414559"
+
+[colors.add]
+bg = "#2a3830"
+fg = "#a6d189"
+mark = "#64804f"
+
+[colors.del]
+bg = "#3b2a32"
+fg = "#e78284"
+mark = "#b05763"
+
+[colors.markdown]
+code_bg = "#292c3c"
+heading_h1 = "#ca9ee6"
+heading_h2 = "#8caaee"
+heading_h3 = "#f4b8e4"
+link_fg = "#99d1db"
+link_url_fg = "#838ba7"
+code_fg = "#c6d0f5"
+blockquote_fg = "#949cbb"

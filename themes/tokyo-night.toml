@@ -1,0 +1,31 @@
+# Tokyo Night (Night) — upstream: github.com/folke/tokyonight.nvim
+# extras/lua/tokyonight_night.lua — bg #1a1b26 · fg #c0caf5
+# diff add #243e4a / delete #4a272f · git add #449dab / delete #914c54
+name = "tokyo-night"
+
+[colors]
+accent = "#7aa2f7"
+pane_bg = "#1a1b26"
+rail_bg = "#16161e"
+placeholder = "#545c7e"
+menu_sel_bg = "#292e42"
+
+[colors.add]
+bg = "#243e4a"
+fg = "#9ece6a"
+mark = "#449dab"
+
+[colors.del]
+bg = "#4a272f"
+fg = "#f7768e"
+mark = "#914c54"
+
+[colors.markdown]
+code_bg = "#16161e"
+heading_h1 = "#7aa2f7"
+heading_h2 = "#bb9af7"
+heading_h3 = "#7dcfff"
+link_fg = "#7dcfff"
+link_url_fg = "#565f89"
+code_fg = "#c0caf5"
+blockquote_fg = "#737aa2"
