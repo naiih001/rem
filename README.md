@@ -11,16 +11,20 @@ A Rust-based terminal UI coding assistant for working on local projects in your 
 - Terminal-based user interface
 - Project-aware local context
 - Rust + Tokio backend
-- Works with environment-based configuration
+- TOML-based configuration (`~/.config/rem/config.toml`)
 
 ## Getting started
 
-1. Copy the example environment file:
+1. Create the config directory:
    ```bash
-   cp .env.example .env
+   mkdir -p ~/.config/rem
    ```
-2. Fill in the required `REM_*` values in `.env`.
-3. Run the app:
+2. Copy the example config:
+   ```bash
+   cp config.example.toml ~/.config/rem/config.toml
+   ```
+3. Fill in your API key and settings.
+4. Run the app:
    ```bash
    cargo run
    ```
