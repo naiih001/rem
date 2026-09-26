@@ -1,7 +1,7 @@
 //! Scrollback transcript rows, Aster-style.
 //!
 //! Every builder returns finished `Vec<Line<'static>>`, already wrapped to
-//! `width`. The event loop pushes them above the inline viewport with
+//! `width`. The event loop pushes them above the bottom-anchored viewport with
 //! `insert_before` and never touches them again — scrolling, selection, and
 //! copy belong to the terminal. Anatomy verified against Aster's
 //! `history.rs`: `hang`/`bullet`/`branch`, user band + rail, tool label +
