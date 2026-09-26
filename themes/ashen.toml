@@ -1,0 +1,31 @@
+# Ashen — upstream: github.com/ficcdaf/ashen.nvim (variants/default)
+# background #121212 · ember red #B14242 · oranges #D87C4A/#C4693D/#E49A44
+# teal #4A8B8B · grays g_2 #d5d5d5 – g_11 #191919
+name = "ashen"
+
+[colors]
+accent = "#B14242"
+pane_bg = "#121212"
+rail_bg = "#191919"
+placeholder = "#737373"
+menu_sel_bg = "#323232"
+
+[colors.add]
+bg = "#323232"
+fg = "#E49A44"
+mark = "#C4693D"
+
+[colors.del]
+bg = "#323232"
+fg = "#DF6464"
+mark = "#B14242"
+
+[colors.markdown]
+code_bg = "#191919"
+heading_h1 = "#D87C4A"
+heading_h2 = "#C4693D"
+heading_h3 = "#E49A44"
+link_fg = "#4A8B8B"
+link_url_fg = "#949494"
+code_fg = "#d5d5d5"
+blockquote_fg = "#a7a7a7"
