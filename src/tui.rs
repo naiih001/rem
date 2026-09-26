@@ -20,6 +20,7 @@ use tokio::task::JoinHandle;
 use unicode_width::UnicodeWidthStr;
 
 use crate::agent::{AgentLoop, ToolEvent};
+use rig::message::{AssistantContent, Message, UserContent};
 use crate::history;
 use crate::permissions::{ApprovalDecision, ApprovalRequest, ApprovalRx};
 use crate::theme::Theme;
@@ -117,6 +118,13 @@ fn run_app(
     .context("create terminal")?;
 
     let mut app = App::new(model, effort);
+    if let Ok(sid) = std::env::var("REM_SESSION_ID") {
+        if let Ok(conn) = crate::sessions::open() {
+            if let Ok(Some(s)) = crate::sessions::get_session(&conn, &sid) {
+                app.replay_json(&s.messages_json);
+            }
+        }
+    }
     // The approval channel is tokio mpsc; the TUI loop is sync crossterm, so
     // poll with try_recv (never block the 50ms frame).
     let mut approval_rx = approval_rx;
@@ -131,6 +139,12 @@ fn run_app(
         &mut approval_rx,
     );
 
+    // Sync final id for the post-exit resume hint in main.rs: /resume,
+    // /fork, and the picker mutate app.session_id after startup, and both
+    // quit paths (/quit, Ctrl+D) return through here.
+    unsafe {
+        std::env::set_var("REM_SESSION_ID", &app.session_id);
+    }
     // Inline viewport: leave the transcript in scrollback and park the
     // cursor below the pane. Ratatui's Drop restores the cursor state.
     disable_raw_mode().ok();
@@ -581,6 +595,49 @@ impl App {
         self.streamed_tools = 0;
         self.dirty = true;
     }
+    fn replay_json(&mut self, json: &str) {
+        let Ok(mut ctx) = crate::context::Context::from_json(json) else { return };
+        let msgs = std::mem::take(ctx.messages_mut());
+        self.replay_messages(&msgs);
+    }
+    fn replay_messages(&mut self, msgs: &[Message]) {
+        for m in msgs {
+            match m {
+                Message::System { .. } => {}
+                Message::User { content } => {
+                    let mut texts = Vec::new();
+                    let mut had_tool = false;
+                    for c in content {
+                        match c {
+                            UserContent::Text(t) if t.text.starts_with("Prior conversation summary:") => self.enqueue_notice(t.text.clone()),
+                            UserContent::Text(t) => texts.push(t.text.clone()),
+                            UserContent::ToolResult(r) => {
+                                had_tool = true;
+                                let parts: Vec<&str> = r.content.iter().filter_map(|c| c.as_text()).collect();
+                                let output = parts.join("\n");
+                                let summary: String = output.lines().next().unwrap_or("").chars().take(120).collect();
+                                let w = self.term_width as usize;
+                                self.enqueue(crate::history::tool_row(&r.name, "", true, &summary, &output, w));
+                            }
+                            _ => {}
+                        }
+                    }
+                    let body = texts.join("\n");
+                    if !had_tool && !body.trim().is_empty() { self.enqueue_user(&body); }
+                }
+                Message::Assistant { content, .. } => {
+                    let mut body = String::new();
+                    for c in content {
+                        if let AssistantContent::Text(t) = c { body.push_str(&t.text); }
+                    }
+                    if !body.trim().is_empty() {
+                        let w = self.term_width as usize;
+                        self.enqueue(crate::history::reply_rows(&body, w, &self.theme));
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Main loop: drains turn/live/approval channels, prints finished rows
@@ -857,7 +914,7 @@ fn handle_key(
                                 app.session_id = s.id.clone();
                                 app.session_title = s.title.clone();
                                 match agent.import_sync(&s.messages_json) {
-                                    Ok(()) => app.enqueue_notice(format!("resumed {title}")),
+                                    Ok(()) => { app.replay_json(&s.messages_json); app.enqueue_notice(format!("resumed {title}")) },
                                     Err(e) => app.enqueue_notice(format!("resumed {title} (history import failed: {e})")),
                                 }
                             }
@@ -1130,7 +1187,7 @@ fn submit(
                             app.session_id = s.id.clone();
                             app.session_title = s.title.clone();
                             match agent.import_sync(&s.messages_json) {
-                                Ok(()) => app.enqueue_notice(format!("resumed {}", s.title)),
+                                Ok(()) => { app.replay_json(&s.messages_json); app.enqueue_notice(format!("resumed {}", s.title)) },
                                 Err(e) => app.enqueue_notice(format!("resumed {} (history import failed: {e})", s.title)),
                             }
                         }

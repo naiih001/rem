@@ -117,7 +117,29 @@ async fn main() {
         std::env::set_var("REM_SESSION_TITLE", &session.title);
     }
 
-    if let Err(e) = RatatuiBackend::new().run(agent, approval_rx) {
+    let run_result = RatatuiBackend::new().run(agent, approval_rx);
+
+    // Post-exit cleanup (all quit paths: /quit, Ctrl+D on empty input):
+    // run() already tore down raw mode + the inline viewport, so wipe
+    // visible screen + scrollback (mirrors launch Clear All+Purge) leaving
+    // only the resume hint. Env var wins: /resume//fork inside the TUI
+    // sync the final id there before returning.
+    {
+        use crossterm::{cursor::MoveTo, execute, terminal::{Clear, ClearType}};
+        let _ = execute!(
+            std::io::stdout(),
+            Clear(ClearType::All),
+            Clear(ClearType::Purge),
+            MoveTo(0, 0),
+        );
+    }
+    let sid = std::env::var("REM_SESSION_ID").unwrap_or_default();
+    let sid = if sid.is_empty() { session.id.clone() } else { sid };
+    if !sid.is_empty() {
+        println!("Session saved. Resume with: rem --resume {sid}");
+    }
+
+    if let Err(e) = run_result {
         eprintln!("rem: TUI error: {e:#}");
         std::process::exit(1);
     }
