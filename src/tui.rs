@@ -22,6 +22,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::agent::{AgentLoop, ToolEvent};
 use crate::history;
 use crate::permissions::{ApprovalDecision, ApprovalRequest, ApprovalRx};
+use crate::theme::Theme;
 
 /// Swappable UI abstraction. `RatatuiBackend` is the Ratatui implementation;
 /// the old Cursive backend was removed in favor of this Aster-styled UI.
@@ -181,13 +182,9 @@ fn resize_inline_viewport<B: Backend>(
 /// Braille spinner frames for the busy status row (same set Aster uses).
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-/// Warm orange accent for the prompt, spinner, and mode glyph.
-const ACCENT: Color = Color::Rgb(242, 118, 79);
 /// Slash-menu popup budget (Aster `menu_lines` 10-cap): max command rows;
 /// one extra `+N more` row appears on overflow.
 const MENU_MAX_ROWS: usize = 10;
-/// Selected menu-row highlight: subtle lift over `PANE_BG`.
-const MENU_SEL_BG: Color = Color::Rgb(0x2e, 0x2e, 0x2e);
 /// Scrollback transcript (ADR-0005): finished rows print into the
 /// terminal's own scrollback via `insert_before` and are never touched
 /// again. `App` holds only a queue of pending `Line` groups; the event
@@ -218,12 +215,23 @@ static COMMANDS: &[Command] = &[
         takes_arg: false,
         desc: "list commands",
     },
+    Command {
+        name: "theme",
+        takes_arg: true,
+        desc: "list or switch color themes",
+    },
 ];
 
-/// Match trimmed input against exact `/name`.
-fn lookup_command(text: &str) -> Option<&'static Command> {
-    let name = text.trim().strip_prefix('/')?;
-    COMMANDS.iter().find(|c| c.name == name)
+/// Split `/name arg...` into the registry command + trailing arg.
+/// Returns `None` when the input is not a slash command or the name is
+/// unknown. The arg is the trimmed remainder (may be empty).
+fn parse_command(text: &str) -> Option<(&'static Command, String)> {
+    let rest = text.trim().strip_prefix('/')?;
+    let mut parts = rest.splitn(2, char::is_whitespace);
+    let name = parts.next().unwrap_or("");
+    let arg = parts.next().unwrap_or("").trim().to_string();
+    let cmd = COMMANDS.iter().find(|c| c.name == name)?;
+    Some((cmd, arg))
 }
 
 /// Slash-menu prefix filter: the menu lives only while the input is a bare
@@ -289,6 +297,9 @@ fn clamp_menu_sel(app: &mut App) {
 struct App {
     model: String,
     effort: String,
+    /// Active color theme. Swapped live by `/theme`; every render and
+    /// history-row builder reads from here (no `const` colors remain).
+    theme: Theme,
     /// Finished transcript groups waiting to print above the viewport.
     /// Each entry is one `history::` row group (already wrapped to
     /// `term_width` at enqueue time... actually wrapped at drain time;
@@ -395,9 +406,14 @@ fn fmt_elapsed(d: Duration) -> String {
 
 impl App {
     fn new(model: String, effort: String) -> Self {
+        Self::with_theme(model, effort, Theme::load_active())
+    }
+
+    fn with_theme(model: String, effort: String, theme: Theme) -> Self {
         let mut app = Self {
             model,
             effort,
+            theme,
             print_queue: Vec::new(),
             input: String::new(),
             cursor: 0,
@@ -434,7 +450,7 @@ impl App {
 
     fn enqueue_user(&mut self, prompt: &str) {
         let w = self.term_width;
-        self.enqueue(history::user_row(prompt, w as usize));
+        self.enqueue(history::user_row(prompt, w as usize, &self.theme));
     }
 
     fn enqueue_notice(&mut self, text: String) {
@@ -455,6 +471,7 @@ impl App {
             &req.reason,
             queued,
             w as usize,
+            &self.theme,
         ));
     }
 
@@ -467,7 +484,7 @@ impl App {
         let rows = match ev.name.as_str() {
             "git_diff" => {
                 let path = ev.args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                history::patch_row("Diff", path, &ev.output, w)
+                history::patch_row("Diff", path, &ev.output, w, &self.theme)
             }
             _ => history::tool_row(
                 &ev.name,
@@ -502,7 +519,7 @@ impl App {
                     true => "(empty reply)",
                     false => text,
                 };
-                self.enqueue(history::reply_rows(body, w));
+                self.enqueue(history::reply_rows(body, w, &self.theme));
             }
             Err(e) => {
                 self.enqueue(history::error_row(&format!("[error] {e}"), w));
@@ -879,6 +896,49 @@ fn handle_ctrl(app: &mut App, code: KeyCode) -> bool {
     }
 }
 
+/// `/theme` dispatch: no arg lists available themes + current; with a
+/// name loads `<name>.toml`, swaps the live theme, and persists it so the
+/// next launch becomes the default. Unknown names and load failures
+/// queue an error notice — never a crash.
+fn handle_theme_command(app: &mut App, arg: &str) {
+    if arg.is_empty() {
+        let list = match Theme::list_themes() {
+            Ok(names) => names,
+            Err(e) => {
+                app.enqueue_notice(format!("theme: cannot list themes: {e:#}"));
+                return;
+            }
+        };
+        if list.is_empty() {
+            app.enqueue_notice(format!(
+                "theme: no themes installed (current: {}).",
+                app.theme.name
+            ));
+        } else {
+            app.enqueue_notice(format!(
+                "themes (current: {}):\n  {}",
+                app.theme.name,
+                list.join("\n  ")
+            ));
+        }
+        return;
+    }
+    match Theme::load_named(arg) {
+        Ok(theme) => {
+            let name = theme.name.clone();
+            app.theme = theme;
+            if let Err(e) = Theme::save_active(&name) {
+                app.enqueue_notice(format!("theme: switched to \"{name}\" but could not persist: {e:#}"));
+            } else {
+                app.enqueue_notice(format!("theme: switched to \"{name}\"."));
+            }
+        }
+        Err(e) => {
+            app.enqueue_notice(format!("theme: unknown theme \"{arg}\" ({e:#}). Try /theme."));
+        }
+    }
+}
+
 fn submit(
     app: &mut App,
     agent: &Arc<impl AgentLoop + Send + Sync + 'static>,
@@ -902,7 +962,7 @@ fn submit(
     app.history.push(text.clone());
     app.hist_idx = None;
 
-    if let Some(cmd) = lookup_command(&text) {
+    if let Some((cmd, arg)) = parse_command(&text) {
         match cmd.name {
             "quit" => return true,
             "clear" => {
@@ -917,6 +977,10 @@ fn submit(
                     msg.push_str(&format!("\n  /{}{usage} — {}", c.name, c.desc));
                 }
                 app.enqueue_notice(msg);
+                return false;
+            }
+            "theme" => {
+                handle_theme_command(app, &arg);
                 return false;
             }
             _ => {}
@@ -1124,8 +1188,17 @@ fn render_pane(f: &mut ratatui::Frame, app: &mut App) {
     render_input(f, app, chunks[3]);
     render_footer(f, app, chunks[4]);
     // Approval modal last: bottom-anchored sheet over the pane.
-    if let Some(req) = app.pending_approvals.front() {
-        render_approval_modal(f, f.area(), req, app.pending_approvals.len());
+    if app.pending_approvals.front().is_some() {
+        let queued = app.pending_approvals.len();
+        // Clone the head request (oneshot sender is not Clone, so rebuild
+        // a display-only copy without touching the queue).
+        let head = app.pending_approvals.front().expect("checked above");
+        let display = ApprovalDisplay {
+            tool_name: head.tool_name.clone(),
+            args_preview: head.args_preview.clone(),
+            reason: head.reason.clone(),
+        };
+        render_approval_modal(f, f.area(), &display, queued, &app.theme);
     }
     // Keep the caret on the composer's text row in the shaded band.
     let x = app.cursor_x(area.width);
@@ -1141,13 +1214,27 @@ fn render_pane(f: &mut ratatui::Frame, app: &mut App) {
 /// The request rows already printed into scrollback when the modal took
 /// over; this sheet is the live decision surface. `handle_key` blocks input
 /// routing until resolved.
-fn render_approval_modal(f: &mut ratatui::Frame, area: Rect, req: &ApprovalRequest, queued: usize) {
+/// Display-only snapshot of an approval head for the modal sheet.
+/// (The live `ApprovalRequest` owns a oneshot sender and cannot be cloned.)
+struct ApprovalDisplay {
+    tool_name: String,
+    args_preview: String,
+    reason: String,
+}
+
+fn render_approval_modal(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    req: &ApprovalDisplay,
+    queued: usize,
+    theme: &Theme,
+) {
     // Bottom sheet: 5 shaded rows over gap + status + input band; footer
     // stays visible underneath with the model/turn line.
     let h = 5u16.min(area.height.saturating_sub(1));
     let sheet = Rect::new(area.x, area.y, area.width, h);
     f.render_widget(
-        Block::default().style(Style::default().bg(history::PANE_BG)),
+        Block::default().style(Style::default().bg(theme.pane_bg)),
         sheet,
     );
     if sheet.height < 5 || sheet.width < 20 {
@@ -1165,7 +1252,7 @@ fn render_approval_modal(f: &mut ratatui::Frame, area: Rect, req: &ApprovalReque
         false => req.args_preview.clone(),
     };
     let mut head: Vec<Span<'static>> = vec![
-        Span::styled("◌ ", Style::default().fg(ACCENT)),
+        Span::styled("◌ ", Style::default().fg(theme.accent)),
         Span::styled(
             "permission — approval needed".to_string(),
             Style::default().add_modifier(Modifier::BOLD),
@@ -1216,7 +1303,7 @@ fn render_status(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect)
     }
     if !app.pending_approvals.is_empty() {
         let line = Line::from(vec![
-            Span::styled("◌ ", Style::default().fg(ACCENT)),
+            Span::styled("◌ ", Style::default().fg(app.theme.accent)),
             Span::styled(
                 format!("waiting approval ({} queued)", app.pending_approvals.len()),
                 Style::default().fg(Color::Yellow),
@@ -1233,7 +1320,10 @@ fn render_status(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect)
         let elapsed = app.busy_since.elapsed();
         let spinner = SPINNER[(elapsed.as_millis() / 100) as usize % SPINNER.len()];
         let line = Line::from(vec![
-            Span::styled(format!("{spinner} "), Style::default().fg(ACCENT)),
+            Span::styled(
+                format!("{spinner} "),
+                Style::default().fg(app.theme.accent),
+            ),
             Span::styled("working", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 format!(" · {:.1}s · esc to interrupt", elapsed.as_secs_f32()),
@@ -1246,11 +1336,11 @@ fn render_status(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect)
     f.render_widget(Paragraph::new(Line::from("")), area);
 }
 
-/// Slash-menu popup directly above the composer (ADR-0007): `PANE_BG`
+/// Slash-menu popup directly above the composer (ADR-0007): themed
 /// shaded band, one row per match as `▸ /name  desc` — selected row
-/// highlighted (`MENU_SEL_BG` + bold `ACCENT` name + `▸` marker), rest
-/// dim — capped at `MENU_MAX_ROWS` with a trailing dim `+N more` overflow
-/// row. Zero-height chunk when closed.
+/// highlighted (theme `menu_sel_bg` + bold accent name + `▸` marker),
+/// rest dim — capped at `MENU_MAX_ROWS` with a trailing dim `+N more`
+/// overflow row. Zero-height chunk when closed.
 fn render_menu(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
     if area.height == 0 || area.width == 0 {
         return;
@@ -1259,8 +1349,9 @@ fn render_menu(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
     if cmds.is_empty() {
         return;
     }
+    let theme = &app.theme;
     f.render_widget(
-        Block::default().style(Style::default().bg(history::PANE_BG)),
+        Block::default().style(Style::default().bg(theme.pane_bg)),
         area,
     );
     let sel = app.menu_sel.map_or(0, |i| i.min(cmds.len() - 1));
@@ -1280,26 +1371,26 @@ fn render_menu(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
     for (i, cmd) in cmds.iter().enumerate().skip(start).take(command_rows) {
         let selected = i == sel;
         let row_style = match selected {
-            true => Style::default().bg(MENU_SEL_BG),
-            false => Style::default().bg(history::PANE_BG),
+            true => Style::default().bg(theme.menu_sel_bg),
+            false => Style::default().bg(theme.pane_bg),
         };
         let (marker, name_style) = match selected {
             true => (
                 Span::styled(
                     "▸ ",
                     Style::default()
-                        .fg(ACCENT)
+                        .fg(theme.accent)
                         .add_modifier(Modifier::BOLD)
-                        .bg(MENU_SEL_BG),
+                        .bg(theme.menu_sel_bg),
                 ),
                 Style::default()
-                    .fg(ACCENT)
+                    .fg(theme.accent)
                     .add_modifier(Modifier::BOLD)
-                    .bg(MENU_SEL_BG),
+                    .bg(theme.menu_sel_bg),
             ),
             false => (
-                Span::styled("  ", Style::default().bg(history::PANE_BG)),
-                Style::default().fg(Color::DarkGray).bg(history::PANE_BG),
+                Span::styled("  ", Style::default().bg(theme.pane_bg)),
+                Style::default().fg(Color::DarkGray).bg(theme.pane_bg),
             ),
         };
         lines.push(Line::from(vec![
@@ -1308,8 +1399,8 @@ fn render_menu(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
             Span::styled(
                 format!("  {}", cmd.desc),
                 Style::default().fg(Color::DarkGray).bg(match selected {
-                    true => MENU_SEL_BG,
-                    false => history::PANE_BG,
+                    true => theme.menu_sel_bg,
+                    false => theme.pane_bg,
                 }),
             ),
         ]));
@@ -1320,7 +1411,7 @@ fn render_menu(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
     if has_overflow {
         lines.push(Line::from(vec![Span::styled(
             format!("  +{} more", cmds.len() - command_rows),
-            Style::default().fg(Color::DarkGray).bg(history::PANE_BG),
+            Style::default().fg(Color::DarkGray).bg(theme.pane_bg),
         )]));
     }
     f.render_widget(Paragraph::new(lines), area);
@@ -1332,7 +1423,7 @@ fn render_menu(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
 /// faint when empty, and a busy hint replaces it while a turn runs.
 fn render_input(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
     f.render_widget(
-        Block::default().style(Style::default().bg(history::PANE_BG)),
+        Block::default().style(Style::default().bg(app.theme.pane_bg)),
         area,
     );
     if area.height == 0 || area.width < 8 {
@@ -1348,7 +1439,9 @@ fn render_input(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) 
         Span::raw(" "),
         Span::styled(
             "❯ ",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(app.theme.accent)
+                .add_modifier(Modifier::BOLD),
         ),
     ];
     if app.input.is_empty() {
@@ -1359,7 +1452,7 @@ fn render_input(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) 
         spans.push(Span::styled(
             hint,
             Style::default()
-                .fg(history::PLACEHOLDER)
+                .fg(app.theme.placeholder)
                 .add_modifier(Modifier::ITALIC),
         ));
     } else {
@@ -1377,7 +1470,7 @@ fn render_footer(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect)
     let faint = Style::default().fg(Color::DarkGray);
     let spans = vec![
         Span::raw("  "),
-        Span::styled("▶ manual", Style::default().fg(ACCENT)),
+        Span::styled("▶ manual", Style::default().fg(app.theme.accent)),
         Span::styled(format!("  ·  {}", app.model), faint),
         Span::styled(format!("  ·  {}", app.effort), faint),
     ];
@@ -1510,7 +1603,7 @@ mod tests {
         assert_eq!(cell_text(&buf, 1, 80).trim(), "");
         // Input band rows: shaded.
         for y in 2..5 {
-            assert_eq!(buf[(0, y)].bg, history::PANE_BG, "band row {y}");
+            assert_eq!(buf[(0, y)].bg, app.theme.pane_bg, "band row {y}");
         }
         // Prompt + placeholder on the band's middle row.
         let mid = cell_text(&buf, 3, 80);
@@ -1560,7 +1653,7 @@ mod tests {
         assert!(text.contains("[y] approve"), "got: {text}");
         assert!(text.contains("[n] deny"), "got: {text}");
         // Sheet rows carry the shaded background.
-        assert_eq!(buf[(0, 0)].bg, history::PANE_BG);
+        assert_eq!(buf[(0, 0)].bg, app.theme.pane_bg);
     }
 
     #[test]
@@ -2102,7 +2195,12 @@ mod tests {
         app.input = "/".to_string();
         app.cursor = 1;
         assert!(is_menu_open(&app));
-        assert_eq!(menu_height(&app), COMMANDS.len() as u16);
+        // 4 registry commands, 3-row idle capacity: the menu caps at
+        // capacity and spills into a `+N more` overflow row.
+        assert_eq!(
+            menu_height(&app),
+            (COMMANDS.len() as u16).min(menu_row_capacity(&app))
+        );
         assert_eq!(MENU_MAX_ROWS, 10);
         app.input = "/bogus".to_string();
         app.cursor = 6;
@@ -2139,7 +2237,7 @@ mod tests {
         app.cursor = 1;
         app.menu_sel = Some(0);
         app.history = vec!["old turn".to_string()];
-        for expect in [1, 2, 0] {
+        for expect in [1, 2, 3, 0] {
             assert!(!handle_key(
                 &mut app,
                 &agent,
@@ -2158,7 +2256,7 @@ mod tests {
             KeyCode::Up,
             KeyModifiers::empty()
         ));
-        assert_eq!(app.menu_sel, Some(2));
+        assert_eq!(app.menu_sel, Some(3));
         assert_eq!(app.hist_idx, None);
         assert_eq!(app.input, "/");
         assert_eq!(app.history, vec!["old turn".to_string()]);
@@ -2352,7 +2450,7 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        for name in ["/quit", "/clear", "/help"] {
+        for name in ["/quit", "/clear", "/help", "/theme"] {
             assert!(flat.contains(name), "help missing {name}: {flat}");
         }
         assert!(flat.contains("quit the app"), "help missing desc: {flat}");
@@ -2402,7 +2500,9 @@ mod tests {
         app.menu_sel = Some(0);
         terminal.draw(|f| render_pane(f, &mut app)).unwrap();
         let text = terminal.backend().to_string();
-        for name in ["/quit", "/clear", "/help"] {
+        // Idle capacity fits 3 rows; 4 registry commands spill into
+        // 2 visible rows + a `+2 more` overflow row.
+        for name in ["/quit", "/clear"] {
             assert!(text.contains(name), "menu row missing {name}: {text}");
         }
         assert!(
@@ -2410,7 +2510,7 @@ mod tests {
             "menu desc missing: {text}"
         );
         assert!(text.contains('▸'), "selection marker missing: {text}");
-        assert!(!text.contains("more"), "unexpected overflow row: {text}");
+        assert!(text.contains("+2 more"), "overflow row missing: {text}");
         let menu_row = text.lines().position(|l| l.contains("/quit")).unwrap();
         let input_row = text.lines().position(|l| l.contains("❯ /")).unwrap();
         assert!(menu_row < input_row, "menu must render above the composer");
@@ -2446,7 +2546,7 @@ mod tests {
         let text = terminal.backend().to_string();
         assert!(text.contains("working"), "busy status missing: {text}");
         assert!(text.contains("/help"), "selected command missing: {text}");
-        assert!(text.contains("+2 more"), "overflow hint missing: {text}");
+        assert!(text.contains("+3 more"), "overflow hint missing: {text}");
         assert!(
             text.lines().any(|line| line.contains("❯ /")),
             "typed input missing: {text}"
@@ -2456,6 +2556,129 @@ mod tests {
             Position::new(4, 3),
             "caret should stay on the composer's normal row"
         );
+    }
+
+    #[test]
+    fn slash_theme_lists_current_when_no_arg() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        handle_theme_command(&mut app, "");
+        let flat: String = app
+            .print_queue
+            .iter()
+            .flatten()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        // No themes installed in CI env: names the current theme.
+        // (With themes installed it lists them instead — either way it
+        // must mention the current theme name.)
+        assert!(
+            flat.contains(&app.theme.name),
+            "theme list must name current: {flat}"
+        );
+    }
+
+    #[test]
+    fn slash_theme_unknown_name_queues_error_notice() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        let before = app.theme.name.clone();
+        handle_theme_command(&mut app, "definitely-not-a-theme-xyz");
+        assert_eq!(app.theme.name, before, "failed switch must keep theme");
+        let flat: String = app
+            .print_queue
+            .iter()
+            .flatten()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(flat.contains("unknown theme"), "got: {flat}");
+        assert!(!app.busy, "theme command must not start a turn");
+    }
+
+    #[test]
+    fn slash_theme_dispatches_with_arg_through_submit() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        app.input = "/theme nope-xyz".to_string();
+        app.cursor = app.input.chars().count();
+        let agent = std::sync::Arc::new(StubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        // Menu is closed (whitespace in input) so Enter dispatches the
+        // full `/theme <arg>` line via parse_command.
+        assert!(!is_menu_open(&app));
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Enter,
+            KeyModifiers::empty()
+        ));
+        assert_eq!(
+            app.history.last().map(String::as_str),
+            Some("/theme nope-xyz")
+        );
+        let flat: String = app
+            .print_queue
+            .iter()
+            .flatten()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(flat.contains("unknown theme"), "got: {flat}");
+        assert!(!app.busy, "/theme must not start a turn");
+    }
+
+    #[test]
+    fn slash_help_lists_theme_command() {
+        // Covered by slash_submit_help_lists_every_registry_command,
+        // but pin the theme usage line explicitly.
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        app.input = "/help".to_string();
+        app.cursor = 5;
+        let agent = std::sync::Arc::new(StubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Enter,
+            KeyModifiers::empty()
+        ));
+        let flat: String = app
+            .print_queue
+            .iter()
+            .flatten()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(flat.contains("/theme <arg>"), "got: {flat}");
     }
 
     struct StubAgent;

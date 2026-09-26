@@ -3,6 +3,7 @@ mod config;
 mod context;
 mod history;
 mod markdown;
+mod theme;
 mod permissions;
 mod tools;
 mod tui;

@@ -6,16 +6,17 @@ use ratatui::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::history::wrap_line;
+use crate::theme::Theme;
 
-const CODE_BG: Color = Color::Rgb(0x19, 0x19, 0x19);
 const TABLE_SEPARATOR: &str = " │ ";
 
-pub(crate) fn render(text: &str, width: usize) -> Vec<Line<'static>> {
-    Renderer::new(width).render(text)
+pub(crate) fn render(text: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+    Renderer::new(width, theme).render(text)
 }
 
-struct Renderer {
+struct Renderer<'a> {
     width: usize,
+    theme: &'a Theme,
     lines: Vec<Line<'static>>,
     current: Vec<Span<'static>>,
     style: Style,
@@ -43,10 +44,11 @@ struct Table {
     header_rows: usize,
 }
 
-impl Renderer {
-    fn new(width: usize) -> Self {
+impl<'a> Renderer<'a> {
+    fn new(width: usize, theme: &'a Theme) -> Self {
         Self {
             width: width.max(1),
+            theme,
             lines: Vec::new(),
             current: Vec::new(),
             style: Style::default(),
@@ -88,7 +90,7 @@ impl Renderer {
             Event::Start(Tag::Paragraph) => {}
             Event::End(TagEnd::Paragraph) => self.flush_block(),
             Event::Start(Tag::Heading { level, .. }) => {
-                self.heading = Some(heading_style(level));
+                self.heading = Some(self.heading_style(level));
                 self.style = self.heading.unwrap();
             }
             Event::End(TagEnd::Heading(_)) => {
@@ -139,14 +141,14 @@ impl Renderer {
             Event::Start(Tag::Link { dest_url, .. }) => {
                 self.link_destinations.push(dest_url.to_string());
                 self.push_style(Modifier::UNDERLINED);
-                self.style = self.style.fg(Color::Cyan);
+                self.style = self.style.fg(self.theme.link_fg);
             }
             Event::End(TagEnd::Link) => {
                 self.pop_style();
                 if let Some(url) = self.link_destinations.pop()
                     && !url.is_empty()
                 {
-                    self.push_span(format!(" ({url})"), Style::default().fg(Color::DarkGray));
+                    self.push_span(format!(" ({url})"), Style::default().fg(self.theme.link_url_fg));
                 }
             }
             Event::Start(Tag::Image { dest_url, .. }) => {
@@ -156,7 +158,7 @@ impl Renderer {
                 if let Some(url) = self.link_destinations.pop()
                     && !url.is_empty()
                 {
-                    self.push_span(format!(" ({url})"), Style::default().fg(Color::DarkGray));
+                    self.push_span(format!(" ({url})"), Style::default().fg(self.theme.link_url_fg));
                 }
             }
             Event::Start(Tag::Table(alignments)) => {
@@ -182,7 +184,7 @@ impl Renderer {
             }
             Event::Code(text) => self.push_span(
                 text.to_string(),
-                Style::default().fg(Color::Yellow).bg(CODE_BG),
+                Style::default().fg(self.theme.code_fg).bg(self.theme.code_bg),
             ),
             Event::SoftBreak => self.push_span(" ".to_string(), self.style),
             Event::HardBreak => self.flush_line(),
@@ -292,13 +294,13 @@ impl Renderer {
         let code = self.code_block.take().unwrap_or_default();
         for raw in code.trim_end_matches('\n').split('\n') {
             let mut line = Line::from(vec![
-                Span::styled("  ", Style::default().bg(CODE_BG)),
-                Span::styled(raw.to_string(), Style::default().fg(Color::Gray).bg(CODE_BG)),
+                Span::styled("  ", Style::default().bg(self.theme.code_bg)),
+                Span::styled(raw.to_string(), Style::default().fg(self.theme.code_fg).bg(self.theme.code_bg)),
             ]);
-            line.style = Style::default().bg(CODE_BG);
+            line.style = Style::default().bg(self.theme.code_bg);
             for wrapped in wrap_line(line, self.width) {
                 let mut rendered = wrapped;
-                rendered.style = Style::default().bg(CODE_BG);
+                rendered.style = Style::default().bg(self.theme.code_bg);
                 self.lines.push(rendered);
             }
         }
@@ -360,6 +362,16 @@ impl Renderer {
         }
         self.lines.push(Line::from(spans));
     }
+
+    fn heading_style(&self, level: HeadingLevel) -> Style {
+        let modifier = Modifier::BOLD;
+        let color = match level {
+            HeadingLevel::H1 => self.theme.heading_h1,
+            HeadingLevel::H2 => self.theme.heading_h2,
+            _ => self.theme.heading_h3,
+        };
+        Style::default().fg(color).add_modifier(modifier)
+    }
 }
 
 impl Table {
@@ -371,18 +383,6 @@ impl Table {
     }
 }
 
-fn heading_style(level: HeadingLevel) -> Style {
-    let modifier = match level {
-        HeadingLevel::H1 | HeadingLevel::H2 => Modifier::BOLD,
-        _ => Modifier::BOLD,
-    };
-    let color = match level {
-        HeadingLevel::H1 => Color::Cyan,
-        HeadingLevel::H2 => Color::Blue,
-        _ => Color::Reset,
-    };
-    Style::default().fg(color).add_modifier(modifier)
-}
 
 fn fit_columns(widths: &mut [usize], total_width: usize) {
     if widths.is_empty() {
@@ -465,9 +465,11 @@ mod tests {
 
     #[test]
     fn renders_blocks_lists_inline_styles_and_links() {
+        let theme = Theme::default();
         let lines = render(
             "# Heading\n\nA **bold** and *italic* `code` [link](https://example.com).\n\n- one\n- two\n\n> quoted",
             60,
+            &theme,
         );
         let text = flatten(&lines).join("\n");
         assert!(text.contains("Heading"));
@@ -485,16 +487,19 @@ mod tests {
 
     #[test]
     fn renders_fenced_code_with_indentation_and_background() {
-        let lines = render("```rust\nfn main() {}\n```", 40);
+        let theme = Theme::default();
+        let lines = render("```rust\nfn main() {}\n```", 40, &theme);
         assert_eq!(flatten(&lines)[0], "  fn main() {}");
-        assert_eq!(lines[0].style.bg, Some(CODE_BG));
+        assert_eq!(lines[0].style.bg, Some(theme.code_bg));
     }
 
     #[test]
     fn wraps_table_cells_to_terminal_width() {
+        let theme = Theme::default();
         let lines = render(
             "| Name | Description |\n| --- | --- |\n| rem | a longer description that must wrap |\n",
             20,
+            &theme,
         );
         assert!(flatten(&lines).iter().any(|line| line.contains("Description")));
         assert!(lines.iter().all(|line| {
