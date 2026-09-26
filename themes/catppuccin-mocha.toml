@@ -1,0 +1,30 @@
+# Catppuccin Mocha — upstream: github.com/catppuccin/palette (mocha)
+# base #1e1e2e · mantle #181825 · text #cdd6f4
+name = "catppuccin-mocha"
+
+[colors]
+accent = "#cba6f7"
+pane_bg = "#1e1e2e"
+rail_bg = "#181825"
+placeholder = "#6c7086"
+menu_sel_bg = "#313244"
+
+[colors.add]
+bg = "#1e2b25"
+fg = "#a6e3a1"
+mark = "#40a02b"
+
+[colors.del]
+bg = "#2e1e28"
+fg = "#f38ba8"
+mark = "#d20f39"
+
+[colors.markdown]
+code_bg = "#181825"
+heading_h1 = "#cba6f7"
+heading_h2 = "#89b4fa"
+heading_h3 = "#f5c2e7"
+link_fg = "#89dceb"
+link_url_fg = "#7f849c"
+code_fg = "#cdd6f4"
+blockquote_fg = "#9399b2"

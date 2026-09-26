@@ -1,0 +1,31 @@
+# Nord — upstream: github.com/nordtheme/vim (master, nord0–15)
+# Polar Night #2E3440–#4C566A · Snow Storm #D8DEE9–#ECEFF4
+# Frost #8FBCBB/#88C0D0/#81A1C1/#5E81AC · Aurora #BF616A/#D08770/#EBCB8B/#A3BE8C/#B48EAD
+name = "nord"
+
+[colors]
+accent = "#88C0D0"
+pane_bg = "#2E3440"
+rail_bg = "#3B4252"
+placeholder = "#4C566A"
+menu_sel_bg = "#434C5E"
+
+[colors.add]
+bg = "#2E3B35"
+fg = "#A3BE8C"
+mark = "#7a8c66"
+
+[colors.del]
+bg = "#3B2D33"
+fg = "#BF616A"
+mark = "#8f4a51"
+
+[colors.markdown]
+code_bg = "#3B4252"
+heading_h1 = "#88C0D0"
+heading_h2 = "#81A1C1"
+heading_h3 = "#B48EAD"
+link_fg = "#8FBCBB"
+link_url_fg = "#4C566A"
+code_fg = "#D8DEE9"
+blockquote_fg = "#616E88"
