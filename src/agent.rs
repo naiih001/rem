@@ -16,6 +16,7 @@ use rig::{
 use crate::{
     config::Config,
     context::Context,
+    modes::Mode,
     permissions::{ApprovalTx, PermissionHook},
     tools::{
         BashTool, EditTool, GitDiffTool, GitStatusTool, GlobTool, GrepTool, ListDirectoryTool,
@@ -51,6 +52,7 @@ pub trait AgentLoop {
     fn effort_name(&self) -> String {
         "medium".to_string()
     }
+    fn mode_handle(&self) -> Arc<Mutex<Mode>> { Arc::new(Mutex::new(Mode::default())) }
     async fn export_messages_json(&self) -> Result<String, String> { Err("not supported".to_string()) }
     async fn import_messages_json(&self, _json: &str) -> Result<(), String> { Err("not supported".to_string()) }
     fn export_sync(&self) -> Result<String, String> { Err("not supported".to_string()) }
@@ -207,6 +209,7 @@ pub struct RigAgent {
     recorder: ToolRecorder,
     model_name: String,
     effort: String,
+    mode: Arc<Mutex<Mode>>,
 }
 
 /// Project instructions file name, loaded from the project root only.
@@ -236,8 +239,9 @@ impl RigAgent {
         let model = client.completion_model(cfg.model.default.clone());
 
         let recorder = ToolRecorder::default();
+        let mode = Arc::new(Mutex::new(Mode::default()));
         // Observer first (see everything), gate second (steers). ADR-0001.
-        let gate = PermissionHook::new(approval_tx, project_root.clone());
+        let gate = PermissionHook::new(approval_tx, project_root.clone(), mode.clone());
 
         let mut preamble = String::from(
             "You are rem, a coding agent in a terminal TUI. \
@@ -278,6 +282,7 @@ impl RigAgent {
             recorder,
             model_name: cfg.model.default.clone(),
             effort: cfg.model.effort.clone(),
+            mode,
         })
     }
 
@@ -373,6 +378,7 @@ impl AgentLoop for RigAgent {
     fn effort_name(&self) -> String {
         self.effort.clone()
     }
+    fn mode_handle(&self) -> Arc<Mutex<Mode>> { self.mode.clone() }
     async fn export_messages_json(&self) -> Result<String, String> { self.context.lock().await.to_json() }
     async fn import_messages_json(&self, json: &str) -> Result<(), String> { let ctx = Context::from_json(json)?; *self.context.lock().await = ctx; Ok(()) }
     // Sync variants for the sync TUI submit path via try_lock (safe on runtime thread).

@@ -73,3 +73,6 @@
 
 - **AGENTS.md**: Verbatim project instructions loaded once at startup from `<project_root>/AGENTS.md` only (no walk-up, no global file, no cap). Appended after the static preamble under a `Project context from AGENTS.md:` header; silently skipped when missing. Outranks history, survives compaction, takes effect on next restart.
 - **/init**: Slash command that rewrites to a fixed instruction and runs a normal agent turn — the model inspects the repo and overwrites project-root `AGENTS.md`. Transcript shows `/init`; standard write/approval flow applies.
+- **Permission mode**: A session-local policy preset controlling which tool calls run automatically, ask for approval, or are denied. Modes are `plan`, `manual`, `auto`, `edit`, and `yolo`.
+- **Plan mode**: Read-only permission mode. Prohibited calls receive model-visible denial feedback so the agent can replan.
+- **Yolo mode**: Approval-free mode that still preserves unconditional denials for annihilators and secret exfiltration.
