@@ -266,6 +266,10 @@ const BUSY_VERB_SECS: u64 = 2;
 /// Slash-menu popup budget (Aster `menu_lines` 10-cap): max command rows;
 /// one extra `+N more` row appears on overflow.
 const MENU_MAX_ROWS: usize = 10;
+/// Preferred visible command rows when the menu is open. The pane grows to
+/// this size when the terminal has room, while `menu_row_capacity` still
+/// keeps the popup bounded on short terminals.
+const MENU_PREFERRED_ROWS: usize = 7;
 /// Scrollback transcript (ADR-0005): finished rows print into the
 /// terminal's own scrollback via `insert_before` and are never touched
 /// again. `App` holds only a queue of pending `Line` groups; the event
@@ -1555,7 +1559,17 @@ impl App {
     }
 
     fn pane_height(&self, term_width: u16) -> u16 {
-        PANE_ROWS.saturating_add(self.visible_input_lines(term_width).saturating_sub(1) as u16)
+        let input_extra = self.visible_input_lines(term_width).saturating_sub(1) as u16;
+        let menu_extra = if is_menu_open(self) {
+            menu_row_count(&self.input)
+                .min(MENU_PREFERRED_ROWS)
+                .min(MENU_MAX_ROWS) as u16
+        } else {
+            0
+        };
+        PANE_ROWS
+            .saturating_add(input_extra)
+            .saturating_add(menu_extra)
     }
 
     fn input_band_height(&self, term_width: u16, menu_open: bool) -> u16 {
