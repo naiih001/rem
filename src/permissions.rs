@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use rig::agent::{AgentHook, HookContext, ToolCall, ToolCallAction};
+use crate::modes::Mode;
 
 /// Pure policy verdict for one tool call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,20 +76,28 @@ pub const FAST_PATH_MAX_BYTES: usize = 32 * 1024;
 
 /// Classify one tool call. Pure: no I/O, no channel access.
 pub fn classify(tool_name: &str, args: &serde_json::Value, project_root: &Path) -> Verdict {
+    classify_mode(tool_name, args, project_root, Mode::Manual)
+}
+
+pub fn classify_mode(tool_name: &str, args: &serde_json::Value, project_root: &Path, mode: Mode) -> Verdict {
+    if mode == Mode::Plan && !matches!(tool_name, "read" | "list_directory" | "glob" | "grep" | "git_status" | "git_diff") {
+        return Verdict::Deny { reason: format!("mode `plan` is read-only; `{tool_name}` is not permitted") };
+    }
+    if mode == Mode::Yolo && tool_name != "bash" { return Verdict::Allow; }
     match tool_name {
         // Read-only tools: automatic.
         "read" | "list_directory" | "glob" | "grep" | "git_status" | "git_diff" => Verdict::Allow,
         // Mutations: approval, with a narrow auto fast-path.
-        "write" | "edit" => classify_mutate(tool_name, args, project_root),
+        "write" | "edit" => match mode { Mode::Manual => Verdict::Confirm { reason: "manual mode requires approval".into() }, Mode::Auto | Mode::Edit | Mode::Yolo => classify_mutate(tool_name, args, project_root), Mode::Plan => unreachable!() },
         // Shell: the whole threat model lives here.
         "bash" => classify_bash(args),
         // Network tools: approval per user spec.
-        "web_fetch" => Verdict::Confirm {
+        "web_fetch" => if mode == Mode::Yolo { Verdict::Allow } else { Verdict::Confirm {
             reason: "network fetch needs approval".to_string(),
-        },
-        "web_search" => Verdict::Confirm {
+        } },
+        "web_search" => if mode == Mode::Yolo { Verdict::Allow } else { Verdict::Confirm {
             reason: "network search needs approval".to_string(),
-        },
+        } },
         // Unknown future tools: fail closed to approval, never auto.
         _ => Verdict::Confirm {
             reason: format!("unknown tool `{tool_name}` needs approval"),
@@ -545,14 +554,16 @@ pub struct PermissionHook {
     tx: ApprovalTx,
     project_root: PathBuf,
     session_allows: Arc<Mutex<HashSet<String>>>,
+    mode: Arc<Mutex<Mode>>,
 }
 
 impl PermissionHook {
-    pub fn new(tx: ApprovalTx, project_root: PathBuf) -> Self {
+    pub fn new(tx: ApprovalTx, project_root: PathBuf, mode: Arc<Mutex<Mode>>) -> Self {
         Self {
             tx,
             project_root,
             session_allows: Arc::new(Mutex::new(HashSet::new())),
+            mode,
         }
     }
 
@@ -603,7 +614,8 @@ impl AgentHook for PermissionHook {
         {
             return ToolCallAction::Run;
         }
-        match classify(event.tool_name, &parsed, &self.project_root) {
+        let mode = self.mode.lock().map(|m| *m).unwrap_or_default();
+        match classify_mode(event.tool_name, &parsed, &self.project_root, mode) {
             Verdict::Allow => ToolCallAction::Run,
             Verdict::Deny { reason } => ToolCallAction::skip(format!("denied: {reason}")),
             Verdict::Confirm { reason } => {
@@ -899,7 +911,7 @@ mod tests {
         use rig::agent::ToolCallAction;
         let (tx, rx) = approval_channel();
         drop(rx); // TUI gone.
-        let hook = PermissionHook::new(tx, root());
+        let hook = PermissionHook::new(tx, root(), Arc::new(Mutex::new(Mode::Manual)));
         let parsed = serde_json::json!({"command": "cargo test"});
         let key = rule_key("bash", &parsed);
         let action = hook
@@ -912,7 +924,7 @@ mod tests {
     async fn hook_resumes_on_approve_in_same_run() {
         use rig::agent::ToolCallAction;
         let (tx, mut rx) = approval_channel();
-        let hook = PermissionHook::new(tx, root());
+        let hook = PermissionHook::new(tx, root(), Arc::new(Mutex::new(Mode::Manual)));
         let parsed = serde_json::json!({"command": "cargo test"});
         let key = rule_key("bash", &parsed);
         let handle = tokio::spawn({

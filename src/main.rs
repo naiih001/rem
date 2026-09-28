@@ -3,6 +3,7 @@ mod config;
 mod context;
 mod history;
 mod markdown;
+mod modes;
 mod theme;
 mod permissions;
 mod sessions;

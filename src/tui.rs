@@ -26,6 +26,7 @@ use crate::agent::{AgentLoop, ToolEvent};
 use rig::message::{AssistantContent, Message, UserContent};
 use crate::history;
 use crate::permissions::{ApprovalDecision, ApprovalRequest, ApprovalRx};
+use crate::modes::Mode;
 use crate::theme::Theme;
 
 /// Swappable UI abstraction. `RatatuiBackend` is the Ratatui implementation;
@@ -473,6 +474,7 @@ struct SessionPicker {
 struct App {
     model: String,
     effort: String,
+    mode: Mode,
     /// Active color theme. Swapped live by `/theme`; every render and
     /// history-row builder reads from here (no `const` colors remain).
     theme: Theme,
@@ -592,6 +594,7 @@ impl App {
         let mut app = Self {
             model,
             effort,
+            mode: Mode::default(),
             theme,
             print_queue: Vec::new(),
             input: String::new(),
@@ -1130,6 +1133,14 @@ fn handle_key(
         KeyCode::Enter => return submit(app, agent, tx, think_tx),
         // Tab is unbound in the scrollback model (ADR-0005): no block
         // selection exists. Kept as a no-op so the key stays free.
+        KeyCode::BackTab | KeyCode::Tab if mods.contains(KeyModifiers::SHIFT) => {
+            let next = app.mode.next();
+            app.mode = next;
+            if let Ok(mut mode) = agent.mode_handle().lock() {
+                *mode = next;
+            }
+            app.enqueue_notice(format!("permission mode: {}", next.name()));
+        }
         KeyCode::Tab | KeyCode::BackTab => {}
         KeyCode::Backspace => {
             if app.cursor > 0 {
@@ -2205,7 +2216,10 @@ fn render_footer(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect)
     let faint = Style::default().fg(Color::DarkGray);
     let spans = vec![
         Span::raw("  "),
-        Span::styled("▶ manual", Style::default().fg(app.theme.accent)),
+        Span::styled(
+            format!("▶ {}", app.mode.name()),
+            Style::default().fg(app.theme.mode_color(app.mode)),
+        ),
         Span::styled(format!("  ·  {}", app.model), faint),
         Span::styled(format!("  ·  {}", app.effort), faint),
     ];
