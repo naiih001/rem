@@ -2218,7 +2218,7 @@ fn render_footer(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect)
         Span::raw("  "),
         Span::styled(
             format!("▶ {}", app.mode.name()),
-            Style::default().fg(app.theme.mode_color(app.mode)),
+            Style::default().fg(app.theme.accent),
         ),
         Span::styled(format!("  ·  {}", app.model), faint),
         Span::styled(format!("  ·  {}", app.effort), faint),
