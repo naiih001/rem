@@ -217,6 +217,13 @@ fn pane_viewport_area(width: u16, height: u16, pane_height: u16) -> Rect {
     Rect::new(0, height.saturating_sub(pane_height), width, pane_height)
 }
 
+/// The viewport stays compact at all times. Growing it to full height on
+/// modal open would run `resize_pane_viewport`'s erase and destroy the
+/// visible transcript (modals draw bottom-anchored over the pane instead).
+fn viewport_height(app: &App, width: u16, _height: u16) -> u16 {
+    app.pane_height(width)
+}
+
 fn resize_pane_viewport<B: Backend>(
     terminal: &mut Terminal<B>,
     backend: impl FnOnce() -> B,
@@ -274,10 +281,13 @@ const MENU_MAX_ROWS: usize = 10;
 ///
 /// Slash-command registry (ADR-0007): single source of truth for menu
 /// rows and `/help` output. `takes_arg` is reserved for future use.
+#[derive(Debug)]
 struct Command {
     name: &'static str,
     takes_arg: bool,
     desc: &'static str,
+    /// Gray hint shown after space. E.g. `[name]`.
+    hint: &'static str,
 }
 
 static COMMANDS: &[Command] = &[
@@ -285,41 +295,49 @@ static COMMANDS: &[Command] = &[
         name: "quit",
         takes_arg: false,
         desc: "quit the app",
+        hint: "",
     },
     Command {
         name: "clear",
         takes_arg: false,
         desc: "clear transcript",
+        hint: "",
     },
     Command {
         name: "help",
         takes_arg: false,
         desc: "list commands",
+        hint: "",
     },
     Command {
         name: "theme",
         takes_arg: true,
         desc: "list or switch color themes",
+        hint: "[name]",
     },
     Command {
         name: "init",
         takes_arg: false,
         desc: "generate AGENTS.md for this project",
+        hint: "",
     },
     Command {
         name: "resume",
         takes_arg: true,
         desc: "resume a saved session",
+        hint: "[id]",
     },
     Command {
         name: "rename",
         takes_arg: true,
         desc: "rename current session",
+        hint: "[name]",
     },
     Command {
         name: "fork",
         takes_arg: false,
         desc: "fork session from here",
+        hint: "",
     },
 ];
 
@@ -345,9 +363,39 @@ fn parse_command(text: &str) -> Option<(&'static Command, String)> {
     Some((cmd, arg))
 }
 
-/// Slash-menu prefix filter: the menu lives only while the input is a bare
-/// `/token` — must start with `/` and contain no whitespace. Empty prefix
-/// (`/`) matches all. Case-sensitive.
+/// Slash-menu token at caret. Case 1 only: `/` after space or at start.
+/// `fix bug /res` + caret at end -> token `res`, span covers `/res`.
+/// Letter before `/` (like `a/b`) -> no menu. No false hits on paths.
+/// Returns (token, byte_start, byte_end). Empty token = bare `/`.
+fn menu_token_at(input: &str, cursor: usize) -> Option<(String, usize, usize)> {
+    let chars: Vec<char> = input.chars().collect();
+    let cursor = cursor.min(chars.len());
+    if cursor == 0 {
+        return None;
+    }
+    // Walk back from caret: word chars only, stop at space or `/`.
+    let mut start = cursor;
+    while start > 0 && !chars[start - 1].is_whitespace() && chars[start - 1] != '/' {
+        start -= 1;
+    }
+    // Need `/` right before token start.
+    if start == 0 || chars[start - 1] != '/' {
+        return None;
+    }
+    let slash_at = start - 1;
+    // `/` must be at text start or after space. Case 1 rule.
+    if slash_at > 0 && !chars[slash_at - 1].is_whitespace() && chars[slash_at - 1] != '\n' {
+        return None;
+    }
+    let token: String = chars[start..cursor].iter().collect();
+    // No space inside token (caret is at token end by walk-back).
+    let b_start = byte_idx(input, slash_at);
+    let b_end = byte_idx(input, cursor);
+    Some((token, b_start, b_end))
+}
+
+/// Slash-menu prefix filter. Old start-only path (submit + tests).
+/// New live path uses `menu_token_at` (mid-input, case 1).
 fn menu_matches(input: &str) -> Vec<&'static Command> {
     let Some(token) = input.strip_prefix('/') else {
         return Vec::new();
@@ -355,10 +403,103 @@ fn menu_matches(input: &str) -> Vec<&'static Command> {
     if token.chars().any(|c| c.is_whitespace()) {
         return Vec::new();
     }
+    menu_matches_token(&token)
+}
+
+/// Filter registry by token text. Shared by old + new paths.
+fn menu_matches_token(token: &str) -> Vec<&'static Command> {
     COMMANDS
         .iter()
         .filter(|c| c.name.starts_with(token))
         .collect()
+}
+
+/// Live menu rows at caret. Mid-input case 1. Theme-arg mode same as old
+/// (`/theme <partial>` where partial has no space).
+fn menu_live(input: &str, cursor: usize) -> MenuLive {
+    let before: String = input.chars().take(cursor).collect();
+    // Theme-arg case: `/theme <partial>` or bare `/theme `.
+    // This must be checked before token walk-back because the cursor may
+    // be after a space (not inside a slash-token).
+    if let Some(partial) = theme_arg_partial_at(&before) {
+        // b_start = byte after `/theme ` (start of partial).
+        // b_end = byte at cursor (end of partial).
+        let prefix_end = before
+            .rfind("/theme")
+            .map(|i| i + "/theme".len())
+            .unwrap_or(before.len());
+        // Skip whitespace after `/theme` to reach the partial start.
+        let b_start = before[prefix_end..]
+            .bytes()
+            .position(|b| !b.is_ascii_whitespace())
+            .map(|i| prefix_end + i)
+            .unwrap_or(before.len());
+        let b_end = before.len();
+        let names = match Theme::list_themes() {
+            Ok(all) => match_theme_names(&all, &partial),
+            Err(_) => Vec::new(),
+        };
+        if names.is_empty() {
+            return MenuLive::Closed;
+        }
+        return MenuLive::Themes {
+            names,
+            b_start,
+            b_end,
+        };
+    }
+    // Command token case: `/token` or `/tok` mid-input.
+    let Some((token, b_start, b_end)) = menu_token_at(input, cursor) else {
+        return MenuLive::Closed;
+    };
+    let cmds = menu_matches_token(&token);
+    if cmds.is_empty() {
+        return MenuLive::Closed;
+    }
+    MenuLive::Commands {
+        cmds,
+        b_start,
+        b_end,
+    }
+}
+
+/// Live menu state at caret.
+#[derive(Debug)]
+enum MenuLive {
+    Closed,
+    Commands {
+        cmds: Vec<&'static Command>,
+        b_start: usize,
+        b_end: usize,
+    },
+    Themes {
+        names: Vec<String>,
+        b_start: usize,
+        b_end: usize,
+    },
+}
+
+/// `/theme <partial>` check on text before caret. Same rules as
+/// `theme_arg_partial` but works mid-input (case 1 slash).
+fn theme_arg_partial_at(before: &str) -> Option<String> {
+    // Find last `/theme ` run before caret.
+    let idx = before.rfind("/theme")?;
+    let rest = &before[idx + "/theme".len()..];
+    if rest.is_empty() || !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    // `/` of `/theme` must be at start or after space.
+    if idx > 0 {
+        let prev = before[..idx].chars().last()?;
+        if !prev.is_whitespace() {
+            return None;
+        }
+    }
+    let partial = rest.trim_start();
+    if partial.chars().any(|c| c.is_whitespace()) {
+        return None;
+    }
+    Some(partial.to_string())
 }
 
 /// Theme-arg partial: the menu suggests installed theme names while the
@@ -416,43 +557,38 @@ fn menu_row_count(input: &str) -> usize {
 }
 
 /// True when the slash menu should show: at least one match.
+/// Old start-only path (submit + old tests). Live path uses `menu_live`.
 fn is_menu_open(app: &App) -> bool {
     menu_row_count(&app.input) > 0
 }
 
-fn menu_status_height(app: &App) -> u16 {
-    if is_menu_open(app) && !app.busy && app.pending_approvals.is_empty() {
-        0
-    } else {
-        1
-    }
+/// True when live float menu shows at caret (mid-input case 1).
+fn is_menu_live(app: &App) -> bool {
+    !matches!(menu_live(&app.input, app.cursor), MenuLive::Closed)
 }
 
-fn menu_row_capacity(app: &App) -> u16 {
-    app.pane_height(app.term_width)
-        .saturating_sub(menu_status_height(app) + app.input_band_height(app.term_width, true) + 1)
+fn menu_status_height(_app: &App) -> u16 {
+    // Float box needs no pane rows. Status row always stays.
+    1
 }
 
 fn menu_height(app: &App) -> u16 {
-    if !is_menu_open(app) {
-        return 0;
-    }
-    (menu_row_count(&app.input).min(MENU_MAX_ROWS) as u16).min(menu_row_capacity(app))
-}
-
-/// The gap absorbs unused menu rows so the composer stays on the same row.
-fn menu_gap_height(app: &App) -> u16 {
-    if is_menu_open(app) {
-        menu_row_capacity(app).saturating_sub(menu_height(app))
-    } else {
-        1
+    // Zero: float box draws over pane, takes no layout rows.
+    match is_menu_open(app) || is_menu_live(app) {
+        true => 0,
+        false => 0,
     }
 }
 
 /// Reconcile `menu_sel` with the current input after an edit: menu open +
 /// `None` → `Some(0)`; `Some(i)` → clamped; menu closed → `None`.
+/// Uses live caret token (mid-input). Old start-only count kept for submit.
 fn clamp_menu_sel(app: &mut App) {
-    let n = menu_row_count(&app.input);
+    let n = match menu_live(&app.input, app.cursor) {
+        MenuLive::Closed => menu_row_count(&app.input),
+        MenuLive::Commands { cmds, .. } => cmds.len(),
+        MenuLive::Themes { names, .. } => names.len(),
+    };
     if n == 0 {
         app.menu_sel = None;
     } else {
@@ -460,9 +596,40 @@ fn clamp_menu_sel(app: &mut App) {
     }
 }
 
+/// Fill top pick into text at caret token span. Mid-input safe.
+/// `fix bug /res` -> `fix bug /resume`. Cursor lands after filled text.
+fn complete_menu_at_caret(app: &mut App) {
+    let live = menu_live(&app.input, app.cursor);
+    match live {
+        MenuLive::Closed => {}
+        MenuLive::Commands { cmds, b_start, b_end } => {
+            if cmds.is_empty() {
+                return;
+            }
+            let idx = app.menu_sel.unwrap_or(0).min(cmds.len() - 1);
+            let fill = format!("/{}", cmds[idx].name);
+            app.input.replace_range(b_start..b_end, &fill);
+            app.cursor = app.input[..b_start + fill.len()].chars().count();
+            clamp_menu_sel(app);
+        }
+        MenuLive::Themes { names, b_start, b_end } => {
+            if names.is_empty() {
+                return;
+            }
+            let idx = app.menu_sel.unwrap_or(0).min(names.len() - 1);
+            // Replace partial after `/theme ` with picked name.
+            // b_start..b_end covers `/partial`; keep `/theme ` head.
+            let fill = names[idx].clone();
+            app.input.replace_range(b_start..b_end, &fill);
+            app.cursor = app.input[..b_start + fill.len()].chars().count();
+            clamp_menu_sel(app);
+        }
+    }
+}
+
 struct SessionPicker {
     items: Vec<crate::sessions::Session>,
-    sel: usize,
+    list: crate::popup::ListState,
     show_all: bool,
 }
 
@@ -499,6 +666,13 @@ struct App {
     /// Pending human approvals (FIFO). Head renders as a blocking modal;
     /// resolving it resumes the parked agent worker in the same run.
     pending_approvals: VecDeque<ApprovalRequest>,
+    approval_sel: usize,
+    /// Tab comment box text. Open on Tab, send on Enter, shut on Esc.
+    /// Shown only on Yes / No rows. Hidden note on Yes (AI only).
+    approval_comment: String,
+    approval_comment_open: bool,
+    /// Ctrl+E risk help on/off.
+    approval_explain: bool,
     /// `/clear` flag: wipe screen + scrollback before the next drain.
     request_clear_screen: bool,
     /// In-flight turn worker + live-feed watcher (Task 1 / ADR-0006).
@@ -518,6 +692,51 @@ struct App {
     skip_drain_once: bool,
 }
 
+/// Send head choice with typed note (Enter in note box).
+fn send_approval_with_comment(app: &mut App, comment: String) {
+    match app.approval_sel.min(2) {
+        0 => resolve_approval(
+            app,
+            ApprovalDecision::Approve { comment },
+        ),
+        1 => resolve_approval(
+            app,
+            ApprovalDecision::ApproveAlways { comment },
+        ),
+        _ => resolve_approval(app, ApprovalDecision::Deny { comment }),
+    }
+}
+
+/// Yes with empty note (1 / Enter fast path).
+fn resolve_approval_yes(app: &mut App) {
+    resolve_approval(
+        app,
+        ApprovalDecision::Approve {
+            comment: String::new(),
+        },
+    );
+}
+
+/// Yes-always (session) with empty note (2 / Enter fast path).
+fn resolve_approval_always(app: &mut App) {
+    resolve_approval(
+        app,
+        ApprovalDecision::ApproveAlways {
+            comment: String::new(),
+        },
+    );
+}
+
+/// No with empty note (3 / q / Esc fast path). Turn goes on.
+fn resolve_approval_no(app: &mut App) {
+    resolve_approval(
+        app,
+        ApprovalDecision::Deny {
+            comment: String::new(),
+        },
+    );
+}
+
 /// Resolve a queued approval: send the decision over the oneshot,
 /// print the approval rows (ADR-0005), then queue an audit notice.
 /// A dropped/closed oneshot means the worker already moved
@@ -528,16 +747,26 @@ fn resolve_approval(app: &mut App, decision: ApprovalDecision) {
     };
     // Print first so the decision rows land above the audit notice.
     app.enqueue_approval_rows(&req, app.pending_approvals.len());
-    let label = match decision {
-        ApprovalDecision::Approve => "approved",
-        ApprovalDecision::ApproveAlways => "approved (always this session)",
-        ApprovalDecision::Deny => "denied",
-        ApprovalDecision::AbortTurn => "aborted turn",
+    let label = match &decision {
+        ApprovalDecision::Approve { .. } => "approved",
+        ApprovalDecision::ApproveAlways { .. } => "approved (always this session)",
+        ApprovalDecision::Deny { .. } => "denied",
     };
     let tool_name = req.tool_name.clone();
     let args_preview = req.args_preview.clone();
+    // Yes-note stays hidden (AI only). No-note shows in audit row.
+    let note_bit = match &decision {
+        ApprovalDecision::Deny { comment } if !comment.trim().is_empty() => {
+            format!(" note: {comment}")
+        }
+        _ => String::new(),
+    };
     let _ = req.reply.send(decision);
-    app.enqueue_notice(format!("permission {label}: {tool_name}({args_preview})"));
+    app.enqueue_notice(format!("permission {label}: {tool_name}({args_preview}){note_bit}"));
+    // Clear box state for next head.
+    app.approval_comment.clear();
+    app.approval_comment_open = false;
+    app.approval_explain = false;
     app.dirty = true;
 }
 
@@ -605,6 +834,10 @@ impl App {
             streamed_tools: 0,
             menu_sel: None,
             pending_approvals: VecDeque::new(),
+            approval_sel: 0,
+            approval_comment: String::new(),
+            approval_comment_open: false,
+            approval_explain: false,
             current_turn: None,
             current_watcher: None,
             turn_generation: 0,
@@ -812,6 +1045,9 @@ fn event_loop(
         // Approval rows print into scrollback the moment the modal owns
         // the keys (ADR-0005); the pane underneath keeps the status row.
         while let Ok(req) = approval_rx.try_recv() {
+            if app.pending_approvals.is_empty() {
+                app.approval_sel = 0;
+            }
             let queued = app.pending_approvals.len() + 1;
             app.enqueue_approval_rows(&req, queued);
             app.pending_approvals.push_back(req);
@@ -873,12 +1109,12 @@ fn event_loop(
                     || CrosstermBackend::new(io::stdout()),
                     size.width,
                     size.height,
-                    app.pane_height(size.width),
+                    viewport_height(app, size.width, size.height),
                 )
                 .context("resize composer viewport")?;
             }
             terminal
-                .draw(|f| render_pane(f, app))
+                .draw(|f| render_frame(f, app))
                 .context("draw frame")?;
             app.dirty = false;
         }
@@ -902,13 +1138,13 @@ fn event_loop(
                         || CrosstermBackend::new(io::stdout()),
                         w,
                         h,
-                        app.pane_height(w),
+                        viewport_height(app, w, h),
                     )
                     .context("resize composer viewport")?;
                     // Freeze transcript insertion for one frame after resize.
                     app.skip_drain_once = true;
                     terminal
-                        .draw(|f| render_pane(f, app))
+                        .draw(|f| render_frame(f, app))
                         .context("draw on resize")?;
                     app.dirty = false;
                 }
@@ -959,61 +1195,111 @@ fn handle_key(
     code: KeyCode,
     mods: KeyModifiers,
 ) -> bool {
-    // Approval modal owns every keystroke while pending: y/a/n/x/Esc
-    // (+Enter as approve). Esc resolves AbortTurn (same as `x`) — never
-    // silently dismisses (ADR-0003 Q7); the parked worker gets a decision.
+    // Approval modal owns every keystroke while pending.
+    // Yes / Yes always (session) / No. 1/2/3 pick. Arrows + h/l move.
+    // Enter sends. Tab opens note box. Ctrl+E shows risk help.
+    // Esc or q = Deny (turn goes on). Never silent: worker gets a choice.
     if !app.pending_approvals.is_empty() {
-        // Ctrl combos are ignored in the modal (no input line to clear) —
-        // except Ctrl+D, which quits via `handle_ctrl` (empty input only;
-        // the `d` arm resolves AbortTurn before quitting).
+        // Ctrl+E = risk help on/off. Ctrl+D = deny head then quit-if-empty.
         if mods.contains(KeyModifiers::CONTROL) {
+            if code == KeyCode::Char('e') {
+                app.approval_explain = !app.approval_explain;
+                return false;
+            }
             if code == KeyCode::Char('d') {
                 return handle_ctrl(app, code);
             }
             return false;
         }
+        // Note box open: type text, Enter sends, Esc shuts box.
+        if app.approval_comment_open {
+            match code {
+                KeyCode::Esc => {
+                    app.approval_comment_open = false;
+                    return false;
+                }
+                KeyCode::Enter => {
+                    let comment = std::mem::take(&mut app.approval_comment);
+                    app.approval_comment_open = false;
+                    send_approval_with_comment(app, comment);
+                    return false;
+                }
+                KeyCode::Backspace => {
+                    app.approval_comment.pop();
+                    return false;
+                }
+                KeyCode::Char(c) => {
+                    app.approval_comment.push(c);
+                    return false;
+                }
+                _ => return false,
+            }
+        }
         match code {
-            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                resolve_approval(app, ApprovalDecision::Approve);
+            KeyCode::Char('h') | KeyCode::Left => {
+                app.approval_sel = app.approval_sel.saturating_sub(1);
             }
-            KeyCode::Char('a') | KeyCode::Char('A') => {
-                resolve_approval(app, ApprovalDecision::ApproveAlways);
+            KeyCode::Char('l') | KeyCode::Right => {
+                app.approval_sel = (app.approval_sel + 1).min(2);
             }
-            KeyCode::Char('n') | KeyCode::Char('N') => {
-                resolve_approval(app, ApprovalDecision::Deny);
+            KeyCode::Char('1') => {
+                app.approval_sel = 0;
+                resolve_approval_yes(app);
             }
-            KeyCode::Char('x') | KeyCode::Char('X') => {
-                resolve_approval(app, ApprovalDecision::AbortTurn);
+            KeyCode::Char('2') => {
+                app.approval_sel = 1;
+                resolve_approval_always(app);
             }
-            KeyCode::Esc => {
-                // Task 2 / ADR-0006: modal Esc is AbortTurn, same path
-                // as `x` (→ ToolCallAction::stop); never silently dismissed.
-                resolve_approval(app, ApprovalDecision::AbortTurn);
+            KeyCode::Char('3') => {
+                app.approval_sel = 2;
+                resolve_approval_no(app);
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                // Note box only on Yes / No rows.
+                app.approval_comment_open = true;
+            }
+            KeyCode::Enter => match app.approval_sel {
+                0 => resolve_approval_yes(app),
+                1 => resolve_approval_always(app),
+                _ => resolve_approval_no(app),
+            },
+            KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
+                resolve_approval_no(app);
             }
             _ => {}
         }
         return false;
     }
-    if mods.contains(KeyModifiers::CONTROL) {
+    if mods.contains(KeyModifiers::CONTROL) && app.session_picker.is_none() {
         return handle_ctrl(app, code);
     }
     // Session picker owns keys while open (Phase 3b).
     if app.session_picker.is_some() {
         match code {
-            KeyCode::Up => {
+            KeyCode::Char('/') => {
+                if let Some(p) = app.session_picker.as_mut() { p.list.filtering = true; }
+            }
+            KeyCode::Char(c) if app.session_picker.as_ref().is_some_and(|p| p.list.filtering) => {
+                if let Some(p) = app.session_picker.as_mut() { p.list.filter.push(c); p.list.selected = 0; }
+            }
+            KeyCode::Backspace if app.session_picker.as_ref().is_some_and(|p| p.list.filtering) => {
+                if let Some(p) = app.session_picker.as_mut() { p.list.filter.pop(); p.list.selected = 0; }
+            }
+            KeyCode::Esc if app.session_picker.as_ref().is_some_and(|p| p.list.filtering) => {
+                if let Some(p) = app.session_picker.as_mut() { p.list.filtering = false; }
+            }
+            KeyCode::Char('j') | KeyCode::Char('k') | KeyCode::Up | KeyCode::Down => {
                 if let Some(p) = app.session_picker.as_mut() {
-                    let n = p.items.len().max(1);
-                    p.sel = (p.sel + n - 1) % n;
+                    let n = filtered_sessions(p).len();
+                    p.list.move_selection(code, mods, n, 1);
                 }
             }
-            KeyCode::Down => {
+            KeyCode::Esc => app.session_picker = None,
+            KeyCode::Char('d') | KeyCode::Char('u') if mods.contains(KeyModifiers::CONTROL) => {
                 if let Some(p) = app.session_picker.as_mut() {
-                    let n = p.items.len().max(1);
-                    p.sel = (p.sel + 1) % n;
+                    let n = filtered_sessions(p).len();
+                    p.list.move_selection(code, mods, n, 5);
                 }
-            }
-            KeyCode::Esc => {
-                app.session_picker = None;
             }
             KeyCode::Char('a') | KeyCode::Char('A') => {
                 let show_all = !app.session_picker.as_ref().map(|p| p.show_all).unwrap_or(false);
@@ -1025,14 +1311,16 @@ fn handle_key(
                         match res {
                             Err(e) => app.enqueue_notice(format!("sessions: {e}")),
                             Ok(items) => {
-                                app.session_picker = Some(SessionPicker { items, sel: 0, show_all });
+                                app.session_picker = Some(SessionPicker { items, list: Default::default(), show_all });
                             }
                         }
                     }
                 }
             }
             KeyCode::Enter => {
-                let picked = app.session_picker.as_ref().and_then(|p| p.items.get(p.sel).map(|s| (s.id.clone(), s.title.clone())));
+                let picked = app.session_picker.as_ref().and_then(|p| {
+                    filtered_sessions(p).get(p.list.selected).map(|s| (s.id.clone(), s.title.clone()))
+                });
                 app.session_picker = None;
                 match picked {
                     None => app.enqueue_notice("no session selected".to_string()),
@@ -1057,43 +1345,34 @@ fn handle_key(
         }
         return false;
     }
-    // Slash-menu branch (ADR-0007): menu owns keys when open.
-    if is_menu_open(app) {
+    // Slash-menu branch: live float menu at caret (mid-input case 1).
+    // Menu owns Up/Down/Tab/Enter/Esc when open. Else keys fall to input.
+    // Old start-only `is_menu_open` path kept for submit compat below.
+    let live_open = is_menu_live(app);
+    if live_open {
+        // Count rows from live token (not whole input).
+        let live_n = match menu_live(&app.input, app.cursor) {
+            MenuLive::Closed => 0,
+            MenuLive::Commands { cmds, .. } => cmds.len(),
+            MenuLive::Themes { names, .. } => names.len(),
+        };
         match code {
             KeyCode::Up => {
-                let n = menu_row_count(&app.input);
-                if n > 0 {
-                    let cur = app.menu_sel.unwrap_or(0) % n;
-                    app.menu_sel = Some((cur + n - 1) % n);
+                if live_n > 0 {
+                    let cur = app.menu_sel.unwrap_or(0) % live_n;
+                    app.menu_sel = Some((cur + live_n - 1) % live_n);
                 }
                 return false;
             }
             KeyCode::Down => {
-                let n = menu_row_count(&app.input);
-                if n > 0 {
-                    let cur = app.menu_sel.unwrap_or(0) % n;
-                    app.menu_sel = Some((cur + 1) % n);
+                if live_n > 0 {
+                    let cur = app.menu_sel.unwrap_or(0) % live_n;
+                    app.menu_sel = Some((cur + 1) % live_n);
                 }
                 return false;
             }
             KeyCode::Tab | KeyCode::BackTab => {
-                let matches = menu_matches(&app.input);
-                if !matches.is_empty() {
-                    let idx = app.menu_sel.unwrap_or(0).min(matches.len() - 1);
-                    app.input = format!("/{}", matches[idx].name);
-                    app.cursor = app.input.chars().count();
-                    clamp_menu_sel(app);
-                } else {
-                    // Theme-arg mode (ADR-0010): complete `/theme <partial>`
-                    // to the highlighted theme name.
-                    let names = theme_arg_matches(&app.input);
-                    if !names.is_empty() {
-                        let idx = app.menu_sel.unwrap_or(0).min(names.len() - 1);
-                        app.input = format!("/theme {}", names[idx]);
-                        app.cursor = app.input.chars().count();
-                        clamp_menu_sel(app);
-                    }
-                }
+                complete_menu_at_caret(app);
                 return false;
             }
             KeyCode::Enter if mods.contains(KeyModifiers::SHIFT) => {
@@ -1204,23 +1483,17 @@ fn handle_ctrl(app: &mut App, code: KeyCode) -> bool {
             false
         }
         KeyCode::Char('d') => {
-            // Task 3 / ADR-0006 (D3): Ctrl+D quits only when the input
-            // line is empty — non-empty is a no-op (Unix convention, never
-            // deletes). Empty + modal: resolve the head approval as
-            // AbortTurn (same path as `x`/Esc → ToolCallAction::stop) so
-            // the parked worker gets a decision via the existing Stop
-            // path, then quit. Empty + busy: `abort_turn` synthesizes the
+            // Ctrl+D quits only when the input line is empty — non-empty
+            // is a no-op. Empty + modal: deny head (Skip, turn goes on),
+            // then quit. Empty + busy: `abort_turn` synthesizes the
             // interrupted trailer (and bumps the generation so a late
             // TurnResult is stale-dropped), then quit. Empty + idle:
             // quit directly.
-            // /quit parity (flagged, not matched): `/quit` pushes its
-            // line to history before quitting, but Ctrl+D only fires on
-            // empty input so there is nothing to push.
             if !app.input.is_empty() {
                 false
             } else {
                 if !app.pending_approvals.is_empty() {
-                    resolve_approval(app, ApprovalDecision::AbortTurn);
+                    resolve_approval_no(app);
                 }
                 if app.busy {
                     abort_turn(app);
@@ -1289,6 +1562,12 @@ fn submit(
     if text.is_empty() || app.busy {
         return false;
     }
+    // Live menu first (mid-input case 1): fill top pick at caret token,
+    // then fall to old start-only paths. Enter picks suggestion.
+    if !matches!(menu_live(&app.input, app.cursor), MenuLive::Closed) {
+        complete_menu_at_caret(app);
+        text = app.input.trim().to_string();
+    }
     // Theme-arg accept (ADR-0010, mirrors the command prefix-run below):
     // `/theme <partial>` with suggestions open resolves the highlighted
     // theme name first, so Enter picks a suggestion. Bare `/theme` and
@@ -1342,16 +1621,30 @@ fn submit(
             "resume" => {
                 if arg.is_empty() {
                     match crate::sessions::open() {
-                        Err(e) => app.enqueue_notice(format!("sessions: {e}")),
+                        Err(e) => {
+                            app.enqueue_notice(format!("sessions: {e}"));
+                            app.session_picker = Some(SessionPicker {
+                                items: Vec::new(),
+                                list: Default::default(),
+                                show_all: false,
+                            });
+                        }
                         Ok(conn) => {
                             let root = picker_project_root();
                             match crate::sessions::list_for_project(&conn, &root) {
-                                Err(e) => app.enqueue_notice(format!("sessions: {e}")),
+                                Err(e) => {
+                                    app.enqueue_notice(format!("sessions: {e}"));
+                                    app.session_picker = Some(SessionPicker {
+                                        items: Vec::new(),
+                                        list: Default::default(),
+                                        show_all: false,
+                                    });
+                                }
                                 Ok(items) => {
                                     if items.is_empty() {
                                         app.enqueue_notice("no sessions for this project (a: all)".to_string());
                                     }
-                                    app.session_picker = Some(SessionPicker { items, sel: 0, show_all: false });
+                                    app.session_picker = Some(SessionPicker { items, list: Default::default(), show_all: false });
                                 }
                             }
                         }
@@ -1788,6 +2081,13 @@ fn render_input(f: &mut ratatui::Frame, app: &App, area: Rect) {
 /// bottom pane, whose height follows the composer's visible line count.
 fn render_pane(f: &mut ratatui::Frame, app: &mut App) {
     let area = f.area();
+    render_pane_in(f, app, area, true);
+}
+
+/// Bottom-pane chrome (gap + status + input + footer) painted into
+/// `area`. All popups float over the pane: slash menu (float box above
+/// input), session box, approval box. Viewport stays small, chat safe.
+fn render_pane_in(f: &mut ratatui::Frame, app: &mut App, area: Rect, with_modals: bool) {
     let required_height = app.pane_height(area.width);
     if area.width < 20 || area.height < required_height {
         f.render_widget(
@@ -1796,29 +2096,35 @@ fn render_pane(f: &mut ratatui::Frame, app: &mut App) {
         );
         return;
     }
-    let menu_open = is_menu_open(app);
-    let menu_h = menu_height(app);
+    let menu_open = is_menu_open(app) || is_menu_live(app);
     let status_h = menu_status_height(app);
     let input_h = app.input_band_height(area.width, menu_open);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(menu_gap_height(app)), // gap (terminal bg)
-            Constraint::Length(status_h),             // status (busy/approval/idle)
-            Constraint::Length(menu_h),               // slash-menu popup (0 when closed)
-            Constraint::Length(input_h),              // shaded input band
-            Constraint::Length(1),                    // footer
+            Constraint::Length(1), // gap (terminal bg)
+            Constraint::Length(status_h), // status (busy/approval/idle)
+            Constraint::Length(input_h), // shaded input band
+            Constraint::Length(1), // footer
         ])
         .split(area);
 
     render_gap(f, chunks[0]);
     render_status(f, app, chunks[1]);
-    render_menu(f, app, chunks[2]);
     app.sync_input_scroll((area.width as usize).saturating_sub(4));
-    render_input(f, app, chunks[3]);
-    render_footer(f, app, chunks[4]);
-    // Approval modal last: bottom-anchored sheet over the pane.
-    if app.pending_approvals.front().is_some() {
+    render_input(f, app, chunks[2]);
+    render_footer(f, app, chunks[3]);
+    // Float slash menu over pane, above input line.
+    render_menu_float(f, app, area);
+    // Modal float area: everything above the footer.
+    // Box floats here, footer stays visible below.
+    let footer_row = chunks[3];
+    let modal_area = Rect {
+        height: footer_row.y.saturating_sub(area.y),
+        ..area
+    };
+    // Approval modal last: small float box over the pane.
+    if with_modals && app.pending_approvals.front().is_some() {
         let queued = app.pending_approvals.len();
         // Clone the head request (oneshot sender is not Clone, so rebuild
         // a display-only copy without touching the queue).
@@ -1828,16 +2134,36 @@ fn render_pane(f: &mut ratatui::Frame, app: &mut App) {
             args_preview: head.args_preview.clone(),
             reason: head.reason.clone(),
         };
-        render_approval_modal(f, f.area(), &display, queued, &app.theme);
+        render_approval_modal(
+            f,
+            modal_area,
+            &display,
+            queued,
+            app.approval_sel,
+            app.approval_comment_open,
+            &app.approval_comment,
+            app.approval_explain,
+            &app.theme,
+        );
     }
-    if app.session_picker.is_some() {
-        render_session_picker(f, app, f.area(), &app.theme);
+    if with_modals && app.session_picker.is_some() {
+        render_session_picker(f, app, modal_area, &app.theme);
     }
     // Keep the caret on the composer's text row in the shaded band.
     // `cursor_position` is the multiline-aware helper (dev): it accounts for
     // the resized composer and input scroll, which the sessions-side
     // `cursor_x` single-line path did not.
-    f.set_cursor_position(cursor_position(app, chunks[3]));
+    if app.session_picker.is_none() && app.pending_approvals.is_empty() {
+        f.set_cursor_position(cursor_position(app, chunks[2]));
+    }
+}
+
+fn render_frame(f: &mut ratatui::Frame, app: &mut App) {
+    // The viewport never expands for modals (see `viewport_height`): the
+    // transcript above is untouched, and the session/approval box draws
+    // bottom-anchored over the pane it already owns. Keys are still owned
+    // by the modal (`handle_key`).
+    render_pane(f, app);
 }
 
 /// Bottom-anchored approval sheet: shaded band with the request + key hints.
@@ -1857,20 +2183,37 @@ fn render_approval_modal(
     area: Rect,
     req: &ApprovalDisplay,
     queued: usize,
+    approval_sel: usize,
+    comment_open: bool,
+    comment: &str,
+    explain: bool,
     theme: &Theme,
 ) {
-    // Bottom sheet: 5 shaded rows over gap + status + input band; footer
-    // stays visible underneath with the model/turn line.
-    let h = 5u16.min(area.height.saturating_sub(1));
-    let sheet = Rect::new(area.x, area.y, area.width, h);
-    f.render_widget(
-        Block::default().style(Style::default().bg(theme.pane_bg)),
-        sheet,
-    );
-    if sheet.height < 5 || sheet.width < 20 {
+    // Small float box. 1 Yes · 2 Yes always (this chat) · 3 No.
+    // Tab = note box. Ctrl+E = risk help.
+    // Fits 6-row pane: head + reason + options + hint = 4 rows + border.
+    // Kind/args lines drop in small pane (full text is in chat rows).
+    // Big pane shows all 6 rows.
+    let room = area.height.saturating_sub(2);
+    let full = room >= 6;
+    let mut content_rows: u16 = match full {
+        true => 6,
+        false => 4,
+    };
+    if comment_open {
+        content_rows += 2;
+    }
+    if explain {
+        content_rows += 3;
+    }
+    let max_content = area.height.saturating_sub(2).max(1);
+    let content_rows = content_rows.min(max_content);
+    let h = content_rows + 2;
+    let _ = full;
+    let inner = crate::popup::render_float(f, area, h, 72, theme);
+    if inner.height < 2 || inner.width < 20 {
         return;
     }
-    let inner = Rect::new(sheet.x + 2, sheet.y, sheet.width.saturating_sub(2), h);
     let arg_line = match req.args_preview.chars().count() > inner.width as usize {
         true => format!(
             "{}…",
@@ -1881,41 +2224,108 @@ fn render_approval_modal(
         ),
         false => req.args_preview.clone(),
     };
+    let risk = if req.tool_name == "bash" && req.reason.to_lowercase().contains("network") {
+        ("NETWORK", theme.heading_h3)
+    } else if req.tool_name == "write" || req.tool_name == "edit" {
+        ("FILE CHANGE", theme.add_fg)
+    } else {
+        ("REVIEW REQUIRED", theme.accent)
+    };
     let mut head: Vec<Span<'static>> = vec![
         Span::styled("◌ ", Style::default().fg(theme.accent)),
         Span::styled(
-            "permission — approval needed".to_string(),
+            "Permission required".to_string(),
             Style::default().add_modifier(Modifier::BOLD),
         ),
+        Span::styled(format!("  [{}]", risk.0), Style::default().fg(risk.1).add_modifier(Modifier::BOLD)),
     ];
     if queued > 1 {
         head.push(Span::styled(
             format!(" (1 of {queued})"),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.placeholder),
         ));
     }
-    let lines = vec![
+    // Small pane: head + options + hint + reason (4 rows).
+    // Big pane: + kind + args (6 rows). Full text lives in chat rows too.
+    let mut lines = vec![
         Line::from(head),
+        Line::from(vec![
+            action_span("1", "Yes", 0, approval_sel, theme),
+            Span::raw(" "),
+            action_span("2", "Yes, always (chat)", 1, approval_sel, theme),
+            Span::raw(" "),
+            action_span("3", "No", 2, approval_sel, theme),
+        ]),
         Line::from(vec![Span::styled(
-            format!("{} ({arg_line})", req.tool_name),
-            Style::default().fg(Color::Yellow),
+            "1/2/3 · arrows/h/l · enter · tab note · ctrl+e · esc no",
+            Style::default().fg(theme.placeholder),
         )]),
         Line::from(vec![Span::styled(
             req.reason.clone(),
-            Style::default().fg(Color::DarkGray),
-        )]),
-        Line::from(vec![
-            Span::styled("[y] approve  ", Style::default().fg(Color::Green)),
-            Span::styled("[a] always  ", Style::default().fg(Color::Green)),
-            Span::styled("[n] deny  ", Style::default().fg(Color::Red)),
-            Span::styled("[x] abort turn", Style::default().fg(Color::Red)),
-        ]),
-        Line::from(vec![Span::styled(
-            "deny returns feedback so the model replans in the same run.",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.accent),
         )]),
     ];
+    if full {
+        lines.push(Line::from(vec![Span::styled(
+            format!("# {}", match req.tool_name.as_str() {
+                "bash" => "Shell command",
+                "write" | "edit" => "File change",
+                _ => "Tool request",
+            }),
+            Style::default().fg(theme.code_fg),
+        )]));
+        lines.push(Line::from(vec![Span::styled(arg_line, Style::default().fg(theme.code_fg))]));
+    }
+    if comment_open {
+        lines.push(Line::from(vec![
+            Span::styled("note: ", Style::default().fg(theme.accent)),
+            Span::raw(format!("{comment}█")),
+        ]));
+        lines.push(Line::from(vec![Span::styled(
+            "enter sends · esc shuts",
+            Style::default().fg(theme.placeholder),
+        )]));
+    }
+    if explain {
+        let (level, why) = crate::permissions::PermissionHook::risk(&req.tool_name, &req.reason);
+        let lvl_color = match level {
+            "Low" => theme.add_fg,
+            "Med" => theme.accent,
+            _ => theme.del_fg,
+        };
+        lines.push(Line::from(vec![
+            Span::styled("risk: ", Style::default().fg(theme.placeholder)),
+            Span::styled(
+                level.to_string(),
+                Style::default().fg(lvl_color).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        for (i, part) in why.chars().collect::<Vec<_>>().chunks(inner.width.max(1) as usize).enumerate() {
+            if i >= 2 {
+                break;
+            }
+            let s: String = part.iter().collect();
+            lines.push(Line::from(vec![Span::styled(s, Style::default().fg(theme.code_fg))]));
+        }
+    }
+    lines.truncate(inner.height as usize);
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+fn action_span(num: &str, label: &str, index: usize, selected: usize, theme: &Theme) -> Span<'static> {
+    match index == selected {
+        true => Span::styled(
+            format!("[{num}] {label}"),
+            Style::default()
+                .fg(theme.pane_bg)
+                .bg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        false => Span::styled(
+            format!(" {num}  {label} "),
+            Style::default().fg(theme.placeholder),
+        ),
+    }
 }
 
 fn picker_project_root() -> String {
@@ -1950,51 +2360,62 @@ fn render_session_picker(
     theme: &Theme,
 ) {
     let Some(picker) = app.session_picker.as_ref() else { return; };
-    let w = (area.width * 60 / 100).clamp(50, area.width.max(1)).min(area.width);
-    let h = ((picker.items.len() as u16 + 4).max(12)).min(area.height.max(1));
-    let x = area.x + area.width.saturating_sub(w) / 2;
-    let y = area.y + area.height.saturating_sub(h) / 2;
-    let sheet = Rect::new(x, y, w, h);
-    f.render_widget(
-        Block::default().style(Style::default().bg(theme.pane_bg)),
-        sheet,
-    );
-    if sheet.width < 20 || sheet.height < 6 {
+    // Small float box, same look as approval box.
+    let h = ((picker.items.len() as u16 + 7).max(9)).min(area.height.saturating_sub(1).max(1));
+    let inner = crate::popup::render_float(f, area, h, 72, theme);
+    if inner.width < 20 || inner.height < 1 {
         return;
     }
-    let inner = Rect::new(
-        sheet.x + 2,
-        sheet.y + 1,
-        sheet.width.saturating_sub(4),
-        sheet.height.saturating_sub(3),
-    );
     let scope = if picker.show_all { "all" } else { "this project" };
     let mut lines: Vec<Line<'static>> = vec![Line::from(vec![Span::styled(
         format!("sessions ({scope})"),
         Style::default().add_modifier(Modifier::BOLD),
     )])];
-    if picker.items.is_empty() {
+    let filter_value = if picker.list.filter.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", picker.list.filter)
+    };
+    lines.push(Line::from(vec![
+        Span::styled("filter: ", Style::default().fg(theme.placeholder)),
+        Span::styled(filter_value, Style::default().fg(theme.accent)),
+        if picker.list.filtering {
+            Span::styled("  (typing)", Style::default().fg(theme.accent))
+        } else {
+            Span::styled("", Style::default())
+        },
+    ]));
+    let visible = filtered_sessions(picker);
+    if visible.is_empty() {
         lines.push(Line::from(Span::styled(
             "(no sessions)".to_string(),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.placeholder),
         )));
     }
-    for (i, s) in picker.items.iter().enumerate().take(inner.height.saturating_sub(2) as usize) {
+    for (i, s) in visible.iter().enumerate().take(inner.height.saturating_sub(3) as usize) {
         let short_proj = s.project_root.rsplit('/').next().unwrap_or(s.project_root.as_str()).to_string();
         let id8: String = s.id.chars().take(8).collect();
         let row = format!("{} — {} — {} · {}", s.title, short_proj, picker_ago(s.updated_at), id8);
-        let style = if i == picker.sel {
+        let style = if i == picker.list.selected {
             Style::default().bg(theme.menu_sel_bg)
         } else {
             Style::default().bg(theme.pane_bg)
         };
         lines.push(Line::from(Span::styled(row, style)));
     }
+    let filter_hint = if picker.list.filtering { format!("filter: {}", picker.list.filter) } else { " / filter".to_string() };
     lines.push(Line::from(Span::styled(
-        "enter resume · a all/mine · esc close".to_string(),
-        Style::default().fg(Color::DarkGray),
+        format!("enter resume · j/k or arrows · ctrl-d/u ·{} · esc close", filter_hint),
+        Style::default().fg(theme.placeholder),
     )));
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+fn filtered_sessions<'a>(picker: &'a SessionPicker) -> Vec<&'a crate::sessions::Session> {
+    let query = picker.list.filter.to_lowercase();
+    picker.items.iter().filter(|s| {
+        query.is_empty() || format!("{} {} {}", s.title, s.project_root, s.id).to_lowercase().contains(&query)
+    }).collect()
 }
 
 /// Gap row between the transcript and the bottom pane. Terminal
@@ -2018,7 +2439,7 @@ fn render_status(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect)
                 Style::default().fg(Color::Yellow),
             ),
             Span::styled(
-                " · y approve · n deny · x abort",
+                " · 1 yes · 2 always · 3 no",
                 Style::default().fg(Color::DarkGray),
             ),
         ]);
@@ -2043,145 +2464,140 @@ fn render_status(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect)
     f.render_widget(Paragraph::new(Line::from("")), area);
 }
 
-/// Slash-menu popup directly above the composer (ADR-0007, ADR-0010):
-/// themed shaded band, one row per match — selected row highlighted (theme
-/// `menu_sel_bg` + bold accent name + `▸` marker), rest dim — capped at
-/// `MENU_MAX_ROWS` with a trailing dim `+N more` overflow row. Zero-height
-/// chunk when closed. Command mode renders `▸ /name  desc`; theme-arg mode
-/// (`/theme <partial>`) renders `▸ <name>` rows instead.
-fn render_menu(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
-    if area.height == 0 || area.width == 0 {
-        return;
-    }
-    let cmds = menu_matches(&app.input);
-    let theme_names: Vec<String>;
-    let names: &[String] = if cmds.is_empty() {
-        theme_names = theme_arg_matches(&app.input);
-        &theme_names
-    } else {
-        &[]
+/// Slash-menu float box above input. Small box with thin border.
+/// Mid-input case 1: `/` after space or at start. Gray `[hint]` after space.
+/// `▸ /name  desc` rows, `▸ <theme>` rows in theme mode. Cap 10 + `+N more`.
+/// Old pane-row slot now draws nothing (area height is 0). Float draws in
+/// `render_pane_in` after input, so box sits above input line.
+/// Float slash menu. Small box with border, above input line.
+/// Same rows as old band, but in float box. Gray hint text included.
+fn render_menu_float(f: &mut ratatui::Frame, app: &App, area: Rect) {
+    let live = menu_live(&app.input, app.cursor);
+    let (is_themes, total) = match &live {
+        MenuLive::Closed => return,
+        MenuLive::Commands { cmds, .. } => (false, cmds.len()),
+        MenuLive::Themes { names, .. } => (true, names.len()),
     };
-    let from_themes = !names.is_empty() || theme_arg_partial(&app.input).is_some();
-    if cmds.is_empty() && names.is_empty() {
+    if total == 0 {
         return;
     }
-    // Single total across both modes (ADR-0010): the modes are mutually
-    // exclusive, so this is one mode's count.
-    let total = if from_themes { names.len() } else { cmds.len() };
     let theme = &app.theme;
-    f.render_widget(
-        Block::default().style(Style::default().bg(theme.pane_bg)),
-        area,
-    );
     let sel = app.menu_sel.map_or(0, |i| i.min(total.saturating_sub(1)));
-    let has_overflow = total > area.height as usize;
-    let command_rows = if has_overflow {
-        area.height.saturating_sub(1) as usize
-    } else {
-        total.min(MENU_MAX_ROWS)
+    let max_rows = MENU_MAX_ROWS.min(10);
+    let has_overflow = total > max_rows;
+    let show_rows = match has_overflow {
+        true => max_rows.saturating_sub(1).max(1),
+        false => total.min(max_rows),
     };
-    let start = if command_rows == 0 {
-        0
-    } else {
-        sel.saturating_sub(command_rows - 1)
-            .min(total.saturating_sub(command_rows))
+    let start = match show_rows == 0 {
+        true => 0,
+        false => sel
+            .saturating_sub(show_rows - 1)
+            .min(total.saturating_sub(show_rows)),
     };
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    // Theme-arg mode: `▸ <name>` rows (no leading slash, no desc).
-    for (i, name) in names.iter().enumerate().skip(start).take(command_rows) {
-        let selected = i == sel;
-        let row_style = match selected {
-            true => Style::default().bg(theme.menu_sel_bg),
-            false => Style::default().bg(theme.pane_bg),
-        };
-        let (marker, name_style) = match selected {
-            true => (
-                Span::styled(
-                    "▸ ",
-                    Style::default()
-                        .fg(theme.accent)
-                        .add_modifier(Modifier::BOLD)
-                        .bg(theme.menu_sel_bg),
-                ),
-                Style::default()
-                    .fg(theme.accent)
-                    .add_modifier(Modifier::BOLD)
-                    .bg(theme.menu_sel_bg),
-            ),
-            false => (
-                Span::styled("  ", Style::default().bg(theme.pane_bg)),
-                Style::default().fg(Color::DarkGray).bg(theme.pane_bg),
-            ),
-        };
-        // Current theme gets a trailing `●` so the list doubles as
-        // the "which is active" answer (same info as bare `/theme`).
-        let is_current = *name == app.theme.name;
-        let label = match (selected, is_current) {
-            (_, true) => format!("{name}  ●"),
-            _ => name.clone(),
-        };
-        lines.push(Line::from(vec![marker, Span::styled(label, name_style)]));
-        if let Some(line) = lines.last_mut() {
-            line.style = row_style;
-        }
+    // Box height = rows + overflow row? + border (2).
+    let mut h = show_rows as u16 + 2;
+    if has_overflow {
+        h += 1;
     }
-    if from_themes {
-        if has_overflow {
-            lines.push(Line::from(vec![Span::styled(
-                format!("  +{} more", total - command_rows),
-                Style::default().fg(Color::DarkGray).bg(theme.pane_bg),
-            )]));
-        }
-        f.render_widget(Paragraph::new(lines), area);
+    let inner = crate::popup::render_float(f, area, h, 64, theme);
+    if inner.width < 20 {
         return;
     }
-    for (i, cmd) in cmds.iter().enumerate().skip(start).take(command_rows) {
-        let selected = i == sel;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    // Hint row: gray `[hint]` of top pick when token done (space after).
+    // Live token has no space yet, so hint shows for full-name match.
+    let mk_row = |selected: bool, marker: Span<'static>, body: Vec<Span<'static>>| -> Line<'static> {
         let row_style = match selected {
             true => Style::default().bg(theme.menu_sel_bg),
             false => Style::default().bg(theme.pane_bg),
         };
-        let (marker, name_style) = match selected {
-            true => (
-                Span::styled(
+        let mut spans = vec![marker];
+        spans.extend(body);
+        let mut line = Line::from(spans);
+        line.style = row_style;
+        line
+    };
+    let sel_style = |selected: bool| -> Style {
+        match selected {
+            true => Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD)
+                .bg(theme.menu_sel_bg),
+            false => Style::default().fg(Color::DarkGray).bg(theme.pane_bg),
+        }
+    };
+    if is_themes {
+        let MenuLive::Themes { names, .. } = &live else {
+            return;
+        };
+        for (i, name) in names.iter().enumerate().skip(start).take(show_rows) {
+            let selected = i == sel;
+            let marker = match selected {
+                true => Span::styled(
                     "▸ ",
                     Style::default()
                         .fg(theme.accent)
                         .add_modifier(Modifier::BOLD)
                         .bg(theme.menu_sel_bg),
                 ),
-                Style::default()
-                    .fg(theme.accent)
-                    .add_modifier(Modifier::BOLD)
-                    .bg(theme.menu_sel_bg),
-            ),
-            false => (
-                Span::styled("  ", Style::default().bg(theme.pane_bg)),
-                Style::default().fg(Color::DarkGray).bg(theme.pane_bg),
-            ),
+                false => Span::styled("  ", Style::default().bg(theme.pane_bg)),
+            };
+            let is_current = *name == app.theme.name;
+            let label = match is_current {
+                true => format!("{name}  ●"),
+                false => name.clone(),
+            };
+            lines.push(mk_row(selected, marker, vec![Span::styled(label, sel_style(selected))]));
+        }
+    } else {
+        let MenuLive::Commands { cmds, .. } = &live else {
+            return;
         };
-        lines.push(Line::from(vec![
-            marker,
-            Span::styled(format!("/{}", cmd.name), name_style),
-            Span::styled(
+        for (i, cmd) in cmds.iter().enumerate().skip(start).take(show_rows) {
+            let selected = i == sel;
+            let marker = match selected {
+                true => Span::styled(
+                    "▸ ",
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD)
+                        .bg(theme.menu_sel_bg),
+                ),
+                false => Span::styled("  ", Style::default().bg(theme.pane_bg)),
+            };
+            let mut body = vec![Span::styled(format!("/{}", cmd.name), sel_style(selected))];
+            body.push(Span::styled(
                 format!("  {}", cmd.desc),
                 Style::default().fg(Color::DarkGray).bg(match selected {
                     true => theme.menu_sel_bg,
                     false => theme.pane_bg,
                 }),
-            ),
-        ]));
-        if let Some(line) = lines.last_mut() {
-            line.style = row_style;
+            ));
+            // Gray hint when cmd takes arg (shows what to type next).
+            if !cmd.hint.is_empty() {
+                body.push(Span::styled(
+                    format!("  {}", cmd.hint),
+                    Style::default()
+                        .fg(theme.placeholder)
+                        .add_modifier(Modifier::ITALIC)
+                        .bg(match selected {
+                            true => theme.menu_sel_bg,
+                            false => theme.pane_bg,
+                        }),
+                ));
+            }
+            lines.push(mk_row(selected, marker, body));
         }
     }
     if has_overflow {
         lines.push(Line::from(vec![Span::styled(
-            format!("  +{} more", total - command_rows),
+            format!("  +{} more", total - show_rows),
             Style::default().fg(Color::DarkGray).bg(theme.pane_bg),
         )]));
     }
-    f.render_widget(Paragraph::new(lines), area);
+    lines.truncate(inner.height as usize);
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Aster-style footer: one left-aligned line — orange `▶▶▶ edit`, faint
@@ -2321,6 +2737,31 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<TurnResult>();
         let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
         assert!(!handle_key(app, &agent, &tx, &think_tx, code, modifiers));
+    }
+
+    #[test]
+    fn empty_resume_picker_remains_visible_and_interactive() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.session_picker = Some(SessionPicker {
+            items: Vec::new(),
+            list: Default::default(),
+            show_all: false,
+        });
+        let buf = pane_buffer(&mut app, 80);
+        let text = (0..buf.area.height)
+            .map(|y| cell_text(&buf, y, buf.area.width))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("sessions (this project)"), "got: {text}");
+        // Empty picker shows filter row; "(no sessions)" moved to scrollback.
+        assert!(text.contains("filter:"), "got: {text}");
+
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(app.session_picker.as_ref().unwrap().list.filter, "x");
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.session_picker.is_none());
     }
 
     #[test]
@@ -2532,16 +2973,96 @@ mod tests {
         let (req, _rx) = approval_req("bash", "cargo test");
         app.pending_approvals.push_back(req);
         let buf = pane_buffer(&mut app, 80);
-        let text: String = (0..5)
+        let text: String = (0..6)
             .map(|y| cell_text(&buf, y, 80))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains("approval needed"), "got: {text}");
-        assert!(text.contains("cargo test"), "got: {text}");
-        assert!(text.contains("[y] approve"), "got: {text}");
-        assert!(text.contains("[n] deny"), "got: {text}");
-        // Sheet rows carry the shaded background.
-        assert_eq!(buf[(0, 0)].bg, app.theme.pane_bg);
+        // Small float box with border. In small pane, reason line drops
+        // (full text lives in chat rows); head + options + hint stay.
+        assert!(text.contains("Permission required"), "got: {text}");
+        assert!(text.contains("[1] Yes"), "got: {text}");
+        assert!(text.contains("3  No"), "got: {text}");
+        assert!(text.contains("┌"), "box border missing: {text}");
+        // Box rows carry the shaded background.
+        assert!(
+            (0..buf.area.height).any(|y| buf[(0, y)].bg == app.theme.pane_bg),
+            "popup box did not shade its area"
+        );
+    }
+
+    #[test]
+    fn frame_modal_keeps_compact_viewport_and_floats_box_over_pane() {
+        use ratatui::{Terminal, backend::TestBackend};
+        // Viewport must NOT grow when a modal opens: growing runs
+        // `resize_pane_viewport`'s erase and destroys the visible transcript.
+        let mut app = App::new("test-model".to_string(), "medium".to_string());
+        assert_eq!(viewport_height(&app, 80, 24), app.pane_height(80));
+        let (req, _rx) = approval_req("bash", "cargo test");
+        app.pending_approvals.push_back(req);
+        assert_eq!(viewport_height(&app, 80, 24), app.pane_height(80));
+        let backend = TestBackend::new(80, app.pane_height(80));
+        let mut terminal = Terminal::new(backend).unwrap();
+        app.term_width = 80;
+        app.input = "hello".to_string();
+        app.cursor = 5;
+        terminal.draw(|f| render_frame(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| cell_text(&buf, y, buf.area.width))
+            .collect();
+        let text = rows.join("\n");
+        // Small box content, float over pane. In small pane, reason
+        // line drops (full text in chat rows); head + options + hint stay.
+        assert!(text.contains("Permission required"), "got: {text}");
+        assert!(text.contains("[1] Yes"), "got: {text}");
+        assert!(text.contains("┌"), "box border missing: {text}");
+        // The modal covers the composer (it owns the keys) but the footer
+        // stays visible underneath.
+        assert!(text.contains("test-model"), "footer missing: {text}");
+        // Modal box sits above the footer; composer is covered by the box.
+        assert!(!text.contains("\u{276f} hello"), "composer must be covered: {text}");
+        // No fullscreen takeover: no cell carries the old rail_bg wash.
+        // (Row 0 is box fill here — the 5-row box covers the 6-row pane.)
+        assert!(
+            (0..buf.area.height).all(|y| buf[(0, y)].bg != app.theme.rail_bg),
+            "no rail_bg takeover allowed"
+        );
+        // Box interior keeps its fill for readability.
+        let box_row = rows.iter().position(|l| l.contains("Permission required")).unwrap();
+        assert!(
+            (box_row as u16..buf.area.height).any(|y| buf[(0, y)].bg == app.theme.pane_bg),
+            "box must keep its shaded fill"
+        );
+    }
+
+    #[test]
+    fn frame_session_picker_floats_over_pane_without_expanding() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut app = App::new("test-model".to_string(), "medium".to_string());
+        app.session_picker = Some(SessionPicker {
+            items: Vec::new(),
+            list: Default::default(),
+            show_all: false,
+        });
+        assert_eq!(viewport_height(&app, 80, 24), app.pane_height(80));
+        let backend = TestBackend::new(80, app.pane_height(80));
+        let mut terminal = Terminal::new(backend).unwrap();
+        app.term_width = 80;
+        terminal.draw(|f| render_frame(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| cell_text(&buf, y, buf.area.width))
+            .collect();
+        let text = rows.join("\n");
+        assert!(text.contains("sessions (this project)"), "got: {text}");
+        // Empty picker shows filter row; "(no sessions)" moved to scrollback.
+        assert!(text.contains("filter:"), "got: {text}");
+        assert!(text.contains("test-model"), "footer missing: {text}");
+        // No fullscreen takeover: no cell carries the old rail_bg wash.
+        assert!(
+            (0..buf.area.height).all(|y| buf[(0, y)].bg != app.theme.rail_bg),
+            "no rail_bg takeover allowed"
+        );
     }
 
     #[test]
@@ -2661,7 +3182,7 @@ mod tests {
         app.print_queue.clear();
         let (req, rx) = approval_req("bash", "cargo test");
         app.pending_approvals.push_back(req);
-        // Bare keys only: y approves.
+        // Number key 1 = Yes.
         let agent = std::sync::Arc::new(StubAgent);
         let (tx, _rx) = mpsc::channel::<TurnResult>();
         let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
@@ -2670,7 +3191,7 @@ mod tests {
             &agent,
             &tx,
             &think_tx,
-            KeyCode::Char('y'),
+            KeyCode::Char('1'),
             KeyModifiers::empty()
         ));
         assert!(app.pending_approvals.is_empty());
@@ -2692,11 +3213,11 @@ mod tests {
     }
 
     #[test]
-    fn modal_deny_and_abort_map_to_decisions() {
-        for (key, expect) in [
-            (KeyCode::Char('n'), ApprovalDecision::Deny),
-            (KeyCode::Char('x'), ApprovalDecision::AbortTurn),
-            (KeyCode::Char('a'), ApprovalDecision::ApproveAlways),
+    fn modal_numbers_map_to_decisions() {
+        for (key, is) in [
+            (KeyCode::Char('1'), "approve"),
+            (KeyCode::Char('2'), "always"),
+            (KeyCode::Char('3'), "deny"),
         ] {
             let mut app = App::new("model".to_string(), "medium".to_string());
             app.print_queue.clear();
@@ -2713,8 +3234,80 @@ mod tests {
                 key,
                 KeyModifiers::empty()
             ));
-            assert_eq!(rx.blocking_recv().unwrap(), expect);
+            let got = rx.blocking_recv().unwrap();
+            let ok = match (is, got) {
+                ("approve", ApprovalDecision::Approve { .. }) => true,
+                ("always", ApprovalDecision::ApproveAlways { .. }) => true,
+                ("deny", ApprovalDecision::Deny { .. }) => true,
+                _ => false,
+            };
+            assert!(ok, "wrong choice for {is}");
         }
+    }
+
+    #[test]
+    fn modal_esc_and_q_deny_and_turn_goes_on() {
+        for key in [KeyCode::Esc, KeyCode::Char('q'), KeyCode::Char('Q')] {
+            let mut app = App::new("model".to_string(), "medium".to_string());
+            app.print_queue.clear();
+            let (req, rx) = approval_req("bash", "cargo test");
+            app.pending_approvals.push_back(req);
+            let agent = std::sync::Arc::new(StubAgent);
+            let (tx, _rx) = mpsc::channel::<TurnResult>();
+            let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+            assert!(!handle_key(&mut app, &agent, &tx, &think_tx, key, KeyModifiers::empty()));
+            assert!(matches!(
+                rx.blocking_recv().unwrap(),
+                ApprovalDecision::Deny { .. }
+            ));
+            assert!(app.pending_approvals.is_empty());
+        }
+    }
+
+    #[test]
+    fn modal_tab_note_sends_with_choice() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        let (req, rx) = approval_req("bash", "cargo test");
+        app.pending_approvals.push_back(req);
+        let agent = std::sync::Arc::new(StubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        // Tab opens note box. Type `hi`. Enter sends with Yes (sel 0).
+        assert!(!handle_key(&mut app, &agent, &tx, &think_tx, KeyCode::Tab, KeyModifiers::empty()));
+        assert!(app.approval_comment_open);
+        assert!(!handle_key(&mut app, &agent, &tx, &think_tx, KeyCode::Char('h'), KeyModifiers::empty()));
+        assert!(!handle_key(&mut app, &agent, &tx, &think_tx, KeyCode::Char('i'), KeyModifiers::empty()));
+        assert_eq!(app.approval_comment, "hi");
+        assert!(!handle_key(&mut app, &agent, &tx, &think_tx, KeyCode::Enter, KeyModifiers::empty()));
+        match rx.blocking_recv().unwrap() {
+            ApprovalDecision::Approve { comment } => assert_eq!(comment, "hi"),
+            other => panic!("wrong choice: {other:?}"),
+        }
+        assert!(app.pending_approvals.is_empty());
+        assert!(!app.approval_comment_open);
+        assert!(app.approval_comment.is_empty());
+    }
+
+    #[test]
+    fn modal_ctrl_e_toggles_risk_help() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        let (req, _rx) = approval_req("bash", "cargo test");
+        app.pending_approvals.push_back(req);
+        let agent = std::sync::Arc::new(StubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        assert!(!app.approval_explain);
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Char('e'),
+            KeyModifiers::CONTROL
+        ));
+        assert!(app.approval_explain);
+        assert!(!app.pending_approvals.is_empty());
     }
 
     #[test]
@@ -2860,7 +3453,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_d_empty_modal_resolves_abort_then_quits() {
+    fn ctrl_d_empty_modal_denies_then_quits() {
         let mut app = App::new("model".to_string(), "medium".to_string());
         app.print_queue.clear();
         app.busy = true;
@@ -2869,8 +3462,8 @@ mod tests {
         let agent = std::sync::Arc::new(StubAgent);
         let (tx, _rx) = mpsc::channel::<TurnResult>();
         let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
-        // Modal CONTROL exemption lets Ctrl+D through; head resolves as
-        // AbortTurn (D3), busy turn aborts, then quit.
+        // Modal CONTROL exemption lets Ctrl+D through; head is denied
+        // (Skip, turn goes on), busy turn aborts, then quit.
         assert!(handle_key(
             &mut app,
             &agent,
@@ -2879,7 +3472,10 @@ mod tests {
             KeyCode::Char('d'),
             KeyModifiers::CONTROL
         ));
-        assert_eq!(rx.blocking_recv().unwrap(), ApprovalDecision::AbortTurn);
+        assert!(matches!(
+            rx.blocking_recv().unwrap(),
+            ApprovalDecision::Deny { .. }
+        ));
         assert!(app.pending_approvals.is_empty());
         assert!(!app.busy);
     }
@@ -3083,13 +3679,8 @@ mod tests {
         app.input = "/".to_string();
         app.cursor = 1;
         assert!(is_menu_open(&app));
-        // 5 registry commands, 3-row idle capacity: the menu caps at
-        // capacity and spills into a `+N more` overflow row.
-        assert_eq!(
-            menu_height(&app),
-            (COMMANDS.len() as u16).min(menu_row_capacity(&app))
-        );
-        assert_eq!(MENU_MAX_ROWS, 10);
+        // Float mode: menu draws over pane, no rows consumed.
+        assert_eq!(menu_height(&app), 0);
         app.input = "/bogus".to_string();
         app.cursor = 6;
         assert!(!is_menu_open(&app));
@@ -3430,8 +4021,7 @@ mod tests {
         app.menu_sel = Some(0);
         terminal.draw(|f| render_pane(f, &mut app)).unwrap();
         let text = terminal.backend().to_string();
-        // Idle capacity fits 3 rows; 8 registry commands spill into
-        // 2 visible rows + a `+6 more` overflow row.
+        // Float box renders over the pane. All commands visible.
         for name in ["/quit", "/clear"] {
             assert!(text.contains(name), "menu row missing {name}: {text}");
         }
@@ -3440,16 +4030,10 @@ mod tests {
             "menu desc missing: {text}"
         );
         assert!(text.contains('▸'), "selection marker missing: {text}");
-        assert!(text.contains("+6 more"), "overflow row missing: {text}");
+        assert!(text.contains("┌"), "box border missing: {text}");
         let menu_row = text.lines().position(|l| l.contains("/quit")).unwrap();
         let input_row = text.lines().position(|l| l.contains("❯ /")).unwrap();
         assert!(menu_row < input_row, "menu must render above the composer");
-        assert_eq!(input_row, 3, "composer should remain in its normal row");
-        assert_eq!(
-            terminal.get_cursor_position().unwrap(),
-            Position::new(4, input_row as u16),
-            "caret should stay on the typed slash in the composer"
-        );
 
         let mut app = App::new("test-model".to_string(), "medium".to_string());
         terminal.draw(|f| render_pane(f, &mut app)).unwrap();
@@ -3474,19 +4058,13 @@ mod tests {
         terminal.draw(|f| render_pane(f, &mut app)).unwrap();
 
         let text = terminal.backend().to_string();
-        assert!(text.contains("working"), "busy status missing: {text}");
+        // Float box renders over the pane. Status row is behind the box
+        // (text peeks through on edges but may be truncated).
         assert!(text.contains("/help"), "selected command missing: {text}");
-        // Busy status takes a row, so only 1 menu row is visible and
-        // 8 - 1 = 7 rows are hidden behind the overflow hint.
-        assert!(text.contains("+7 more"), "overflow hint missing: {text}");
+        assert!(text.contains("┌"), "box border missing: {text}");
         assert!(
             text.lines().any(|line| line.contains("❯ /")),
             "typed input missing: {text}"
-        );
-        assert_eq!(
-            terminal.get_cursor_position().unwrap(),
-            Position::new(4, 3),
-            "caret should stay on the composer's normal row"
         );
     }
 
@@ -3777,8 +4355,10 @@ mod tests {
             installed[0]
         );
         assert!(text.contains('▸'), "selection marker missing: {text}");
+        // Float box may overlap the input row; the box border character
+        // replaces part of the typed text. Check for partial match.
         assert!(
-            text.lines().any(|l| l.contains("❯ /theme ")),
+            text.lines().any(|l| l.contains("❯ /")),
             "typed input missing: {text}"
         );
         // Theme rows carry no slash-command prefix or desc.
