@@ -292,7 +292,13 @@ pub(crate) fn tool_row(
 
 /// A diff body (`git_diff` output): `verb path` header with `+N −M` counts
 /// pushed right, then full-row tinted bands with a darker mark glyph.
-pub(crate) fn patch_row(verb: &str, path: &str, body: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+pub(crate) fn patch_row(
+    verb: &str,
+    path: &str,
+    body: &str,
+    width: usize,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
     // `+++`/`---` file headers are not changed lines.
     let added = body
         .lines()
@@ -333,8 +339,12 @@ fn diff_lines(body: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
     body.lines()
         .map(|raw| {
             let (fg, bg, mark) = match raw.chars().next() {
-                Some('+') if !raw.starts_with("+++") => (theme.add_fg, theme.add_bg, Some(theme.add_mark)),
-                Some('-') if !raw.starts_with("---") => (theme.del_fg, theme.del_bg, Some(theme.del_mark)),
+                Some('+') if !raw.starts_with("+++") => {
+                    (theme.add_fg, theme.add_bg, Some(theme.add_mark))
+                }
+                Some('-') if !raw.starts_with("---") => {
+                    (theme.del_fg, theme.del_bg, Some(theme.del_mark))
+                }
                 _ => (Color::DarkGray, Color::Reset, None),
             };
             let style = Style::default().fg(fg).bg(bg);

@@ -23,11 +23,11 @@ use tokio::task::JoinHandle;
 use unicode_width::UnicodeWidthStr;
 
 use crate::agent::{AgentLoop, ToolEvent};
-use rig::message::{AssistantContent, Message, UserContent};
 use crate::history;
-use crate::permissions::{ApprovalDecision, ApprovalRequest, ApprovalRx};
 use crate::modes::Mode;
+use crate::permissions::{ApprovalDecision, ApprovalRequest, ApprovalRx};
 use crate::theme::Theme;
+use rig::message::{AssistantContent, Message, UserContent};
 
 /// Swappable UI abstraction. `RatatuiBackend` is the Ratatui implementation;
 /// the old Cursive backend was removed in favor of this Aster-styled UI.
@@ -172,12 +172,11 @@ fn run_app(
         let mut app = App::new(model, effort);
         // Resume: on relaunch with REM_SESSION_ID set, replay the stored
         // transcript so the pane shows prior turns before new input.
-        if let Ok(sid) = std::env::var("REM_SESSION_ID") {
-            if let Ok(conn) = crate::sessions::open() {
-                if let Ok(Some(s)) = crate::sessions::get_session(&conn, &sid) {
-                    app.replay_json(&s.messages_json);
-                }
-            }
+        if let Ok(sid) = std::env::var("REM_SESSION_ID")
+            && let Ok(conn) = crate::sessions::open()
+            && let Ok(Some(s)) = crate::sessions::get_session(&conn, &sid)
+        {
+            app.replay_json(&s.messages_json);
         }
         // The approval channel is tokio mpsc; the TUI loop is sync crossterm, so
         // poll with try_recv (never block the 50ms frame).
@@ -215,7 +214,6 @@ const MAX_INPUT_LINES: usize = 5;
 /// Fixed viewport height while the session picker is open (grilled decision:
 /// fixed 12-15 rows). Box outer caps at 13 (viewport - footer - 1 breathing
 /// row), showing up to ~8 session rows with internal scroll beyond that.
-
 fn pane_viewport_area(width: u16, height: u16, pane_height: u16) -> Rect {
     let pane_height = pane_height.min(height);
     Rect::new(0, height.saturating_sub(pane_height), width, pane_height)
@@ -291,10 +289,6 @@ const BUSY_VERB_SECS: u64 = 2;
 /// Slash-menu popup budget (Aster `menu_lines` 10-cap): max command rows;
 /// one extra `+N more` row appears on overflow.
 const MENU_MAX_ROWS: usize = 10;
-/// Preferred visible command rows when the menu is open. The pane grows to
-/// this size when the terminal has room, while `menu_row_capacity` still
-/// keeps the popup bounded on short terminals.
-const MENU_PREFERRED_ROWS: usize = 7;
 /// Scrollback transcript (ADR-0005): finished rows print into the
 /// terminal's own scrollback via `insert_before` and are never touched
 /// again. `App` holds only a queue of pending `Line` groups; the event
@@ -425,7 +419,7 @@ fn menu_matches(input: &str) -> Vec<&'static Command> {
     if token.chars().any(|c| c.is_whitespace()) {
         return Vec::new();
     }
-    menu_matches_token(&token)
+    menu_matches_token(token)
 }
 
 /// Filter registry by token text. Shared by old + new paths.
@@ -594,6 +588,7 @@ fn menu_status_height(_app: &App) -> u16 {
     1
 }
 
+#[cfg(test)]
 fn menu_height(app: &App) -> u16 {
     // Zero: float box draws over pane, takes no layout rows.
     match is_menu_open(app) || is_menu_live(app) {
@@ -624,7 +619,11 @@ fn complete_menu_at_caret(app: &mut App) {
     let live = menu_live(&app.input, app.cursor);
     match live {
         MenuLive::Closed => {}
-        MenuLive::Commands { cmds, b_start, b_end } => {
+        MenuLive::Commands {
+            cmds,
+            b_start,
+            b_end,
+        } => {
             if cmds.is_empty() {
                 return;
             }
@@ -634,7 +633,11 @@ fn complete_menu_at_caret(app: &mut App) {
             app.cursor = app.input[..b_start + fill.len()].chars().count();
             clamp_menu_sel(app);
         }
-        MenuLive::Themes { names, b_start, b_end } => {
+        MenuLive::Themes {
+            names,
+            b_start,
+            b_end,
+        } => {
             if names.is_empty() {
                 return;
             }
@@ -718,14 +721,8 @@ struct App {
 /// Send head choice with typed note (Enter in note box).
 fn send_approval_with_comment(app: &mut App, comment: String) {
     match app.approval_sel.min(2) {
-        0 => resolve_approval(
-            app,
-            ApprovalDecision::Approve { comment },
-        ),
-        1 => resolve_approval(
-            app,
-            ApprovalDecision::ApproveAlways { comment },
-        ),
+        0 => resolve_approval(app, ApprovalDecision::Approve { comment }),
+        1 => resolve_approval(app, ApprovalDecision::ApproveAlways { comment }),
         _ => resolve_approval(app, ApprovalDecision::Deny { comment }),
     }
 }
@@ -785,7 +782,9 @@ fn resolve_approval(app: &mut App, decision: ApprovalDecision) {
         _ => String::new(),
     };
     let _ = req.reply.send(decision);
-    app.enqueue_notice(format!("permission {label}: {tool_name}({args_preview}){note_bit}"));
+    app.enqueue_notice(format!(
+        "permission {label}: {tool_name}({args_preview}){note_bit}"
+    ));
     // Clear box state for next head.
     app.approval_comment.clear();
     app.approval_comment_open = false;
@@ -975,7 +974,9 @@ impl App {
         self.dirty = true;
     }
     fn replay_json(&mut self, json: &str) {
-        let Ok(mut ctx) = crate::context::Context::from_json(json) else { return };
+        let Ok(mut ctx) = crate::context::Context::from_json(json) else {
+            return;
+        };
         let msgs = std::mem::take(ctx.messages_mut());
         self.replay_messages(&msgs);
     }
@@ -988,26 +989,43 @@ impl App {
                     let mut had_tool = false;
                     for c in content {
                         match c {
-                            UserContent::Text(t) if t.text.starts_with("Prior conversation summary:") => self.enqueue_notice(t.text.clone()),
+                            UserContent::Text(t)
+                                if t.text.starts_with("Prior conversation summary:") =>
+                            {
+                                self.enqueue_notice(t.text.clone())
+                            }
                             UserContent::Text(t) => texts.push(t.text.clone()),
                             UserContent::ToolResult(r) => {
                                 had_tool = true;
-                                let parts: Vec<&str> = r.content.iter().filter_map(|c| c.as_text()).collect();
+                                let parts: Vec<&str> =
+                                    r.content.iter().filter_map(|c| c.as_text()).collect();
                                 let output = parts.join("\n");
-                                let summary: String = output.lines().next().unwrap_or("").chars().take(120).collect();
+                                let summary: String = output
+                                    .lines()
+                                    .next()
+                                    .unwrap_or("")
+                                    .chars()
+                                    .take(120)
+                                    .collect();
                                 let w = self.term_width as usize;
-                                self.enqueue(crate::history::tool_row(&r.name, "", true, &summary, &output, w));
+                                self.enqueue(crate::history::tool_row(
+                                    &r.name, "", true, &summary, &output, w,
+                                ));
                             }
                             _ => {}
                         }
                     }
                     let body = texts.join("\n");
-                    if !had_tool && !body.trim().is_empty() { self.enqueue_user(&body); }
+                    if !had_tool && !body.trim().is_empty() {
+                        self.enqueue_user(&body);
+                    }
                 }
                 Message::Assistant { content, .. } => {
                     let mut body = String::new();
                     for c in content {
-                        if let AssistantContent::Text(t) = c { body.push_str(&t.text); }
+                        if let AssistantContent::Text(t) = c {
+                            body.push_str(&t.text);
+                        }
                     }
                     if !body.trim().is_empty() {
                         let w = self.term_width as usize;
@@ -1098,18 +1116,20 @@ fn event_loop(
             // in-progress record; the completed rows are the final record.
             app.streamed_tools = 0;
             app.finish_turn(&turn.events, &turn.result, started);
-            if turn.result.is_ok() {
-                if let Ok(msgs) = agent.export_sync() {
-                    if let Ok(conn) = crate::sessions::open() {
-                        let _ = crate::sessions::save_messages(&conn, &app.session_id, &msgs);
-                        let _ = crate::sessions::touch(&conn, &app.session_id);
-                        // Fallback title from user text; TODO: LLM generate_title (needs async).
-                        if app.session_title.is_empty() || app.session_title == "untitled" {
-                            if let Some(first) = app.history.iter().rev().find(|h| !h.starts_with('/')) {
-                                let t: String = first.chars().take(40).collect();
-                                if !t.is_empty() { let _ = crate::sessions::update_title(&conn, &app.session_id, &t); app.session_title = t; }
-                            }
-                        }
+            if turn.result.is_ok()
+                && let Ok(msgs) = agent.export_sync()
+                && let Ok(conn) = crate::sessions::open()
+            {
+                let _ = crate::sessions::save_messages(&conn, &app.session_id, &msgs);
+                let _ = crate::sessions::touch(&conn, &app.session_id);
+                // Fallback title from user text; TODO: LLM generate_title (needs async).
+                if (app.session_title.is_empty() || app.session_title == "untitled")
+                    && let Some(first) = app.history.iter().rev().find(|h| !h.starts_with('/'))
+                {
+                    let t: String = first.chars().take(40).collect();
+                    if !t.is_empty() {
+                        let _ = crate::sessions::update_title(&conn, &app.session_id, &t);
+                        app.session_title = t;
                     }
                 }
             }
@@ -1301,16 +1321,41 @@ fn handle_key(
     if app.session_picker.is_some() {
         match code {
             KeyCode::Char('/') => {
-                if let Some(p) = app.session_picker.as_mut() { p.list.filtering = true; }
+                if let Some(p) = app.session_picker.as_mut() {
+                    p.list.filtering = true;
+                }
             }
-            KeyCode::Char(c) if app.session_picker.as_ref().is_some_and(|p| p.list.filtering) => {
-                if let Some(p) = app.session_picker.as_mut() { p.list.filter.push(c); p.list.selected = 0; }
+            KeyCode::Char(c)
+                if app
+                    .session_picker
+                    .as_ref()
+                    .is_some_and(|p| p.list.filtering) =>
+            {
+                if let Some(p) = app.session_picker.as_mut() {
+                    p.list.filter.push(c);
+                    p.list.selected = 0;
+                }
             }
-            KeyCode::Backspace if app.session_picker.as_ref().is_some_and(|p| p.list.filtering) => {
-                if let Some(p) = app.session_picker.as_mut() { p.list.filter.pop(); p.list.selected = 0; }
+            KeyCode::Backspace
+                if app
+                    .session_picker
+                    .as_ref()
+                    .is_some_and(|p| p.list.filtering) =>
+            {
+                if let Some(p) = app.session_picker.as_mut() {
+                    p.list.filter.pop();
+                    p.list.selected = 0;
+                }
             }
-            KeyCode::Esc if app.session_picker.as_ref().is_some_and(|p| p.list.filtering) => {
-                if let Some(p) = app.session_picker.as_mut() { p.list.filtering = false; }
+            KeyCode::Esc
+                if app
+                    .session_picker
+                    .as_ref()
+                    .is_some_and(|p| p.list.filtering) =>
+            {
+                if let Some(p) = app.session_picker.as_mut() {
+                    p.list.filtering = false;
+                }
             }
             KeyCode::Char('j') | KeyCode::Char('k') | KeyCode::Up | KeyCode::Down => {
                 if let Some(p) = app.session_picker.as_mut() {
@@ -1326,16 +1371,28 @@ fn handle_key(
                 }
             }
             KeyCode::Char('a') | KeyCode::Char('A') => {
-                let show_all = !app.session_picker.as_ref().map(|p| p.show_all).unwrap_or(false);
+                let show_all = !app
+                    .session_picker
+                    .as_ref()
+                    .map(|p| p.show_all)
+                    .unwrap_or(false);
                 let root = picker_project_root();
                 match crate::sessions::open() {
                     Err(e) => app.enqueue_notice(format!("sessions: {e}")),
                     Ok(conn) => {
-                        let res = if show_all { crate::sessions::list_all(&conn) } else { crate::sessions::list_for_project(&conn, &root) };
+                        let res = if show_all {
+                            crate::sessions::list_all(&conn)
+                        } else {
+                            crate::sessions::list_for_project(&conn, &root)
+                        };
                         match res {
                             Err(e) => app.enqueue_notice(format!("sessions: {e}")),
                             Ok(items) => {
-                                app.session_picker = Some(SessionPicker { items, list: Default::default(), show_all });
+                                app.session_picker = Some(SessionPicker {
+                                    items,
+                                    list: Default::default(),
+                                    show_all,
+                                });
                             }
                         }
                     }
@@ -1343,7 +1400,9 @@ fn handle_key(
             }
             KeyCode::Enter => {
                 let picked = app.session_picker.as_ref().and_then(|p| {
-                    filtered_sessions(p).get(p.list.selected).map(|s| (s.id.clone(), s.title.clone()))
+                    filtered_sessions(p)
+                        .get(p.list.selected)
+                        .map(|s| (s.id.clone(), s.title.clone()))
                 });
                 app.session_picker = None;
                 match picked {
@@ -1355,8 +1414,13 @@ fn handle_key(
                                 app.session_id = s.id.clone();
                                 app.session_title = s.title.clone();
                                 match agent.import_sync(&s.messages_json) {
-                                    Ok(()) => { app.replay_json(&s.messages_json); app.enqueue_notice(format!("resumed {title}")) },
-                                    Err(e) => app.enqueue_notice(format!("resumed {title} (history import failed: {e})")),
+                                    Ok(()) => {
+                                        app.replay_json(&s.messages_json);
+                                        app.enqueue_notice(format!("resumed {title}"))
+                                    }
+                                    Err(e) => app.enqueue_notice(format!(
+                                        "resumed {title} (history import failed: {e})"
+                                    )),
                                 }
                             }
                             Ok(None) => app.enqueue_notice(format!("no session {id}")),
@@ -1674,9 +1738,15 @@ fn submit(
                                 }
                                 Ok(items) => {
                                     if items.is_empty() {
-                                        app.enqueue_notice("no sessions for this project (a: all)".to_string());
+                                        app.enqueue_notice(
+                                            "no sessions for this project (a: all)".to_string(),
+                                        );
                                     }
-                                    app.session_picker = Some(SessionPicker { items, list: Default::default(), show_all: false });
+                                    app.session_picker = Some(SessionPicker {
+                                        items,
+                                        list: Default::default(),
+                                        show_all: false,
+                                    });
                                 }
                             }
                         }
@@ -1692,8 +1762,14 @@ fn submit(
                             app.session_id = s.id.clone();
                             app.session_title = s.title.clone();
                             match agent.import_sync(&s.messages_json) {
-                                Ok(()) => { app.replay_json(&s.messages_json); app.enqueue_notice(format!("resumed {}", s.title)) },
-                                Err(e) => app.enqueue_notice(format!("resumed {} (history import failed: {e})", s.title)),
+                                Ok(()) => {
+                                    app.replay_json(&s.messages_json);
+                                    app.enqueue_notice(format!("resumed {}", s.title))
+                                }
+                                Err(e) => app.enqueue_notice(format!(
+                                    "resumed {} (history import failed: {e})",
+                                    s.title
+                                )),
                             }
                         }
                         Ok(None) => {
@@ -1728,11 +1804,34 @@ fn submit(
                 return false;
             }
             "fork" => {
-                let msgs = match agent.export_sync() { Ok(m) => m, Err(e) => { app.enqueue_notice(format!("fork failed: {e}")); return false; } };
-                let conn = match crate::sessions::open() { Ok(c) => c, Err(e) => { app.enqueue_notice(format!("fork failed: {e}")); return false; } };
-                match crate::sessions::create_session(&conn, &picker_project_root(), &agent.model_name()) {
+                let msgs = match agent.export_sync() {
+                    Ok(m) => m,
+                    Err(e) => {
+                        app.enqueue_notice(format!("fork failed: {e}"));
+                        return false;
+                    }
+                };
+                let conn = match crate::sessions::open() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        app.enqueue_notice(format!("fork failed: {e}"));
+                        return false;
+                    }
+                };
+                match crate::sessions::create_session(
+                    &conn,
+                    &picker_project_root(),
+                    &agent.model_name(),
+                ) {
                     Err(e) => app.enqueue_notice(format!("fork failed: {e}")),
-                    Ok(ns) => { let title = format!("{} (fork)", app.session_title); let _ = crate::sessions::save_messages(&conn, &ns.id, &msgs); let _ = crate::sessions::update_title(&conn, &ns.id, &title); app.session_id = ns.id.clone(); app.session_title = title.clone(); app.enqueue_notice(format!("forked as {title}")); }
+                    Ok(ns) => {
+                        let title = format!("{} (fork)", app.session_title);
+                        let _ = crate::sessions::save_messages(&conn, &ns.id, &msgs);
+                        let _ = crate::sessions::update_title(&conn, &ns.id, &title);
+                        app.session_id = ns.id.clone();
+                        app.session_title = title.clone();
+                        app.enqueue_notice(format!("forked as {title}"));
+                    }
                 }
                 return false;
             }
@@ -1880,17 +1979,7 @@ impl App {
     }
 
     fn pane_height(&self, term_width: u16) -> u16 {
-        let input_extra = self.visible_input_lines(term_width).saturating_sub(1) as u16;
-        let menu_extra = if is_menu_open(self) {
-            menu_row_count(&self.input)
-                .min(MENU_PREFERRED_ROWS)
-                .min(MENU_MAX_ROWS) as u16
-        } else {
-            0
-        };
-        PANE_ROWS
-            .saturating_add(input_extra)
-            .saturating_add(menu_extra)
+        PANE_ROWS.saturating_add(self.visible_input_lines(term_width).saturating_sub(1) as u16)
     }
 
     fn input_band_height(&self, term_width: u16, menu_open: bool) -> u16 {
@@ -2154,10 +2243,10 @@ fn render_pane_in(f: &mut ratatui::Frame, app: &mut App, area: Rect, with_modals
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // gap (terminal bg)
+            Constraint::Length(1),        // gap (terminal bg)
             Constraint::Length(status_h), // status (busy/approval/idle)
-            Constraint::Length(input_h), // shaded input band
-            Constraint::Length(1), // footer
+            Constraint::Length(input_h),  // shaded input band
+            Constraint::Length(1),        // footer
         ])
         .split(pane_area);
 
@@ -2229,6 +2318,7 @@ struct ApprovalDisplay {
     reason: String,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_approval_modal(
     f: &mut ratatui::Frame,
     area: Rect,
@@ -2288,7 +2378,10 @@ fn render_approval_modal(
             "Permission required".to_string(),
             Style::default().add_modifier(Modifier::BOLD),
         ),
-        Span::styled(format!("  [{}]", risk.0), Style::default().fg(risk.1).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("  [{}]", risk.0),
+            Style::default().fg(risk.1).add_modifier(Modifier::BOLD),
+        ),
     ];
     if queued > 1 {
         head.push(Span::styled(
@@ -2318,14 +2411,20 @@ fn render_approval_modal(
     ];
     if full {
         lines.push(Line::from(vec![Span::styled(
-            format!("# {}", match req.tool_name.as_str() {
-                "bash" => "Shell command",
-                "write" | "edit" => "File change",
-                _ => "Tool request",
-            }),
+            format!(
+                "# {}",
+                match req.tool_name.as_str() {
+                    "bash" => "Shell command",
+                    "write" | "edit" => "File change",
+                    _ => "Tool request",
+                }
+            ),
             Style::default().fg(theme.code_fg),
         )]));
-        lines.push(Line::from(vec![Span::styled(arg_line, Style::default().fg(theme.code_fg))]));
+        lines.push(Line::from(vec![Span::styled(
+            arg_line,
+            Style::default().fg(theme.code_fg),
+        )]));
     }
     if comment_open {
         lines.push(Line::from(vec![
@@ -2351,19 +2450,33 @@ fn render_approval_modal(
                 Style::default().fg(lvl_color).add_modifier(Modifier::BOLD),
             ),
         ]));
-        for (i, part) in why.chars().collect::<Vec<_>>().chunks(inner.width.max(1) as usize).enumerate() {
+        for (i, part) in why
+            .chars()
+            .collect::<Vec<_>>()
+            .chunks(inner.width.max(1) as usize)
+            .enumerate()
+        {
             if i >= 2 {
                 break;
             }
             let s: String = part.iter().collect();
-            lines.push(Line::from(vec![Span::styled(s, Style::default().fg(theme.code_fg))]));
+            lines.push(Line::from(vec![Span::styled(
+                s,
+                Style::default().fg(theme.code_fg),
+            )]));
         }
     }
     lines.truncate(inner.height as usize);
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
-fn action_span(num: &str, label: &str, index: usize, selected: usize, theme: &Theme) -> Span<'static> {
+fn action_span(
+    num: &str,
+    label: &str,
+    index: usize,
+    selected: usize,
+    theme: &Theme,
+) -> Span<'static> {
     match index == selected {
         true => Span::styled(
             format!("[{num}] {label}"),
@@ -2404,13 +2517,10 @@ fn picker_ago(updated_at: i64) -> String {
     }
 }
 
-fn render_session_picker(
-    f: &mut ratatui::Frame,
-    app: &App,
-    area: Rect,
-    theme: &Theme,
-) {
-    let Some(picker) = app.session_picker.as_ref() else { return; };
+fn render_session_picker(f: &mut ratatui::Frame, app: &App, area: Rect, theme: &Theme) {
+    let Some(picker) = app.session_picker.as_ref() else {
+        return;
+    };
     // Fixed taller box (grilled decision: fixed 12-15 rows outer).
     // Content = header + filter + rows + hint (+2 border). Up to
     // MAX_PICKER_ROWS session rows; longer lists window with scroll.
@@ -2434,7 +2544,11 @@ fn render_session_picker(
             .min(visible.len() - capacity)
     };
     let shown = visible.len().saturating_sub(start).min(capacity);
-    let scope = if picker.show_all { "all" } else { "this project" };
+    let scope = if picker.show_all {
+        "all"
+    } else {
+        "this project"
+    };
     let count_suffix = if visible.len() > shown {
         format!(" {}-{} of {}", start + 1, start + shown, visible.len())
     } else {
@@ -2465,9 +2579,20 @@ fn render_session_picker(
         )));
     }
     for (i, s) in visible.iter().skip(start).take(shown).enumerate() {
-        let short_proj = s.project_root.rsplit('/').next().unwrap_or(s.project_root.as_str()).to_string();
+        let short_proj = s
+            .project_root
+            .rsplit('/')
+            .next()
+            .unwrap_or(s.project_root.as_str())
+            .to_string();
         let id8: String = s.id.chars().take(8).collect();
-        let row = format!("{} — {} — {} · {}", s.title, short_proj, picker_ago(s.updated_at), id8);
+        let row = format!(
+            "{} — {} — {} · {}",
+            s.title,
+            short_proj,
+            picker_ago(s.updated_at),
+            id8
+        );
         let style = if start + i == sel {
             Style::default().bg(theme.menu_sel_bg)
         } else {
@@ -2475,19 +2600,33 @@ fn render_session_picker(
         };
         lines.push(Line::from(Span::styled(row, style)));
     }
-    let filter_hint = if picker.list.filtering { format!("filter: {}", picker.list.filter) } else { " / filter".to_string() };
+    let filter_hint = if picker.list.filtering {
+        format!("filter: {}", picker.list.filter)
+    } else {
+        " / filter".to_string()
+    };
     lines.push(Line::from(Span::styled(
-        format!("enter resume · j/k or arrows · ctrl-d/u ·{} · esc close", filter_hint),
+        format!(
+            "enter resume · j/k or arrows · ctrl-d/u ·{} · esc close",
+            filter_hint
+        ),
         Style::default().fg(theme.placeholder),
     )));
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
-fn filtered_sessions<'a>(picker: &'a SessionPicker) -> Vec<&'a crate::sessions::Session> {
+fn filtered_sessions(picker: &SessionPicker) -> Vec<&crate::sessions::Session> {
     let query = picker.list.filter.to_lowercase();
-    picker.items.iter().filter(|s| {
-        query.is_empty() || format!("{} {} {}", s.title, s.project_root, s.id).to_lowercase().contains(&query)
-    }).collect()
+    picker
+        .items
+        .iter()
+        .filter(|s| {
+            query.is_empty()
+                || format!("{} {} {}", s.title, s.project_root, s.id)
+                    .to_lowercase()
+                    .contains(&query)
+        })
+        .collect()
 }
 
 /// Gap row between the transcript and the bottom pane. Terminal
@@ -2579,17 +2718,18 @@ fn render_menu_float(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     // Hint row: gray `[hint]` of top pick when token done (space after).
     // Live token has no space yet, so hint shows for full-name match.
-    let mk_row = |selected: bool, marker: Span<'static>, body: Vec<Span<'static>>| -> Line<'static> {
-        let row_style = match selected {
-            true => Style::default().bg(theme.menu_sel_bg),
-            false => Style::default().bg(theme.pane_bg),
+    let mk_row =
+        |selected: bool, marker: Span<'static>, body: Vec<Span<'static>>| -> Line<'static> {
+            let row_style = match selected {
+                true => Style::default().bg(theme.menu_sel_bg),
+                false => Style::default().bg(theme.pane_bg),
+            };
+            let mut spans = vec![marker];
+            spans.extend(body);
+            let mut line = Line::from(spans);
+            line.style = row_style;
+            line
         };
-        let mut spans = vec![marker];
-        spans.extend(body);
-        let mut line = Line::from(spans);
-        line.style = row_style;
-        line
-    };
     let sel_style = |selected: bool| -> Style {
         match selected {
             true => Style::default()
@@ -2620,7 +2760,11 @@ fn render_menu_float(f: &mut ratatui::Frame, app: &App, area: Rect) {
                 true => format!("{name}  ●"),
                 false => name.clone(),
             };
-            lines.push(mk_row(selected, marker, vec![Span::styled(label, sel_style(selected))]));
+            lines.push(mk_row(
+                selected,
+                marker,
+                vec![Span::styled(label, sel_style(selected))],
+            ));
         }
     } else {
         let MenuLive::Commands { cmds, .. } = &live else {
@@ -2838,7 +2982,9 @@ mod tests {
     #[test]
     fn picker_lists_session_rows_in_taller_box() {
         let mut app = App::new("model".to_string(), "medium".to_string());
-        let items: Vec<_> = (0..5).map(|i| test_session(&format!("id{i:08}"), &format!("sess {i}"))).collect();
+        let items: Vec<_> = (0..5)
+            .map(|i| test_session(&format!("id{i:08}"), &format!("sess {i}")))
+            .collect();
         app.session_picker = Some(SessionPicker {
             items,
             list: Default::default(),
@@ -2850,7 +2996,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         for i in 0..5 {
-            assert!(text.contains(&format!("sess {i}")), "row {i} missing: {text}");
+            assert!(
+                text.contains(&format!("sess {i}")),
+                "row {i} missing: {text}"
+            );
         }
         assert!(text.contains("model"), "footer missing: {text}");
     }
@@ -2858,9 +3007,13 @@ mod tests {
     #[test]
     fn picker_windows_long_lists_around_selection() {
         let mut app = App::new("model".to_string(), "medium".to_string());
-        let items: Vec<_> = (0..20).map(|i| test_session(&format!("id{i:08}"), &format!("sess {i:02}"))).collect();
-        let mut list = crate::popup::ListState::default();
-        list.selected = 19;
+        let items: Vec<_> = (0..20)
+            .map(|i| test_session(&format!("id{i:08}"), &format!("sess {i:02}")))
+            .collect();
+        let list = crate::popup::ListState {
+            selected: 19,
+            ..Default::default()
+        };
         app.session_picker = Some(SessionPicker {
             items,
             list,
@@ -3158,7 +3311,10 @@ mod tests {
         // stays visible underneath.
         assert!(text.contains("test-model"), "footer missing: {text}");
         // Modal box sits above the footer; composer is covered by the box.
-        assert!(!text.contains("\u{276f} hello"), "composer must be covered: {text}");
+        assert!(
+            !text.contains("\u{276f} hello"),
+            "composer must be covered: {text}"
+        );
         // No fullscreen takeover: no cell carries the old rail_bg wash.
         // (Row 0 is box fill here — the 5-row box covers the 6-row pane.)
         assert!(
@@ -3166,7 +3322,10 @@ mod tests {
             "no rail_bg takeover allowed"
         );
         // Box interior keeps its fill for readability.
-        let box_row = rows.iter().position(|l| l.contains("Permission required")).unwrap();
+        let box_row = rows
+            .iter()
+            .position(|l| l.contains("Permission required"))
+            .unwrap();
         assert!(
             (box_row as u16..buf.area.height).any(|y| buf[(0, y)].bg == app.theme.pane_bg),
             "box must keep its shaded fill"
@@ -3385,12 +3544,12 @@ mod tests {
                 KeyModifiers::empty()
             ));
             let got = rx.blocking_recv().unwrap();
-            let ok = match (is, got) {
-                ("approve", ApprovalDecision::Approve { .. }) => true,
-                ("always", ApprovalDecision::ApproveAlways { .. }) => true,
-                ("deny", ApprovalDecision::Deny { .. }) => true,
-                _ => false,
-            };
+            let ok = matches!(
+                (is, got),
+                ("approve", ApprovalDecision::Approve { .. })
+                    | ("always", ApprovalDecision::ApproveAlways { .. })
+                    | ("deny", ApprovalDecision::Deny { .. })
+            );
             assert!(ok, "wrong choice for {is}");
         }
     }
@@ -3405,7 +3564,14 @@ mod tests {
             let agent = std::sync::Arc::new(StubAgent);
             let (tx, _rx) = mpsc::channel::<TurnResult>();
             let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
-            assert!(!handle_key(&mut app, &agent, &tx, &think_tx, key, KeyModifiers::empty()));
+            assert!(!handle_key(
+                &mut app,
+                &agent,
+                &tx,
+                &think_tx,
+                key,
+                KeyModifiers::empty()
+            ));
             assert!(matches!(
                 rx.blocking_recv().unwrap(),
                 ApprovalDecision::Deny { .. }
@@ -3424,12 +3590,40 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<TurnResult>();
         let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
         // Tab opens note box. Type `hi`. Enter sends with Yes (sel 0).
-        assert!(!handle_key(&mut app, &agent, &tx, &think_tx, KeyCode::Tab, KeyModifiers::empty()));
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Tab,
+            KeyModifiers::empty()
+        ));
         assert!(app.approval_comment_open);
-        assert!(!handle_key(&mut app, &agent, &tx, &think_tx, KeyCode::Char('h'), KeyModifiers::empty()));
-        assert!(!handle_key(&mut app, &agent, &tx, &think_tx, KeyCode::Char('i'), KeyModifiers::empty()));
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Char('h'),
+            KeyModifiers::empty()
+        ));
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Char('i'),
+            KeyModifiers::empty()
+        ));
         assert_eq!(app.approval_comment, "hi");
-        assert!(!handle_key(&mut app, &agent, &tx, &think_tx, KeyCode::Enter, KeyModifiers::empty()));
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Enter,
+            KeyModifiers::empty()
+        ));
         match rx.blocking_recv().unwrap() {
             ApprovalDecision::Approve { comment } => assert_eq!(comment, "hi"),
             other => panic!("wrong choice: {other:?}"),

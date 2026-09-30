@@ -114,12 +114,9 @@ fn parse_hex(hex: &str) -> Result<Color> {
     let hex = hex.trim().strip_prefix('#').unwrap_or(hex.trim());
     match hex.len() {
         6 => {
-            let r = u8::from_str_radix(&hex[0..2], 16)
-                .context("invalid hex red component")?;
-            let g = u8::from_str_radix(&hex[2..4], 16)
-                .context("invalid hex green component")?;
-            let b = u8::from_str_radix(&hex[4..6], 16)
-                .context("invalid hex blue component")?;
+            let r = u8::from_str_radix(&hex[0..2], 16).context("invalid hex red component")?;
+            let g = u8::from_str_radix(&hex[2..4], 16).context("invalid hex green component")?;
+            let b = u8::from_str_radix(&hex[4..6], 16).context("invalid hex blue component")?;
             Ok(Color::Rgb(r, g, b))
         }
         _ => anyhow::bail!("hex color must be #RRGGBB (6 digits), got: {hex}"),
@@ -177,9 +174,12 @@ impl Theme {
         let add = colors.add.unwrap_or_default();
         let del = colors.del.unwrap_or_default();
         let md = colors.markdown.unwrap_or_default();
-        let name = toml
-            .name
-            .unwrap_or_else(|| path.file_stem().unwrap_or_default().to_string_lossy().into_owned());
+        let name = toml.name.unwrap_or_else(|| {
+            path.file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        });
 
         Ok(Self {
             name,
@@ -352,8 +352,11 @@ blockquote_fg = "#928374"
         let path = dir.join("partial.toml");
         // Only accent set; everything else must equal the default.
         // A bad hex value also falls back instead of erroring.
-        std::fs::write(&path, "[colors]\naccent = \"#ff0000\"\nrail_bg = \"nope\"\n")
-            .unwrap();
+        std::fs::write(
+            &path,
+            "[colors]\naccent = \"#ff0000\"\nrail_bg = \"nope\"\n",
+        )
+        .unwrap();
         let t = Theme::load(&path).unwrap();
         let def = Theme::default();
         assert_eq!(t.accent, Color::Rgb(0xff, 0, 0));
@@ -372,8 +375,7 @@ blockquote_fg = "#928374"
         assert!(Theme::load(&dir.join("does-not-exist.toml")).is_err());
         let path = dir.join("corrupt.toml");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(&path, "[colors\nthis is not toml")
-            .unwrap();
+        std::fs::write(&path, "[colors\nthis is not toml").unwrap();
         assert!(Theme::load(&path).is_err());
         std::fs::remove_file(&path).ok();
     }
@@ -382,7 +384,10 @@ blockquote_fg = "#928374"
     fn upsert_theme_line_preserves_api_and_model() {
         let existing = "# my config\n\n[api]\nkey = \"sk-x\"\nbase_url = \"https://x\"\n\n[model]\ndefault = \"m\"\neffort = \"high\"\n";
         let out = upsert_theme_line(existing, "gruvbox");
-        assert!(out.contains("theme = \"gruvbox\""), "theme line missing: {out}");
+        assert!(
+            out.contains("theme = \"gruvbox\""),
+            "theme line missing: {out}"
+        );
         assert!(out.contains("[api]"), "api block lost: {out}");
         assert!(out.contains("key = \"sk-x\""), "api key lost: {out}");
         assert!(out.contains("[model]"), "model block lost: {out}");
@@ -398,7 +403,11 @@ blockquote_fg = "#928374"
     fn upsert_theme_line_replaces_existing() {
         let existing = "theme = \"old\"\n\n[api]\nkey = \"k\"\n";
         let out = upsert_theme_line(existing, "new");
-        assert_eq!(out.matches("theme =").count(), 1, "duplicate theme lines: {out}");
+        assert_eq!(
+            out.matches("theme =").count(),
+            1,
+            "duplicate theme lines: {out}"
+        );
         assert!(out.contains("theme = \"new\""), "not replaced: {out}");
         assert!(out.contains("[api]"), "api block lost: {out}");
     }

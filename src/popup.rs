@@ -1,6 +1,11 @@
-use crossterm::event::{KeyCode, KeyModifiers};
-use ratatui::{Frame, layout::Rect, style::Style, widgets::{Block, Borders}};
 use crate::theme::Theme;
+use crossterm::event::{KeyCode, KeyModifiers};
+use ratatui::{
+    Frame,
+    layout::Rect,
+    style::Style,
+    widgets::{Block, Borders},
+};
 
 /// Small float box with thin border. Fits text. Sits low in area.
 /// Same pane_bg fill. Border uses placeholder color. Width caps at max_w.
@@ -35,12 +40,24 @@ pub struct ListState {
 }
 
 impl ListState {
-    pub fn move_selection(&mut self, code: KeyCode, modifiers: KeyModifiers, len: usize, page: usize) -> bool {
-        if len == 0 { return false; }
+    pub fn move_selection(
+        &mut self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+        len: usize,
+        page: usize,
+    ) -> bool {
+        if len == 0 {
+            return false;
+        }
         let step = page.max(1);
         match (code, modifiers.contains(KeyModifiers::CONTROL)) {
-            (KeyCode::Char('j'), false) | (KeyCode::Down, false) => self.selected = (self.selected + 1).min(len - 1),
-            (KeyCode::Char('k'), false) | (KeyCode::Up, false) => self.selected = self.selected.saturating_sub(1),
+            (KeyCode::Char('j'), false) | (KeyCode::Down, false) => {
+                self.selected = (self.selected + 1).min(len - 1)
+            }
+            (KeyCode::Char('k'), false) | (KeyCode::Up, false) => {
+                self.selected = self.selected.saturating_sub(1)
+            }
             (KeyCode::Char('d'), true) => self.selected = (self.selected + step).min(len - 1),
             (KeyCode::Char('u'), true) => self.selected = self.selected.saturating_sub(step),
             _ => return false,

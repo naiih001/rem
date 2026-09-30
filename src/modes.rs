@@ -1,9 +1,9 @@
 //! Hard-coded permission modes for the interactive session.
 
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {
     Plan,
+    #[default]
     Manual,
     Auto,
     Edit,
@@ -19,9 +19,12 @@ impl Mode {
     }
 
     pub fn name(self) -> &'static str {
-        match self { Self::Plan => "plan", Self::Manual => "manual", Self::Auto => "auto", Self::Edit => "edit", Self::Yolo => "yolo" }
+        match self {
+            Self::Plan => "plan",
+            Self::Manual => "manual",
+            Self::Auto => "auto",
+            Self::Edit => "edit",
+            Self::Yolo => "yolo",
+        }
     }
-
 }
-
-impl Default for Mode { fn default() -> Self { Self::Manual } }

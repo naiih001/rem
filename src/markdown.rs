@@ -120,9 +120,7 @@ impl<'a> Renderer<'a> {
             }
             Event::Start(Tag::Item) => {
                 if let Some(list) = self.lists.last_mut() {
-                    if list.next == 1 && list.marker.is_empty() {
-                        list.marker = "•".to_string();
-                    } else if list.marker == "•" || list.marker.is_empty() {
+                    if list.marker.is_empty() || list.marker == "•" {
                         list.marker = "•".to_string();
                     } else {
                         list.marker = format!("{}.", list.next);
@@ -148,7 +146,10 @@ impl<'a> Renderer<'a> {
                 if let Some(url) = self.link_destinations.pop()
                     && !url.is_empty()
                 {
-                    self.push_span(format!(" ({url})"), Style::default().fg(self.theme.link_url_fg));
+                    self.push_span(
+                        format!(" ({url})"),
+                        Style::default().fg(self.theme.link_url_fg),
+                    );
                 }
             }
             Event::Start(Tag::Image { dest_url, .. }) => {
@@ -158,7 +159,10 @@ impl<'a> Renderer<'a> {
                 if let Some(url) = self.link_destinations.pop()
                     && !url.is_empty()
                 {
-                    self.push_span(format!(" ({url})"), Style::default().fg(self.theme.link_url_fg));
+                    self.push_span(
+                        format!(" ({url})"),
+                        Style::default().fg(self.theme.link_url_fg),
+                    );
                 }
             }
             Event::Start(Tag::Table(alignments)) => {
@@ -184,14 +188,15 @@ impl<'a> Renderer<'a> {
             }
             Event::Code(text) => self.push_span(
                 text.to_string(),
-                Style::default().fg(self.theme.code_fg).bg(self.theme.code_bg),
+                Style::default()
+                    .fg(self.theme.code_fg)
+                    .bg(self.theme.code_bg),
             ),
             Event::SoftBreak => self.push_span(" ".to_string(), self.style),
             Event::HardBreak => self.flush_line(),
-            Event::FootnoteReference(label) => self.push_span(
-                format!("[^{label}]"),
-                Style::default().fg(Color::DarkGray),
-            ),
+            Event::FootnoteReference(label) => {
+                self.push_span(format!("[^{label}]"), Style::default().fg(Color::DarkGray))
+            }
             Event::TaskListMarker(checked) => {
                 self.push_span(
                     if checked { "[x] " } else { "[ ] " }.to_string(),
@@ -203,7 +208,10 @@ impl<'a> Renderer<'a> {
     }
 
     fn table_event(&mut self, event: Event<'_>) {
-        let table = self.table.as_mut().expect("table event requires table state");
+        let table = self
+            .table
+            .as_mut()
+            .expect("table event requires table state");
         match event {
             Event::Start(Tag::TableHead) => {
                 table.in_row = true;
@@ -220,7 +228,10 @@ impl<'a> Renderer<'a> {
             Event::End(TagEnd::TableRow) => table.finish_row(),
             Event::Start(Tag::TableCell) => table.cell.clear(),
             Event::End(TagEnd::TableCell) => table.row.push(std::mem::take(&mut table.cell)),
-            Event::Text(value) | Event::Code(value) | Event::Html(value) | Event::InlineHtml(value) => {
+            Event::Text(value)
+            | Event::Code(value)
+            | Event::Html(value)
+            | Event::InlineHtml(value) => {
                 table.cell.push_str(&value);
             }
             Event::SoftBreak | Event::HardBreak => table.cell.push(' '),
@@ -250,16 +261,18 @@ impl<'a> Renderer<'a> {
         self.flush_line();
         for (row_index, row) in table.rows.iter().enumerate() {
             let wrapped_cells: Vec<Vec<String>> = (0..columns)
-                .map(|index| {
-                    wrap_cell(row.get(index).map_or("", String::as_str), widths[index])
-                })
+                .map(|index| wrap_cell(row.get(index).map_or("", String::as_str), widths[index]))
                 .collect();
             let row_height = wrapped_cells.iter().map(Vec::len).max().unwrap_or(1);
             for line_index in 0..row_height {
                 let mut spans = Vec::new();
                 for (column, cell_lines) in wrapped_cells.iter().enumerate() {
                     let value = cell_lines.get(line_index).map_or("", String::as_str);
-                    let alignment = table.alignments.get(column).copied().unwrap_or(Alignment::None);
+                    let alignment = table
+                        .alignments
+                        .get(column)
+                        .copied()
+                        .unwrap_or(Alignment::None);
                     let value = align_cell(value, widths[column], alignment);
                     let style = if row_index < table.header_rows {
                         Style::default().add_modifier(Modifier::BOLD)
@@ -295,7 +308,12 @@ impl<'a> Renderer<'a> {
         for raw in code.trim_end_matches('\n').split('\n') {
             let mut line = Line::from(vec![
                 Span::styled("  ", Style::default().bg(self.theme.code_bg)),
-                Span::styled(raw.to_string(), Style::default().fg(self.theme.code_fg).bg(self.theme.code_bg)),
+                Span::styled(
+                    raw.to_string(),
+                    Style::default()
+                        .fg(self.theme.code_fg)
+                        .bg(self.theme.code_bg),
+                ),
             ]);
             line.style = Style::default().bg(self.theme.code_bg);
             for wrapped in wrap_line(line, self.width) {
@@ -326,7 +344,7 @@ impl<'a> Renderer<'a> {
 
     fn flush_block(&mut self) {
         self.flush_line();
-        if !self.lines.is_empty() && !self.lines.last().map_or(true, |line| line.spans.is_empty()) {
+        if !self.lines.is_empty() && !self.lines.last().is_none_or(|line| line.spans.is_empty()) {
             self.lines.push(Line::from(""));
         }
     }
@@ -358,7 +376,10 @@ impl<'a> Renderer<'a> {
             prefix.push_str(&"│ ".repeat(self.quote_depth));
         }
         if !prefix.is_empty() {
-            spans.insert(0, Span::styled(prefix, Style::default().fg(Color::DarkGray)));
+            spans.insert(
+                0,
+                Span::styled(prefix, Style::default().fg(Color::DarkGray)),
+            );
         }
         self.lines.push(Line::from(spans));
     }
@@ -382,7 +403,6 @@ impl Table {
         }
     }
 }
-
 
 fn fit_columns(widths: &mut [usize], total_width: usize) {
     if widths.is_empty() {
@@ -501,7 +521,11 @@ mod tests {
             20,
             &theme,
         );
-        assert!(flatten(&lines).iter().any(|line| line.contains("Description")));
+        assert!(
+            flatten(&lines)
+                .iter()
+                .any(|line| line.contains("Description"))
+        );
         assert!(lines.iter().all(|line| {
             line.spans
                 .iter()

@@ -103,10 +103,7 @@ pub fn get_session(conn: &Connection, id: &str) -> Result<Option<Session>, Strin
     }
 }
 
-pub fn list_for_project(
-    conn: &Connection,
-    project_root: &str,
-) -> Result<Vec<Session>, String> {
+pub fn list_for_project(conn: &Connection, project_root: &str) -> Result<Vec<Session>, String> {
     let mut stmt = conn
         .prepare("SELECT id, project_root, title, created_at, updated_at, model, messages_json FROM sessions WHERE project_root = ?1 ORDER BY updated_at DESC")
         .map_err(|e| format!("list_for_project: {e}"))?;
@@ -126,11 +123,7 @@ pub fn list_all(conn: &Connection) -> Result<Vec<Session>, String> {
         .map_err(|e| format!("list_all: {e}"))
 }
 
-pub fn save_messages(
-    conn: &Connection,
-    id: &str,
-    messages_json: &str,
-) -> Result<(), String> {
+pub fn save_messages(conn: &Connection, id: &str, messages_json: &str) -> Result<(), String> {
     conn.execute(
         "UPDATE sessions SET messages_json = ?1, updated_at = ?2 WHERE id = ?3",
         rusqlite::params![messages_json, now(), id],

@@ -30,6 +30,8 @@ impl Context {
         &mut self.messages
     }
 
+    // Session-restore helper, kept for upcoming resume wiring.
+    #[allow(dead_code)]
     pub fn set_messages(&mut self, msgs: Vec<Message>) {
         self.messages = msgs;
     }

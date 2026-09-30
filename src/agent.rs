@@ -52,11 +52,23 @@ pub trait AgentLoop {
     fn effort_name(&self) -> String {
         "medium".to_string()
     }
-    fn mode_handle(&self) -> Arc<Mutex<Mode>> { Arc::new(Mutex::new(Mode::default())) }
-    async fn export_messages_json(&self) -> Result<String, String> { Err("not supported".to_string()) }
-    async fn import_messages_json(&self, _json: &str) -> Result<(), String> { Err("not supported".to_string()) }
-    fn export_sync(&self) -> Result<String, String> { Err("not supported".to_string()) }
-    fn import_sync(&self, _json: &str) -> Result<(), String> { Err("not supported".to_string()) }
+    fn mode_handle(&self) -> Arc<Mutex<Mode>> {
+        Arc::new(Mutex::new(Mode::default()))
+    }
+    // Trait surface for alternate `AgentLoop` impls; `RigAgent` overrides it.
+    #[allow(dead_code)]
+    async fn export_messages_json(&self) -> Result<String, String> {
+        Err("not supported".to_string())
+    }
+    async fn import_messages_json(&self, _json: &str) -> Result<(), String> {
+        Err("not supported".to_string())
+    }
+    fn export_sync(&self) -> Result<String, String> {
+        Err("not supported".to_string())
+    }
+    fn import_sync(&self, _json: &str) -> Result<(), String> {
+        Err("not supported".to_string())
+    }
 }
 
 /// One tool execution observed during a turn: what ran, with what args,
@@ -258,7 +270,8 @@ impl RigAgent {
             preamble.push_str(&body);
         }
 
-        let agent = AgentBuilder::new(model).preamble(&preamble)
+        let agent = AgentBuilder::new(model)
+            .preamble(&preamble)
             .tool(ReadTool)
             .tool(WriteTool)
             .tool(EditTool)
@@ -286,10 +299,14 @@ impl RigAgent {
         })
     }
 
+    // Wired up by upcoming session-title work (`generate_title` has a TODO
+    // at the call site); kept warning-free until then.
+    #[allow(dead_code)]
     pub async fn message_count(&self) -> usize {
         self.context.lock().await.len()
     }
 
+    #[allow(dead_code)]
     pub async fn generate_title(&self) -> Result<String, String> {
         self.agent
             .prompt("Give this coding session a short 2-5 word title, reply with title only")
@@ -378,12 +395,34 @@ impl AgentLoop for RigAgent {
     fn effort_name(&self) -> String {
         self.effort.clone()
     }
-    fn mode_handle(&self) -> Arc<Mutex<Mode>> { self.mode.clone() }
-    async fn export_messages_json(&self) -> Result<String, String> { self.context.lock().await.to_json() }
-    async fn import_messages_json(&self, json: &str) -> Result<(), String> { let ctx = Context::from_json(json)?; *self.context.lock().await = ctx; Ok(()) }
+    fn mode_handle(&self) -> Arc<Mutex<Mode>> {
+        self.mode.clone()
+    }
+    async fn export_messages_json(&self) -> Result<String, String> {
+        self.context.lock().await.to_json()
+    }
+    async fn import_messages_json(&self, json: &str) -> Result<(), String> {
+        let ctx = Context::from_json(json)?;
+        *self.context.lock().await = ctx;
+        Ok(())
+    }
     // Sync variants for the sync TUI submit path via try_lock (safe on runtime thread).
-    fn export_sync(&self) -> Result<String, String> { match self.context.try_lock() { Ok(g) => g.to_json(), Err(_) => Err("context busy, try again".to_string()) } }
-    fn import_sync(&self, json: &str) -> Result<(), String> { let ctx = Context::from_json(json)?; match self.context.try_lock() { Ok(mut g) => { *g = ctx; Ok(()) }, Err(_) => Err("context busy, try again".to_string()) } }
+    fn export_sync(&self) -> Result<String, String> {
+        match self.context.try_lock() {
+            Ok(g) => g.to_json(),
+            Err(_) => Err("context busy, try again".to_string()),
+        }
+    }
+    fn import_sync(&self, json: &str) -> Result<(), String> {
+        let ctx = Context::from_json(json)?;
+        match self.context.try_lock() {
+            Ok(mut g) => {
+                *g = ctx;
+                Ok(())
+            }
+            Err(_) => Err("context busy, try again".to_string()),
+        }
+    }
 }
 
 #[cfg(test)]

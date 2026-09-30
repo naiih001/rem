@@ -4,10 +4,10 @@ mod context;
 mod history;
 mod markdown;
 mod modes;
-mod theme;
 mod permissions;
 mod popup;
 mod sessions;
+mod theme;
 mod tools;
 mod tui;
 
@@ -127,7 +127,11 @@ async fn main() {
     // only the resume hint. Env var wins: /resume//fork inside the TUI
     // sync the final id there before returning.
     {
-        use crossterm::{cursor::MoveTo, execute, terminal::{Clear, ClearType}};
+        use crossterm::{
+            cursor::MoveTo,
+            execute,
+            terminal::{Clear, ClearType},
+        };
         let _ = execute!(
             std::io::stdout(),
             Clear(ClearType::All),
@@ -136,7 +140,11 @@ async fn main() {
         );
     }
     let sid = std::env::var("REM_SESSION_ID").unwrap_or_default();
-    let sid = if sid.is_empty() { session.id.clone() } else { sid };
+    let sid = if sid.is_empty() {
+        session.id.clone()
+    } else {
+        sid
+    };
     if !sid.is_empty() {
         println!("Session saved. Resume with: rem --resume {sid}");
     }

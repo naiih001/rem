@@ -22,10 +22,10 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use crate::modes::Mode;
 use rig::agent::{
     AgentHook, HookContext, ToolCall, ToolCallAction, ToolResultAction, ToolResultEvent,
 };
-use crate::modes::Mode;
 
 /// Pure policy verdict for one tool call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,29 +78,66 @@ pub fn approval_channel() -> (ApprovalTx, ApprovalRx) {
 pub const FAST_PATH_MAX_BYTES: usize = 32 * 1024;
 
 /// Classify one tool call. Pure: no I/O, no channel access.
+/// Legacy default policy (ADR-0002): equivalent to `Auto` — small
+/// in-project non-sensitive mutations take the fast-path. Session-scoped
+/// gating (Manual/Plan/Yolo) goes through [`classify_mode`].
+/// Unit tests exercise this; production uses [`classify_mode`].
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn classify(tool_name: &str, args: &serde_json::Value, project_root: &Path) -> Verdict {
-    classify_mode(tool_name, args, project_root, Mode::Manual)
+    classify_mode(tool_name, args, project_root, Mode::Auto)
 }
 
-pub fn classify_mode(tool_name: &str, args: &serde_json::Value, project_root: &Path, mode: Mode) -> Verdict {
-    if mode == Mode::Plan && !matches!(tool_name, "read" | "list_directory" | "glob" | "grep" | "git_status" | "git_diff") {
-        return Verdict::Deny { reason: format!("mode `plan` is read-only; `{tool_name}` is not permitted") };
+pub fn classify_mode(
+    tool_name: &str,
+    args: &serde_json::Value,
+    project_root: &Path,
+    mode: Mode,
+) -> Verdict {
+    if mode == Mode::Plan
+        && !matches!(
+            tool_name,
+            "read" | "list_directory" | "glob" | "grep" | "git_status" | "git_diff"
+        )
+    {
+        return Verdict::Deny {
+            reason: format!("mode `plan` is read-only; `{tool_name}` is not permitted"),
+        };
     }
-    if mode == Mode::Yolo && tool_name != "bash" { return Verdict::Allow; }
+    if mode == Mode::Yolo && tool_name != "bash" {
+        return Verdict::Allow;
+    }
     match tool_name {
         // Read-only tools: automatic.
         "read" | "list_directory" | "glob" | "grep" | "git_status" | "git_diff" => Verdict::Allow,
         // Mutations: approval, with a narrow auto fast-path.
-        "write" | "edit" => match mode { Mode::Manual => Verdict::Confirm { reason: "manual mode requires approval".into() }, Mode::Auto | Mode::Edit | Mode::Yolo => classify_mutate(tool_name, args, project_root), Mode::Plan => unreachable!() },
+        "write" | "edit" => match mode {
+            Mode::Manual => Verdict::Confirm {
+                reason: "manual mode requires approval".into(),
+            },
+            Mode::Auto | Mode::Edit | Mode::Yolo => classify_mutate(tool_name, args, project_root),
+            Mode::Plan => unreachable!(),
+        },
         // Shell: the whole threat model lives here.
         "bash" => classify_bash(args),
         // Network tools: approval per user spec.
-        "web_fetch" => if mode == Mode::Yolo { Verdict::Allow } else { Verdict::Confirm {
-            reason: "network fetch needs approval".to_string(),
-        } },
-        "web_search" => if mode == Mode::Yolo { Verdict::Allow } else { Verdict::Confirm {
-            reason: "network search needs approval".to_string(),
-        } },
+        "web_fetch" => {
+            if mode == Mode::Yolo {
+                Verdict::Allow
+            } else {
+                Verdict::Confirm {
+                    reason: "network fetch needs approval".to_string(),
+                }
+            }
+        }
+        "web_search" => {
+            if mode == Mode::Yolo {
+                Verdict::Allow
+            } else {
+                Verdict::Confirm {
+                    reason: "network search needs approval".to_string(),
+                }
+            }
+        }
         // Unknown future tools: fail closed to approval, never auto.
         _ => Verdict::Confirm {
             reason: format!("unknown tool `{tool_name}` needs approval"),
@@ -651,9 +688,7 @@ impl AgentHook for PermissionHook {
         match note {
             Some(n) if !n.trim().is_empty() => {
                 let base = event.presentation.render();
-                ToolResultAction::rewrite(format!(
-                    "{base}\n\n[user note on approval: {n}]"
-                ))
+                ToolResultAction::rewrite(format!("{base}\n\n[user note on approval: {n}]"))
             }
             _ => ToolResultAction::keep(),
         }
