@@ -232,7 +232,6 @@ pub struct RigAgent {
     // Rebuild inputs for `/skills reload`: the inner `Agent` is frozen at
     // build time, so reload re-runs `build_inner` with a fresh skill scan.
     cfg: Config,
-    approval_tx: ApprovalTx,
     project_root: std::path::PathBuf,
     gate: PermissionHook,
     skills: Arc<Mutex<Vec<crate::skills::Skill>>>,
@@ -255,19 +254,10 @@ impl RigAgent {
         approval_tx: ApprovalTx,
         project_root: std::path::PathBuf,
     ) -> Result<Self, String> {
-        // Explicit `.base_url()` per spec — no reliance on OPENAI_BASE_URL env.
-        let client = openai::CompletionsClient::builder()
-            .api_key(cfg.api.key.clone())
-            .base_url(cfg.api.base_url.clone())
-            .build()
-            .map_err(|e| format!("failed to build LLM client: {e}"))?;
-
-        let model = client.completion_model(cfg.model.default.clone());
-
         let recorder = ToolRecorder::default();
         let mode = Arc::new(Mutex::new(Mode::default()));
         // Observer first (see everything), gate second (steers). ADR-0001.
-        let gate = PermissionHook::new(approval_tx.clone(), project_root.clone(), mode.clone());
+        let gate = PermissionHook::new(approval_tx, project_root.clone(), mode.clone());
         let skills = crate::skills::discover(&project_root);
 
         let agent = Self::build_inner(cfg, &gate, &recorder, &project_root, &skills)?;
@@ -280,7 +270,6 @@ impl RigAgent {
             effort: cfg.model.effort.clone(),
             mode,
             cfg: cfg.clone(),
-            approval_tx,
             project_root,
             gate,
             skills: Arc::new(Mutex::new(skills)),
