@@ -204,12 +204,19 @@ fn first_line(s: &str, max: usize) -> String {
 /// Conversation history is caller-owned in [`Context`]: tool outputs are
 /// truncated on entry and old turns are summarized past 100 messages.
 pub struct RigAgent {
-    agent: rig::agent::Agent,
+    inner: tokio::sync::RwLock<rig::agent::Agent>,
     context: tokio::sync::Mutex<Context>,
     recorder: ToolRecorder,
     model_name: String,
     effort: String,
     mode: Arc<Mutex<Mode>>,
+    // Rebuild inputs for `/skills reload`: the inner `Agent` is frozen at
+    // build time, so reload re-runs `build_inner` with a fresh skill scan.
+    cfg: Config,
+    approval_tx: ApprovalTx,
+    project_root: std::path::PathBuf,
+    gate: PermissionHook,
+    skills: Arc<Mutex<Vec<crate::skills::Skill>>>,
 }
 
 /// Project instructions file name, loaded from the project root only.
@@ -241,7 +248,44 @@ impl RigAgent {
         let recorder = ToolRecorder::default();
         let mode = Arc::new(Mutex::new(Mode::default()));
         // Observer first (see everything), gate second (steers). ADR-0001.
-        let gate = PermissionHook::new(approval_tx, project_root.clone(), mode.clone());
+        let gate = PermissionHook::new(approval_tx.clone(), project_root.clone(), mode.clone());
+        let skills = crate::skills::discover(&project_root);
+
+        let agent = Self::build_inner(cfg, &gate, &recorder, &project_root, &skills)?;
+
+        Ok(Self {
+            inner: tokio::sync::RwLock::new(agent),
+            context: tokio::sync::Mutex::new(Context::new()),
+            recorder,
+            model_name: cfg.model.default.clone(),
+            effort: cfg.model.effort.clone(),
+            mode,
+            cfg: cfg.clone(),
+            approval_tx,
+            project_root,
+            gate,
+            skills: Arc::new(Mutex::new(skills)),
+        })
+    }
+
+    /// Build the inner `rig::agent::Agent`: client + preamble (static +
+    /// AGENTS.md + skills index) + 11 tools + hooks. Pure constructor —
+    /// called at startup and on `/skills reload`.
+    fn build_inner(
+        cfg: &Config,
+        gate: &PermissionHook,
+        recorder: &ToolRecorder,
+        project_root: &std::path::Path,
+        skills: &[crate::skills::Skill],
+    ) -> Result<rig::agent::Agent, String> {
+        // Explicit `.base_url()` per spec — no reliance on OPENAI_BASE_URL env.
+        let client = openai::CompletionsClient::builder()
+            .api_key(cfg.api.key.clone())
+            .base_url(cfg.api.base_url.clone())
+            .build()
+            .map_err(|e| format!("failed to build LLM client: {e}"))?;
+
+        let model = client.completion_model(cfg.model.default.clone());
 
         let mut preamble = String::from(
             "You are rem, a coding agent in a terminal TUI. \
@@ -253,9 +297,13 @@ impl RigAgent {
         );
         // Project context (ADR-0009): project-root AGENTS.md only, appended
         // after static instructions, silently skipped when missing.
-        if let Some(body) = load_agents_md(&project_root) {
+        if let Some(body) = load_agents_md(project_root) {
             preamble.push_str(AGENTS_MD_HEADER);
             preamble.push_str(&body);
+        }
+        // Skills index: names+descriptions+paths at startup, bodies via `read`.
+        if !skills.is_empty() {
+            preamble.push_str(&crate::skills::preamble_section(skills));
         }
 
         let agent = AgentBuilder::new(model).preamble(&preamble)
@@ -273,17 +321,10 @@ impl RigAgent {
             .default_max_turns(100)
             .additional_params(serde_json::json!({"reasoning_effort": cfg.model.effort.clone()}))
             .add_hook(recorder.clone())
-            .add_hook(gate)
+            .add_hook(gate.clone())
             .build();
 
-        Ok(Self {
-            agent,
-            context: tokio::sync::Mutex::new(Context::new()),
-            recorder,
-            model_name: cfg.model.default.clone(),
-            effort: cfg.model.effort.clone(),
-            mode,
-        })
+        Ok(agent)
     }
 
     pub async fn message_count(&self) -> usize {
@@ -291,7 +332,7 @@ impl RigAgent {
     }
 
     pub async fn generate_title(&self) -> Result<String, String> {
-        self.agent
+        self.inner.read().await
             .prompt("Give this coding session a short 2-5 word title, reply with title only")
             .preamble("You name coding sessions. Reply with a short title only.")
             .tool_choice(ToolChoice::None)
@@ -321,9 +362,13 @@ impl AgentLoop for RigAgent {
             guard.clear();
         }
 
-        let reply = Chat::chat(&self.agent, prompt, ctx.messages_mut())
+        // Read-lock the inner agent for the turn. Safe: hooks never lock
+        // `inner` or `context`, so no lock cycle with `ctx` held.
+        let inner = self.inner.read().await;
+        let reply = Chat::chat(&*inner, prompt, ctx.messages_mut())
             .await
             .map_err(|e| e.to_string())?;
+        drop(inner);
 
         // Truncate newly committed tool outputs so they don't eat the window.
         ctx.truncate_new(before);
@@ -334,7 +379,7 @@ impl AgentLoop for RigAgent {
             // Summarize WITHOUT tools and WITHOUT history: a plain one-shot
             // call so the summary can't recurse into compaction or tool loops.
             match self
-                .agent
+                .inner.read().await
                 .prompt(material)
                 .preamble(SUMMARIZER_PROMPT)
                 .tool_choice(ToolChoice::None)
