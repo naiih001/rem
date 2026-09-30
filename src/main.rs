@@ -6,6 +6,7 @@ mod markdown;
 mod modes;
 mod theme;
 mod permissions;
+mod popup;
 mod sessions;
 mod tools;
 mod tui;
