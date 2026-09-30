@@ -109,8 +109,24 @@ fn first_nonempty_line(body: &str) -> Option<String> {
     body.lines().map(str::trim).find(|l| !l.is_empty()).map(str::to_string)
 }
 
-fn list_siblings(_dir: &std::path::Path) -> Vec<String> {
-    Vec::new() // Task 3
+fn list_siblings(dir: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else { return out; };
+    let mut stack: Vec<std::path::PathBuf> = entries.filter_map(|e| e.ok().map(|x| x.path())).collect();
+    while let Some(p) = stack.pop() {
+        if p.is_dir() {
+            if let Ok(es) = std::fs::read_dir(&p) {
+                for e in es.filter_map(|x| x.ok()) { stack.push(e.path()); }
+            }
+            continue;
+        }
+        if p.file_name().map(|n| n == "SKILL.md").unwrap_or(false) { continue; }
+        if let Ok(rel) = p.strip_prefix(dir) {
+            out.push(rel.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    out.sort();
+    out
 }
 
 #[cfg(test)]
@@ -155,6 +171,19 @@ mod tests {
         assert_eq!(s.name, "pdf");
         assert!(!s.body.is_empty());
         assert!(s.note.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lists_siblings_sorted_excluding_skill_md() {
+        let dir = std::env::temp_dir().join("rem-skill-test-sib");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("scripts")).unwrap();
+        std::fs::write(dir.join("SKILL.md"), "x\n").unwrap();
+        std::fs::write(dir.join("reference.md"), "x\n").unwrap();
+        std::fs::write(dir.join("scripts/helper.py"), "x\n").unwrap();
+        let sibs = list_siblings(&dir);
+        assert_eq!(sibs, vec!["reference.md".to_string(), "scripts/helper.py".to_string()]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
