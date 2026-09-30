@@ -271,7 +271,7 @@ mod tests {
         assert!(text.contains("Work PDFs."), "got: {text}");
         assert!(text.contains("/r/.agents/skills/pdf/SKILL.md"), "got: {text}");
         assert!(text.contains("reference.md"), "got: {text}");
-        assert!(text.contains("/skill:pdf"), "got: {text}");
+        assert!(text.contains("/skill:<name>"), "got: {text}");
     }
 
     #[test]
