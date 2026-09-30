@@ -1,0 +1,30 @@
+# Gruvbox Light — upstream: github.com/morhetz/gruvbox (master)
+# bg light0 #fbf1c7 · light1 #ebdbb2 · gray #928374 · faded_* accents
+name = "gruvbox-light"
+
+[colors]
+accent = "#d79921"
+pane_bg = "#fbf1c7"
+rail_bg = "#fbf1c7"
+placeholder = "#bdae93"
+menu_sel_bg = "#ebdbb2"
+
+[colors.add]
+bg = "#e8e4c8"
+fg = "#79740e"
+mark = "#5c580b"
+
+[colors.del]
+bg = "#f0d9c5"
+fg = "#9d0006"
+mark = "#7a0005"
+
+[colors.markdown]
+code_bg = "#ebdbb2"
+heading_h1 = "#d79921"
+heading_h2 = "#076678"
+heading_h3 = "#8f3f71"
+link_fg = "#076678"
+link_url_fg = "#928374"
+code_fg = "#3c3836"
+blockquote_fg = "#7c6f64"

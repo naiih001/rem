@@ -1,0 +1,30 @@
+# Catppuccin Macchiato — upstream: github.com/catppuccin/palette (macchiato)
+# base #24273a · mantle #1e2030 · text #cad3f5
+name = "catppuccin-macchiato"
+
+[colors]
+accent = "#c6a0f6"
+pane_bg = "#24273a"
+rail_bg = "#1e2030"
+placeholder = "#6e738d"
+menu_sel_bg = "#363a4f"
+
+[colors.add]
+bg = "#223226"
+fg = "#a6da95"
+mark = "#6da35f"
+
+[colors.del]
+bg = "#35232c"
+fg = "#ed8796"
+mark = "#c94f6d"
+
+[colors.markdown]
+code_bg = "#1e2030"
+heading_h1 = "#c6a0f6"
+heading_h2 = "#8aadf4"
+heading_h3 = "#f5bde6"
+link_fg = "#91d7e3"
+link_url_fg = "#8087a2"
+code_fg = "#cad3f5"
+blockquote_fg = "#939ab7"

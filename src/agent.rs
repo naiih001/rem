@@ -16,6 +16,7 @@ use rig::{
 use crate::{
     config::Config,
     context::Context,
+    modes::Mode,
     permissions::{ApprovalTx, PermissionHook},
     tools::{
         BashTool, EditTool, GitDiffTool, GitStatusTool, GlobTool, GrepTool, ListDirectoryTool,
@@ -50,6 +51,23 @@ pub trait AgentLoop {
     /// param. Defaulted for other impls.
     fn effort_name(&self) -> String {
         "medium".to_string()
+    }
+    fn mode_handle(&self) -> Arc<Mutex<Mode>> {
+        Arc::new(Mutex::new(Mode::default()))
+    }
+    // Trait surface for alternate `AgentLoop` impls; `RigAgent` overrides it.
+    #[allow(dead_code)]
+    async fn export_messages_json(&self) -> Result<String, String> {
+        Err("not supported".to_string())
+    }
+    async fn import_messages_json(&self, _json: &str) -> Result<(), String> {
+        Err("not supported".to_string())
+    }
+    fn export_sync(&self) -> Result<String, String> {
+        Err("not supported".to_string())
+    }
+    fn import_sync(&self, _json: &str) -> Result<(), String> {
+        Err("not supported".to_string())
     }
 }
 
@@ -203,6 +221,18 @@ pub struct RigAgent {
     recorder: ToolRecorder,
     model_name: String,
     effort: String,
+    mode: Arc<Mutex<Mode>>,
+}
+
+/// Project instructions file name, loaded from the project root only.
+const AGENTS_MD: &str = "AGENTS.md";
+/// Header separating static instructions from project context in the preamble.
+const AGENTS_MD_HEADER: &str = "\n\nProject context from AGENTS.md:\n";
+
+/// Load project-root `AGENTS.md` verbatim. No cap, no transform.
+/// Returns `None` when missing/unreadable (caller silently skips).
+fn load_agents_md(project_root: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(project_root.join(AGENTS_MD)).ok()
 }
 
 impl RigAgent {
@@ -213,26 +243,35 @@ impl RigAgent {
     ) -> Result<Self, String> {
         // Explicit `.base_url()` per spec — no reliance on OPENAI_BASE_URL env.
         let client = openai::CompletionsClient::builder()
-            .api_key(cfg.api_key.clone())
-            .base_url(cfg.base_url.clone())
+            .api_key(cfg.api.key.clone())
+            .base_url(cfg.api.base_url.clone())
             .build()
             .map_err(|e| format!("failed to build LLM client: {e}"))?;
 
-        let model = client.completion_model(cfg.model.clone());
+        let model = client.completion_model(cfg.model.default.clone());
 
         let recorder = ToolRecorder::default();
+        let mode = Arc::new(Mutex::new(Mode::default()));
         // Observer first (see everything), gate second (steers). ADR-0001.
-        let gate = PermissionHook::new(approval_tx, project_root);
+        let gate = PermissionHook::new(approval_tx, project_root.clone(), mode.clone());
+
+        let mut preamble = String::from(
+            "You are rem, a coding agent in a terminal TUI. \
+             Use the read/write/edit/bash/list_directory/git_status/git_diff/grep/glob/web_fetch/web_search tools to inspect and change files. \
+             list_directory lists a dir, glob finds files by pattern, grep searches contents, git_status/git_diff inspect git state. \
+             web_search searches the web (DuckDuckGo, no key), web_fetch reads a URL as text. \
+             Bash runs `sh -c` in the project dir (30s timeout). Destructive shell patterns are blocked outright; other mutations and network access ask the human for approval mid-run — if a call is denied, replan without it. \
+             Prefer reading a file before editing it. Keep replies concise.",
+        );
+        // Project context (ADR-0009): project-root AGENTS.md only, appended
+        // after static instructions, silently skipped when missing.
+        if let Some(body) = load_agents_md(&project_root) {
+            preamble.push_str(AGENTS_MD_HEADER);
+            preamble.push_str(&body);
+        }
 
         let agent = AgentBuilder::new(model)
-            .preamble(
-                "You are rem, a coding agent in a terminal TUI. \
-                 Use the read/write/edit/bash/list_directory/git_status/git_diff/grep/glob/web_fetch/web_search tools to inspect and change files. \
-                 list_directory lists a dir, glob finds files by pattern, grep searches contents, git_status/git_diff inspect git state. \
-                 web_search searches the web (DuckDuckGo, no key), web_fetch reads a URL as text. \
-                 Bash runs `sh -c` in the project dir (30s timeout). Destructive shell patterns are blocked outright; other mutations and network access ask the human for approval mid-run — if a call is denied, replan without it. \
-                 Prefer reading a file before editing it. Keep replies concise.",
-            )
+            .preamble(&preamble)
             .tool(ReadTool)
             .tool(WriteTool)
             .tool(EditTool)
@@ -245,7 +284,7 @@ impl RigAgent {
             .tool(WebFetchTool)
             .tool(WebSearchTool)
             .default_max_turns(100)
-            .additional_params(serde_json::json!({"reasoning_effort": cfg.effort.clone()}))
+            .additional_params(serde_json::json!({"reasoning_effort": cfg.model.effort.clone()}))
             .add_hook(recorder.clone())
             .add_hook(gate)
             .build();
@@ -254,9 +293,28 @@ impl RigAgent {
             agent,
             context: tokio::sync::Mutex::new(Context::new()),
             recorder,
-            model_name: cfg.model.clone(),
-            effort: cfg.effort.clone(),
+            model_name: cfg.model.default.clone(),
+            effort: cfg.model.effort.clone(),
+            mode,
         })
+    }
+
+    // Wired up by upcoming session-title work (`generate_title` has a TODO
+    // at the call site); kept warning-free until then.
+    #[allow(dead_code)]
+    pub async fn message_count(&self) -> usize {
+        self.context.lock().await.len()
+    }
+
+    #[allow(dead_code)]
+    pub async fn generate_title(&self) -> Result<String, String> {
+        self.agent
+            .prompt("Give this coding session a short 2-5 word title, reply with title only")
+            .preamble("You name coding sessions. Reply with a short title only.")
+            .tool_choice(ToolChoice::None)
+            .await
+            .map_err(|e| e.to_string())
+            .map(|s| s.trim().to_string())
     }
 }
 
@@ -336,5 +394,60 @@ impl AgentLoop for RigAgent {
 
     fn effort_name(&self) -> String {
         self.effort.clone()
+    }
+    fn mode_handle(&self) -> Arc<Mutex<Mode>> {
+        self.mode.clone()
+    }
+    async fn export_messages_json(&self) -> Result<String, String> {
+        self.context.lock().await.to_json()
+    }
+    async fn import_messages_json(&self, json: &str) -> Result<(), String> {
+        let ctx = Context::from_json(json)?;
+        *self.context.lock().await = ctx;
+        Ok(())
+    }
+    // Sync variants for the sync TUI submit path via try_lock (safe on runtime thread).
+    fn export_sync(&self) -> Result<String, String> {
+        match self.context.try_lock() {
+            Ok(g) => g.to_json(),
+            Err(_) => Err("context busy, try again".to_string()),
+        }
+    }
+    fn import_sync(&self, json: &str) -> Result<(), String> {
+        let ctx = Context::from_json(json)?;
+        match self.context.try_lock() {
+            Ok(mut g) => {
+                *g = ctx;
+                Ok(())
+            }
+            Err(_) => Err("context busy, try again".to_string()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_agents_md_returns_none_when_missing() {
+        let dir = std::env::temp_dir().join("rem-test-no-agents-md-xyz");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(load_agents_md(&dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_agents_md_returns_verbatim_body() {
+        let dir = std::env::temp_dir().join("rem-test-agents-md-xyz");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "# rules\nUse tabs.\n").unwrap();
+        assert_eq!(
+            load_agents_md(&dir).as_deref(),
+            Some("# rules\nUse tabs.\n")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

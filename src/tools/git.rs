@@ -71,11 +71,11 @@ impl Tool for GitDiffTool {
         if args.staged.unwrap_or(false) {
             argv.push("--staged".to_string());
         }
-        if let Some(p) = args.path.as_deref() {
-            if !p.is_empty() {
-                argv.push("--".to_string());
-                argv.push(p.to_string());
-            }
+        if let Some(p) = args.path.as_deref()
+            && !p.is_empty()
+        {
+            argv.push("--".to_string());
+            argv.push(p.to_string());
         }
         run_git(argv).await
     }

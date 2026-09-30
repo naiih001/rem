@@ -22,7 +22,10 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use rig::agent::{AgentHook, HookContext, ToolCall, ToolCallAction};
+use crate::modes::Mode;
+use rig::agent::{
+    AgentHook, HookContext, ToolCall, ToolCallAction, ToolResultAction, ToolResultEvent,
+};
 
 /// Pure policy verdict for one tool call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,16 +39,17 @@ pub enum Verdict {
 }
 
 /// Human decision sent back over the oneshot.
+/// `comment` is free text from Tab field. Empty = no note.
+/// Yes-note is hidden from chat, seen by AI only.
+/// No-note is sent as deny reason.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApprovalDecision {
     /// Run this call.
-    Approve,
+    Approve { comment: String },
     /// Run this call and remember the session rule.
-    ApproveAlways,
+    ApproveAlways { comment: String },
     /// Skip this call, model replans in the same run.
-    Deny,
-    /// Stop the whole turn.
-    AbortTurn,
+    Deny { comment: String },
 }
 
 /// Request parked in the TUI approval modal.
@@ -74,21 +78,66 @@ pub fn approval_channel() -> (ApprovalTx, ApprovalRx) {
 pub const FAST_PATH_MAX_BYTES: usize = 32 * 1024;
 
 /// Classify one tool call. Pure: no I/O, no channel access.
+/// Legacy default policy (ADR-0002): equivalent to `Auto` — small
+/// in-project non-sensitive mutations take the fast-path. Session-scoped
+/// gating (Manual/Plan/Yolo) goes through [`classify_mode`].
+/// Unit tests exercise this; production uses [`classify_mode`].
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn classify(tool_name: &str, args: &serde_json::Value, project_root: &Path) -> Verdict {
+    classify_mode(tool_name, args, project_root, Mode::Auto)
+}
+
+pub fn classify_mode(
+    tool_name: &str,
+    args: &serde_json::Value,
+    project_root: &Path,
+    mode: Mode,
+) -> Verdict {
+    if mode == Mode::Plan
+        && !matches!(
+            tool_name,
+            "read" | "list_directory" | "glob" | "grep" | "git_status" | "git_diff"
+        )
+    {
+        return Verdict::Deny {
+            reason: format!("mode `plan` is read-only; `{tool_name}` is not permitted"),
+        };
+    }
+    if mode == Mode::Yolo && tool_name != "bash" {
+        return Verdict::Allow;
+    }
     match tool_name {
         // Read-only tools: automatic.
         "read" | "list_directory" | "glob" | "grep" | "git_status" | "git_diff" => Verdict::Allow,
         // Mutations: approval, with a narrow auto fast-path.
-        "write" | "edit" => classify_mutate(tool_name, args, project_root),
+        "write" | "edit" => match mode {
+            Mode::Manual => Verdict::Confirm {
+                reason: "manual mode requires approval".into(),
+            },
+            Mode::Auto | Mode::Edit | Mode::Yolo => classify_mutate(tool_name, args, project_root),
+            Mode::Plan => unreachable!(),
+        },
         // Shell: the whole threat model lives here.
         "bash" => classify_bash(args),
         // Network tools: approval per user spec.
-        "web_fetch" => Verdict::Confirm {
-            reason: "network fetch needs approval".to_string(),
-        },
-        "web_search" => Verdict::Confirm {
-            reason: "network search needs approval".to_string(),
-        },
+        "web_fetch" => {
+            if mode == Mode::Yolo {
+                Verdict::Allow
+            } else {
+                Verdict::Confirm {
+                    reason: "network fetch needs approval".to_string(),
+                }
+            }
+        }
+        "web_search" => {
+            if mode == Mode::Yolo {
+                Verdict::Allow
+            } else {
+                Verdict::Confirm {
+                    reason: "network search needs approval".to_string(),
+                }
+            }
+        }
         // Unknown future tools: fail closed to approval, never auto.
         _ => Verdict::Confirm {
             reason: format!("unknown tool `{tool_name}` needs approval"),
@@ -539,20 +588,54 @@ pub fn rule_key(tool_name: &str, args: &serde_json::Value) -> String {
 // ---------------------------------------------------------------------------
 
 /// Rig pre-tool gate. Holds the approval sender, the project root for the
-/// mutate fast-path, and session-scoped always-allow rules.
+/// mutate fast-path, session-scoped always-allow rules, and pending
+/// Yes-notes keyed by rig internal call id (hidden from chat, seen by AI).
 #[derive(Debug, Clone)]
 pub struct PermissionHook {
     tx: ApprovalTx,
     project_root: PathBuf,
     session_allows: Arc<Mutex<HashSet<String>>>,
+    mode: Arc<Mutex<Mode>>,
+    pending_notes: Arc<Mutex<std::collections::HashMap<String, String>>>,
 }
 
 impl PermissionHook {
-    pub fn new(tx: ApprovalTx, project_root: PathBuf) -> Self {
+    pub fn new(tx: ApprovalTx, project_root: PathBuf, mode: Arc<Mutex<Mode>>) -> Self {
         Self {
             tx,
             project_root,
             session_allows: Arc::new(Mutex::new(HashSet::new())),
+            mode,
+            pending_notes: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        }
+    }
+
+    /// Risk level for Ctrl+E panel. Simple rules by tool name.
+    /// Returns (level, why). No model call, instant.
+    pub fn risk(tool_name: &str, reason: &str) -> (&'static str, String) {
+        let low = reason.to_lowercase();
+        match tool_name {
+            "read" | "list_directory" | "glob" | "grep" | "git_status" | "git_diff" => {
+                ("Low", format!("Read only. No change. {reason}"))
+            }
+            "write" | "edit" => {
+                if low.contains("sensitive") || low.contains("outside") {
+                    ("High", format!("File change in risky place. {reason}"))
+                } else if low.contains("large") {
+                    ("High", format!("Big file change. {reason}"))
+                } else {
+                    ("Med", format!("File change. Can undo via git. {reason}"))
+                }
+            }
+            "bash" => {
+                if low.contains("network") {
+                    ("High", format!("Shell with network. {reason}"))
+                } else {
+                    ("High", format!("Shell runs code. {reason}"))
+                }
+            }
+            "web_fetch" | "web_search" => ("High", format!("Network. {reason}")),
+            _ => ("Med", format!("Unknown tool. Careful. {reason}")),
         }
     }
 
@@ -590,6 +673,27 @@ fn compact(args: &serde_json::Value) -> String {
 }
 
 impl AgentHook for PermissionHook {
+    async fn on_tool_result(
+        &self,
+        _ctx: &HookContext,
+        event: ToolResultEvent<'_>,
+    ) -> ToolResultAction {
+        // Hidden Yes-note: add to tool output text. AI sees it.
+        // Chat never shows it (only tool output goes to history).
+        let note = self
+            .pending_notes
+            .lock()
+            .ok()
+            .and_then(|mut p| p.remove(event.internal_call_id));
+        match note {
+            Some(n) if !n.trim().is_empty() => {
+                let base = event.presentation.render();
+                ToolResultAction::rewrite(format!("{base}\n\n[user note on approval: {n}]"))
+            }
+            _ => ToolResultAction::keep(),
+        }
+    }
+
     async fn on_tool_call(&self, _ctx: &HookContext, event: ToolCall<'_>) -> ToolCallAction {
         let parsed: serde_json::Value =
             serde_json::from_str(event.args).unwrap_or(serde_json::Value::Null);
@@ -603,12 +707,19 @@ impl AgentHook for PermissionHook {
         {
             return ToolCallAction::Run;
         }
-        match classify(event.tool_name, &parsed, &self.project_root) {
+        let mode = self.mode.lock().map(|m| *m).unwrap_or_default();
+        match classify_mode(event.tool_name, &parsed, &self.project_root, mode) {
             Verdict::Allow => ToolCallAction::Run,
             Verdict::Deny { reason } => ToolCallAction::skip(format!("denied: {reason}")),
             Verdict::Confirm { reason } => {
-                self.resolve_confirm(event.tool_name, &parsed, key, reason)
-                    .await
+                self.resolve_confirm(
+                    event.tool_name,
+                    &parsed,
+                    key,
+                    reason,
+                    event.internal_call_id,
+                )
+                .await
             }
         }
     }
@@ -624,6 +735,7 @@ impl PermissionHook {
         parsed: &serde_json::Value,
         key: String,
         reason: String,
+        call_id: &str,
     ) -> ToolCallAction {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         let req = ApprovalRequest {
@@ -638,18 +750,41 @@ impl PermissionHook {
             return ToolCallAction::skip("denied: no approver attached (headless fail-closed)");
         }
         match reply_rx.await {
-            Ok(ApprovalDecision::Approve) => ToolCallAction::Run,
-            Ok(ApprovalDecision::ApproveAlways) => {
-                if let Ok(mut g) = self.session_allows.lock() {
-                    g.insert(key);
+            Ok(ApprovalDecision::Approve { comment }) => {
+                // Hidden Yes-note: store by call id, add to tool output
+                // in on_tool_result (AI sees it, chat never shows it).
+                if !comment.trim().is_empty()
+                    && let Ok(mut p) = self.pending_notes.lock()
+                {
+                    p.insert(call_id.to_string(), comment);
                 }
                 ToolCallAction::Run
             }
-            Ok(ApprovalDecision::Deny) => ToolCallAction::skip(format!(
-                "user denied `{tool_name}` ({}): replan without it or ask for an alternative",
-                Self::preview(tool_name, parsed),
-            )),
-            Ok(ApprovalDecision::AbortTurn) => ToolCallAction::stop("aborted by user"),
+            Ok(ApprovalDecision::ApproveAlways { comment }) => {
+                if let Ok(mut g) = self.session_allows.lock() {
+                    g.insert(key);
+                }
+                if !comment.trim().is_empty()
+                    && let Ok(mut p) = self.pending_notes.lock()
+                {
+                    p.insert(call_id.to_string(), comment);
+                }
+                ToolCallAction::Run
+            }
+            Ok(ApprovalDecision::Deny { comment }) => {
+                // No-note is the deny reason. Turn goes on (Skip).
+                let why = match comment.trim().is_empty() {
+                    true => format!(
+                        "user denied `{tool_name}` ({}): replan without it or ask for an alternative",
+                        Self::preview(tool_name, parsed),
+                    ),
+                    false => format!(
+                        "user denied `{tool_name}` ({}): {comment}",
+                        Self::preview(tool_name, parsed),
+                    ),
+                };
+                ToolCallAction::skip(why)
+            }
             // Approver vanished (modal dismissed by shutdown): stop
             // rather than hang the worker forever.
             Err(_) => ToolCallAction::stop("approval channel closed"),
@@ -899,11 +1034,11 @@ mod tests {
         use rig::agent::ToolCallAction;
         let (tx, rx) = approval_channel();
         drop(rx); // TUI gone.
-        let hook = PermissionHook::new(tx, root());
+        let hook = PermissionHook::new(tx, root(), Arc::new(Mutex::new(Mode::Manual)));
         let parsed = serde_json::json!({"command": "cargo test"});
         let key = rule_key("bash", &parsed);
         let action = hook
-            .resolve_confirm("bash", &parsed, key, "test".to_string())
+            .resolve_confirm("bash", &parsed, key, "test".to_string(), "call-1")
             .await;
         assert!(matches!(action, ToolCallAction::Skip(_)), "{action:?}");
     }
@@ -912,21 +1047,25 @@ mod tests {
     async fn hook_resumes_on_approve_in_same_run() {
         use rig::agent::ToolCallAction;
         let (tx, mut rx) = approval_channel();
-        let hook = PermissionHook::new(tx, root());
+        let hook = PermissionHook::new(tx, root(), Arc::new(Mutex::new(Mode::Manual)));
         let parsed = serde_json::json!({"command": "cargo test"});
         let key = rule_key("bash", &parsed);
         let handle = tokio::spawn({
             let hook = hook.clone();
             let parsed = parsed.clone();
             async move {
-                hook.resolve_confirm("bash", &parsed, key, "test".to_string())
+                hook.resolve_confirm("bash", &parsed, key, "test".to_string(), "call-1")
                     .await
             }
         });
         // Human approves: same run resumes with Run.
         let req = rx.recv().await.expect("approval request");
         assert_eq!(req.tool_name, "bash");
-        req.reply.send(ApprovalDecision::Approve).unwrap();
+        req.reply
+            .send(ApprovalDecision::Approve {
+                comment: String::new(),
+            })
+            .unwrap();
         let action = handle.await.unwrap();
         assert!(matches!(action, ToolCallAction::Run), "{action:?}");
     }

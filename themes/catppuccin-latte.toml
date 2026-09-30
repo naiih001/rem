@@ -1,0 +1,30 @@
+# Catppuccin Latte — upstream: github.com/catppuccin/palette (latte)
+# base #eff1f5 · mantle #e6e9ef · text #4c4f69
+name = "catppuccin-latte"
+
+[colors]
+accent = "#8839ef"
+pane_bg = "#eff1f5"
+rail_bg = "#e6e9ef"
+placeholder = "#9ca0b0"
+menu_sel_bg = "#ccd0da"
+
+[colors.add]
+bg = "#d9e8cf"
+fg = "#40a02b"
+mark = "#2d6e1e"
+
+[colors.del]
+bg = "#f0d4d8"
+fg = "#d20f39"
+mark = "#a00d2c"
+
+[colors.markdown]
+code_bg = "#e6e9ef"
+heading_h1 = "#8839ef"
+heading_h2 = "#1e66f5"
+heading_h3 = "#ea76cb"
+link_fg = "#04a5e5"
+link_url_fg = "#8c8fa1"
+code_fg = "#4c4f69"
+blockquote_fg = "#7c7f93"

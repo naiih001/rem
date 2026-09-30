@@ -100,8 +100,8 @@ fn search_path(
         return Ok(());
     }
     // Regular file: skip likely binaries by extension + NUL-byte sniff.
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        if matches!(
+    if let Some(ext) = path.extension().and_then(|e| e.to_str())
+        && matches!(
             ext,
             "png"
                 | "jpg"
@@ -116,9 +116,9 @@ fn search_path(
                 | "rlib"
                 | "rmeta"
                 | "lockb"
-        ) {
-            return Ok(());
-        }
+        )
+    {
+        return Ok(());
     }
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
