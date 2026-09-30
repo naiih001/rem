@@ -212,17 +212,34 @@ fn run_app(
 /// Minimum bottom-pane height: gap(1) + status(1) + input band(3) + footer(1).
 const PANE_ROWS: u16 = 6;
 const MAX_INPUT_LINES: usize = 5;
+/// Fixed viewport height while the session picker is open (grilled decision:
+/// fixed 12-15 rows). Box outer caps at 13 (viewport - footer - 1 breathing
+/// row), showing up to ~8 session rows with internal scroll beyond that.
 
 fn pane_viewport_area(width: u16, height: u16, pane_height: u16) -> Rect {
     let pane_height = pane_height.min(height);
     Rect::new(0, height.saturating_sub(pane_height), width, pane_height)
 }
 
-/// The viewport stays compact at all times. Growing it to full height on
-/// modal open would run `resize_pane_viewport`'s erase and destroy the
-/// visible transcript (modals draw bottom-anchored over the pane instead).
-fn viewport_height(app: &App, width: u16, _height: u16) -> u16 {
-    app.pane_height(width)
+/// The viewport stays compact except while the session picker is open.
+/// The picker needs ~12 rows (header + filter + rows + hint + border) but
+/// the compact pane is only 6 rows, so it clipped to zero session rows.
+/// While the picker is open the viewport grows to a fixed 15 rows; closing
+/// restores the compact pane. Approval modals stay small and never trigger
+/// growth. Growth temporarily covers recent transcript rows (same tradeoff
+/// as multi-line input growth); they remain in terminal scrollback.
+/// Fixed picker viewport: 14 rows (footer + 13-row modal budget).
+/// Box outer caps at 13, showing up to 8 session rows with scroll.
+const PICKER_VIEWPORT_ROWS: u16 = 14;
+/// Max session rows visible in the picker box; beyond this the list windows.
+const MAX_PICKER_ROWS: usize = 8;
+fn viewport_height(app: &App, width: u16, height: u16) -> u16 {
+    let pane = app.pane_height(width);
+    if app.session_picker.is_some() {
+        PICKER_VIEWPORT_ROWS.min(height).max(pane.min(height))
+    } else {
+        pane
+    }
 }
 
 fn resize_pane_viewport<B: Backend>(
@@ -2124,6 +2141,16 @@ fn render_pane_in(f: &mut ratatui::Frame, app: &mut App, area: Rect, with_modals
     let menu_open = is_menu_open(app) || is_menu_live(app);
     let status_h = menu_status_height(app);
     let input_h = app.input_band_height(area.width, menu_open);
+    // Bottom-anchor the pane chrome: in the compact viewport pane_area ==
+    // area, but when the picker expands the viewport the composer stays on
+    // the bottom rows just above the footer and the modal floats above it.
+    let required = required_height.min(area.height);
+    let pane_area = Rect::new(
+        area.x,
+        area.y + area.height.saturating_sub(required),
+        area.width,
+        required,
+    );
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -2132,7 +2159,7 @@ fn render_pane_in(f: &mut ratatui::Frame, app: &mut App, area: Rect, with_modals
             Constraint::Length(input_h), // shaded input band
             Constraint::Length(1), // footer
         ])
-        .split(area);
+        .split(pane_area);
 
     render_gap(f, chunks[0]);
     render_status(f, app, chunks[1]);
@@ -2141,11 +2168,11 @@ fn render_pane_in(f: &mut ratatui::Frame, app: &mut App, area: Rect, with_modals
     render_footer(f, app, chunks[3]);
     // Float slash menu over pane, above input line.
     render_menu_float(f, app, area);
-    // Modal float area: everything above the footer.
-    // Box floats here, footer stays visible below.
-    let footer_row = chunks[3];
+    // Modal float area: everything above the footer row of the full area.
+    // Box bottom-anchors here (see popup::render_float), covering the
+    // composer while open; footer stays visible below.
     let modal_area = Rect {
-        height: footer_row.y.saturating_sub(area.y),
+        height: area.height.saturating_sub(1),
         ..area
     };
     // Approval modal last: small float box over the pane.
@@ -2184,10 +2211,9 @@ fn render_pane_in(f: &mut ratatui::Frame, app: &mut App, area: Rect, with_modals
 }
 
 fn render_frame(f: &mut ratatui::Frame, app: &mut App) {
-    // The viewport never expands for modals (see `viewport_height`): the
-    // transcript above is untouched, and the session/approval box draws
-    // bottom-anchored over the pane it already owns. Keys are still owned
-    // by the modal (`handle_key`).
+    // The session picker expands the viewport (see `viewport_height`) so
+    // its fixed 12-15 row box fits; approval modals stay small and float
+    // over the compact pane. Keys are owned by the modal (`handle_key`).
     render_pane(f, app);
 }
 
@@ -2385,15 +2411,37 @@ fn render_session_picker(
     theme: &Theme,
 ) {
     let Some(picker) = app.session_picker.as_ref() else { return; };
-    // Small float box, same look as approval box.
-    let h = ((picker.items.len() as u16 + 7).max(9)).min(area.height.saturating_sub(1).max(1));
+    // Fixed taller box (grilled decision: fixed 12-15 rows outer).
+    // Content = header + filter + rows + hint (+2 border). Up to
+    // MAX_PICKER_ROWS session rows; longer lists window with scroll.
+    let visible = filtered_sessions(picker);
+    let rows_shown = visible.len().clamp(1, MAX_PICKER_ROWS);
+    let max_h = area.height.saturating_sub(1).max(1);
+    let h = ((rows_shown as u16 + 5).min(max_h)).max(1);
     let inner = crate::popup::render_float(f, area, h, 72, theme);
     if inner.width < 20 || inner.height < 1 {
         return;
     }
+    // Window the list around the selection so it stays visible.
+    let sel = picker.list.selected.min(visible.len().saturating_sub(1));
+    let capacity = (MAX_PICKER_ROWS as u16)
+        .min(inner.height.saturating_sub(3))
+        .max(1) as usize;
+    let start = if visible.len() <= capacity {
+        0
+    } else {
+        sel.saturating_sub(capacity - 1)
+            .min(visible.len() - capacity)
+    };
+    let shown = visible.len().saturating_sub(start).min(capacity);
     let scope = if picker.show_all { "all" } else { "this project" };
+    let count_suffix = if visible.len() > shown {
+        format!(" {}-{} of {}", start + 1, start + shown, visible.len())
+    } else {
+        String::new()
+    };
     let mut lines: Vec<Line<'static>> = vec![Line::from(vec![Span::styled(
-        format!("sessions ({scope})"),
+        format!("sessions ({scope}){count_suffix}"),
         Style::default().add_modifier(Modifier::BOLD),
     )])];
     let filter_value = if picker.list.filter.is_empty() {
@@ -2410,18 +2458,17 @@ fn render_session_picker(
             Span::styled("", Style::default())
         },
     ]));
-    let visible = filtered_sessions(picker);
     if visible.is_empty() {
         lines.push(Line::from(Span::styled(
             "(no sessions)".to_string(),
             Style::default().fg(theme.placeholder),
         )));
     }
-    for (i, s) in visible.iter().enumerate().take(inner.height.saturating_sub(3) as usize) {
+    for (i, s) in visible.iter().skip(start).take(shown).enumerate() {
         let short_proj = s.project_root.rsplit('/').next().unwrap_or(s.project_root.as_str()).to_string();
         let id8: String = s.id.chars().take(8).collect();
         let row = format!("{} — {} — {} · {}", s.title, short_proj, picker_ago(s.updated_at), id8);
-        let style = if i == picker.list.selected {
+        let style = if start + i == sel {
             Style::default().bg(theme.menu_sel_bg)
         } else {
             Style::default().bg(theme.pane_bg)
@@ -2767,6 +2814,69 @@ mod tests {
         assert!(!handle_key(app, &agent, &tx, &think_tx, code, modifiers));
     }
 
+    fn picker_buffer(app: &mut App, w: u16) -> ratatui::buffer::Buffer {
+        use ratatui::{Terminal, backend::TestBackend};
+        let h = viewport_height(app, w, 24);
+        let backend = TestBackend::new(w, h);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render_frame(f, app)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn test_session(id: &str, title: &str) -> crate::sessions::Session {
+        crate::sessions::Session {
+            id: id.to_string(),
+            project_root: "/home/user/proj".to_string(),
+            title: title.to_string(),
+            created_at: 0,
+            updated_at: 0,
+            model: "m".to_string(),
+            messages_json: "[]".to_string(),
+        }
+    }
+
+    #[test]
+    fn picker_lists_session_rows_in_taller_box() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        let items: Vec<_> = (0..5).map(|i| test_session(&format!("id{i:08}"), &format!("sess {i}"))).collect();
+        app.session_picker = Some(SessionPicker {
+            items,
+            list: Default::default(),
+            show_all: false,
+        });
+        let buf = picker_buffer(&mut app, 80);
+        let text = (0..buf.area.height)
+            .map(|y| cell_text(&buf, y, buf.area.width))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for i in 0..5 {
+            assert!(text.contains(&format!("sess {i}")), "row {i} missing: {text}");
+        }
+        assert!(text.contains("model"), "footer missing: {text}");
+    }
+
+    #[test]
+    fn picker_windows_long_lists_around_selection() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        let items: Vec<_> = (0..20).map(|i| test_session(&format!("id{i:08}"), &format!("sess {i:02}"))).collect();
+        let mut list = crate::popup::ListState::default();
+        list.selected = 19;
+        app.session_picker = Some(SessionPicker {
+            items,
+            list,
+            show_all: false,
+        });
+        let buf = picker_buffer(&mut app, 80);
+        let text = (0..buf.area.height)
+            .map(|y| cell_text(&buf, y, buf.area.width))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Selected tail row visible, head scrolled out, counter shown.
+        assert!(text.contains("sess 19"), "got: {text}");
+        assert!(!text.contains("sess 00"), "head should window out: {text}");
+        assert!(text.contains("of 20"), "counter missing: {text}");
+    }
+
     #[test]
     fn empty_resume_picker_remains_visible_and_interactive() {
         let mut app = App::new("model".to_string(), "medium".to_string());
@@ -2775,7 +2885,7 @@ mod tests {
             list: Default::default(),
             show_all: false,
         });
-        let buf = pane_buffer(&mut app, 80);
+        let buf = picker_buffer(&mut app, 80);
         let text = (0..buf.area.height)
             .map(|y| cell_text(&buf, y, buf.area.width))
             .collect::<Vec<_>>()
@@ -3021,8 +3131,8 @@ mod tests {
     #[test]
     fn frame_modal_keeps_compact_viewport_and_floats_box_over_pane() {
         use ratatui::{Terminal, backend::TestBackend};
-        // Viewport must NOT grow when a modal opens: growing runs
-        // `resize_pane_viewport`'s erase and destroys the visible transcript.
+        // Approval modals stay small and never grow the viewport; only the
+        // session picker expands (see viewport_height).
         let mut app = App::new("test-model".to_string(), "medium".to_string());
         assert_eq!(viewport_height(&app, 80, 24), app.pane_height(80));
         let (req, _rx) = approval_req("bash", "cargo test");
@@ -3064,7 +3174,7 @@ mod tests {
     }
 
     #[test]
-    fn frame_session_picker_floats_over_pane_without_expanding() {
+    fn frame_session_picker_expands_viewport_and_shows_rows() {
         use ratatui::{Terminal, backend::TestBackend};
         let mut app = App::new("test-model".to_string(), "medium".to_string());
         app.session_picker = Some(SessionPicker {
@@ -3072,8 +3182,20 @@ mod tests {
             list: Default::default(),
             show_all: false,
         });
+        // Picker open: viewport grows to the fixed picker height.
+        assert_eq!(viewport_height(&app, 80, 24), PICKER_VIEWPORT_ROWS);
+        // Picker closed again: viewport collapses back to the pane.
+        app.session_picker = None;
         assert_eq!(viewport_height(&app, 80, 24), app.pane_height(80));
-        let backend = TestBackend::new(80, app.pane_height(80));
+        app.session_picker = Some(SessionPicker {
+            items: Vec::new(),
+            list: Default::default(),
+            show_all: false,
+        });
+        // Small terminals never grow past what is available.
+        assert_eq!(viewport_height(&app, 80, 4), 4);
+        let h = viewport_height(&app, 80, 24);
+        let backend = TestBackend::new(80, h);
         let mut terminal = Terminal::new(backend).unwrap();
         app.term_width = 80;
         terminal.draw(|f| render_frame(f, &mut app)).unwrap();
