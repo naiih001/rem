@@ -415,9 +415,42 @@ fn theme_arg_matches(input: &str) -> Vec<String> {
     }
 }
 
+/// Skill-arg partial: the menu suggests discovered skill names while the
+/// input is `/skill:<partial>` — colon form, partial name with no
+/// whitespace. Returns the partial (empty = bare `/skill:`, list
+/// everything). `None` for anything else. Case-sensitive, mirroring
+/// `menu_matches`. Unlike themes (live filesystem), names come from the
+/// `App.skill_names` cache — see `skill_arg_matches_for`.
+fn skill_arg_partial(input: &str) -> Option<String> {
+    let rest = input.strip_prefix('/')?;
+    let partial = rest.strip_prefix("skill:")?;
+    if partial.chars().any(|c| c.is_whitespace()) {
+        return None;
+    }
+    Some(partial.to_string())
+}
+
+/// Prefix-filter skill names, order preserved. Pure seam for tests; the live
+/// path composes this with the `App.skill_names` cache.
+fn match_skill_names(names: &[String], partial: &str) -> Vec<String> {
+    names
+        .iter()
+        .filter(|n| n.starts_with(partial))
+        .cloned()
+        .collect()
+}
+
+/// Skill suggestions for an input + cached name list.
+fn skill_arg_matches_for(input: &str, names: &[String]) -> Vec<String> {
+    let Some(partial) = skill_arg_partial(input) else {
+        return Vec::new();
+    };
+    match_skill_names(names, &partial)
+}
+
 /// Total menu rows: command rows for a bare `/token`, theme-name rows for
-/// `/theme <partial>`. Mutually exclusive by construction (whitespace
-/// decides), so this is one mode's count — never a mixed sum.
+/// `/theme <partial>`, skill rows for `/skill:<partial>`. Mutually exclusive
+/// by construction, so this is one mode's count — never a mixed sum.
 fn menu_row_count(input: &str) -> usize {
     let n = menu_matches(input).len();
     if n > 0 {
@@ -427,9 +460,20 @@ fn menu_row_count(input: &str) -> usize {
     }
 }
 
+/// Menu rows for a live `App`: command/theme counts plus skill suggestions
+/// from the cache.
+fn menu_row_count_app(app: &App) -> usize {
+    let n = menu_row_count(&app.input);
+    if n > 0 {
+        n
+    } else {
+        skill_arg_matches_for(&app.input, &app.skill_names).len()
+    }
+}
+
 /// True when the slash menu should show: at least one match.
 fn is_menu_open(app: &App) -> bool {
-    menu_row_count(&app.input) > 0
+    menu_row_count_app(app) > 0
 }
 
 fn menu_status_height(app: &App) -> u16 {
@@ -449,7 +493,7 @@ fn menu_height(app: &App) -> u16 {
     if !is_menu_open(app) {
         return 0;
     }
-    (menu_row_count(&app.input).min(MENU_MAX_ROWS) as u16).min(menu_row_capacity(app))
+    (menu_row_count_app(app).min(MENU_MAX_ROWS) as u16).min(menu_row_capacity(app))
 }
 
 /// The gap absorbs unused menu rows so the composer stays on the same row.
@@ -464,7 +508,7 @@ fn menu_gap_height(app: &App) -> u16 {
 /// Reconcile `menu_sel` with the current input after an edit: menu open +
 /// `None` → `Some(0)`; `Some(i)` → clamped; menu closed → `None`.
 fn clamp_menu_sel(app: &mut App) {
-    let n = menu_row_count(&app.input);
+    let n = menu_row_count_app(app);
     if n == 0 {
         app.menu_sel = None;
     } else {
@@ -1079,7 +1123,7 @@ fn handle_key(
     if is_menu_open(app) {
         match code {
             KeyCode::Up => {
-                let n = menu_row_count(&app.input);
+                let n = menu_row_count_app(app);
                 if n > 0 {
                     let cur = app.menu_sel.unwrap_or(0) % n;
                     app.menu_sel = Some((cur + n - 1) % n);
@@ -1087,7 +1131,7 @@ fn handle_key(
                 return false;
             }
             KeyCode::Down => {
-                let n = menu_row_count(&app.input);
+                let n = menu_row_count_app(app);
                 if n > 0 {
                     let cur = app.menu_sel.unwrap_or(0) % n;
                     app.menu_sel = Some((cur + 1) % n);
@@ -1110,6 +1154,16 @@ fn handle_key(
                         app.input = format!("/theme {}", names[idx]);
                         app.cursor = app.input.chars().count();
                         clamp_menu_sel(app);
+                    } else {
+                        // Skill-arg mode: complete `/skill:<partial>` to the
+                        // highlighted skill name as invokable text.
+                        let names = skill_arg_matches_for(&app.input, &app.skill_names);
+                        if !names.is_empty() {
+                            let idx = app.menu_sel.unwrap_or(0).min(names.len() - 1);
+                            app.input = format!("/skill:{}", names[idx]);
+                            app.cursor = app.input.chars().count();
+                            clamp_menu_sel(app);
+                        }
                     }
                 }
                 return false;
@@ -1342,6 +1396,20 @@ fn submit(
     let mut text = app.input.trim().to_string();
     if text.is_empty() || app.busy {
         return false;
+    }
+    // Skill-arg accept (mirrors theme-arg accept below): `/skill:<partial>`
+    // with suggestions open resolves the highlighted skill to invokable
+    // text before expansion, so Enter picks a suggestion. Runs first — an
+    // unresolved partial would otherwise fail expansion as unknown.
+    if menu_matches(&text).is_empty()
+        && skill_arg_partial(&text).is_some()
+        && !text.contains(char::is_whitespace)
+    {
+        let names = skill_arg_matches_for(&text, &app.skill_names);
+        if !names.is_empty() {
+            let idx = app.menu_sel.unwrap_or(0).min(names.len() - 1);
+            text = format!("/skill:{}", names[idx]);
+        }
     }
     // Skill invoke (`/skill:name ...`, possibly stacked): expand to full
     // bodies before any menu/parse logic. Transcript keeps the short form
@@ -2183,19 +2251,25 @@ fn render_menu(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
     }
     let cmds = menu_matches(&app.input);
     let theme_names: Vec<String>;
-    let names: &[String] = if cmds.is_empty() {
+    let skill_names: Vec<String>;
+    let (names, from_themes, from_skills): (&[String], bool, bool) = if cmds.is_empty() {
         theme_names = theme_arg_matches(&app.input);
-        &theme_names
+        if !theme_names.is_empty() || theme_arg_partial(&app.input).is_some() {
+            (&theme_names, true, false)
+        } else {
+            skill_names = skill_arg_matches_for(&app.input, &app.skill_names);
+            (&skill_names, false, true)
+        }
     } else {
-        &[]
+        (&[], false, false)
     };
-    let from_themes = !names.is_empty() || theme_arg_partial(&app.input).is_some();
     if cmds.is_empty() && names.is_empty() {
         return;
     }
-    // Single total across both modes (ADR-0010): the modes are mutually
-    // exclusive, so this is one mode's count.
-    let total = if from_themes { names.len() } else { cmds.len() };
+    // Single total across modes: mutually exclusive, one mode's count.
+    // Skill rows render like theme rows (`▸ <name>`); Tab/Enter insert the
+    // full `/skill:<name>` invokable form.
+    let total = if from_themes || from_skills { names.len() } else { cmds.len() };
     let theme = &app.theme;
     f.render_widget(
         Block::default().style(Style::default().bg(theme.pane_bg)),
@@ -3375,6 +3449,33 @@ mod tests {
         assert!(!handle_key(&mut app, &agent, &tx, &think_tx, KeyCode::Enter, KeyModifiers::empty()));
         assert!(!app.busy);
         assert!(print_flat(&app).contains("usage: /skill:<name>"));
+    }
+
+    #[test]
+    fn skill_menu_suggests_prefix() {
+        let names = vec!["pdf".to_string(), "plan".to_string(), "deploy".to_string()];
+        assert_eq!(skill_arg_partial("/skill:p"), Some("p".to_string()));
+        assert_eq!(skill_arg_partial("/skill:"), Some(String::new()));
+        assert!(skill_arg_partial("/skill:p task").is_none());
+        assert!(skill_arg_partial("/skills").is_none());
+        assert_eq!(match_skill_names(&names, "p"), vec!["pdf".to_string(), "plan".to_string()]);
+        assert_eq!(
+            skill_arg_matches_for("/skill:dep", &names),
+            vec!["deploy".to_string()]
+        );
+        assert!(skill_arg_matches_for("/skill:x", &names).is_empty());
+    }
+
+    #[test]
+    fn skill_menu_opens_for_partial() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.skill_names = vec!["pdf".to_string(), "plan".to_string()];
+        app.input = "/skill:p".to_string();
+        app.cursor = 8;
+        assert!(is_menu_open(&app));
+        assert_eq!(menu_row_count_app(&app), 2);
+        clamp_menu_sel(&mut app);
+        assert_eq!(app.menu_sel, Some(0));
     }
 
     #[tokio::test]
