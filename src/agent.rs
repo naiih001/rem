@@ -53,10 +53,29 @@ pub trait AgentLoop {
         "medium".to_string()
     }
     fn mode_handle(&self) -> Arc<Mutex<Mode>> { Arc::new(Mutex::new(Mode::default())) }
+    /// Discovered skills for `/skills` list + `/skill:<name>` invoke.
+    /// Defaulted so other `AgentLoop` impls report none.
+    fn list_skills(&self) -> Vec<SkillSummary> { Vec::new() }
+    /// Full `SKILL.md` body for one skill by folder name. Default: none.
+    fn get_skill_body(&self, _name: &str) -> Option<String> { None }
+    /// Re-scan skill dirs + rebuild preamble for subsequent turns.
+    /// Returns human summary (`reloaded N skills: a, b`). Default: unsupported.
+    fn reload_skills_sync(&self) -> Result<String, String> { Err("not supported".to_string()) }
     async fn export_messages_json(&self) -> Result<String, String> { Err("not supported".to_string()) }
     async fn import_messages_json(&self, _json: &str) -> Result<(), String> { Err("not supported".to_string()) }
     fn export_sync(&self) -> Result<String, String> { Err("not supported".to_string()) }
     fn import_sync(&self, _json: &str) -> Result<(), String> { Err("not supported".to_string()) }
+}
+
+/// One discovered skill for the `/skills` list: identity + listing fields only.
+/// No `PathBuf` across the trait — TUI renders `path` as text; bodies load
+/// via [`AgentLoop::get_skill_body`].
+#[derive(Debug, Clone)]
+pub struct SkillSummary {
+    pub name: String,
+    pub description: String,
+    pub path: String,
+    pub note: Option<String>,
 }
 
 /// One tool execution observed during a turn: what ran, with what args,
@@ -429,6 +448,35 @@ impl AgentLoop for RigAgent {
     // Sync variants for the sync TUI submit path via try_lock (safe on runtime thread).
     fn export_sync(&self) -> Result<String, String> { match self.context.try_lock() { Ok(g) => g.to_json(), Err(_) => Err("context busy, try again".to_string()) } }
     fn import_sync(&self, json: &str) -> Result<(), String> { let ctx = Context::from_json(json)?; match self.context.try_lock() { Ok(mut g) => { *g = ctx; Ok(()) }, Err(_) => Err("context busy, try again".to_string()) } }
+    fn list_skills(&self) -> Vec<SkillSummary> {
+        self.skills.lock().map(|g| g.iter().map(|s| SkillSummary {
+            name: s.name.clone(),
+            description: s.description.clone(),
+            path: s.path.to_string_lossy().to_string(),
+            note: s.note.clone(),
+        }).collect()).unwrap_or_default()
+    }
+    fn get_skill_body(&self, name: &str) -> Option<String> {
+        self.skills.lock().ok()?.iter().find(|s| s.name == name).map(|s| s.body.clone())
+    }
+    /// Re-scan skill dirs + rebuild the inner `Agent` so subsequent turns see
+    /// new/edited skills. History (`Context`), recorder, gate allows, and mode
+    /// survive (same Arcs reused). Fail-closed: rebuild error keeps old agent.
+    /// Caller (TUI) must refuse while a turn is in-flight (`app.busy`).
+    fn reload_skills_sync(&self) -> Result<String, String> {
+        let fresh = crate::skills::discover(&self.project_root);
+        let rebuilt = Self::build_inner(&self.cfg, &self.gate, &self.recorder, &self.project_root, &fresh)?;
+        match self.inner.try_write() {
+            Ok(mut guard) => { *guard = rebuilt; }
+            Err(_) => return Err("agent busy, try again".to_string()),
+        }
+        let names: Vec<String> = fresh.iter().map(|s| s.name.clone()).collect();
+        if let Ok(mut guard) = self.skills.lock() { *guard = fresh; }
+        match names.is_empty() {
+            true => Ok("reloaded 0 skills".to_string()),
+            false => Ok(format!("reloaded {} skill{}: {}", names.len(), if names.len() == 1 { "" } else { "s" }, names.join(", "))),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -442,6 +490,21 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         assert!(load_agents_md(&dir).is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reload_skills_sync_preserves_list_shape() {
+        // Shape test without a live LLM client: build_inner needs real creds,
+        // so exercise the summary mapping via discover_in + preamble only.
+        let base = std::env::temp_dir().join("rem-skill-test-reload-shape");
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("skills/pdf");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), "---\ndescription: D.\n---\nBody.\n").unwrap();
+        let found = crate::skills::discover_in(&[base.join("skills")]);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].name, "pdf");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
