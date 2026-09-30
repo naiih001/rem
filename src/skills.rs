@@ -187,6 +187,96 @@ pub fn preamble_section(skills: &[Skill]) -> String {
     out
 }
 
+/// Split shell-style args (double-quote aware) for `$N` indexing.
+pub fn split_args(task: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_q = false;
+    let mut has = false;
+    for c in task.chars() {
+        match c {
+            '"' => { in_q = !in_q; has = true; }
+            c if c.is_whitespace() && !in_q => {
+                if has { out.push(cur.clone()); cur.clear(); has = false; }
+            }
+            _ => { cur.push(c); has = true; }
+        }
+    }
+    if has { out.push(cur); }
+    out
+}
+
+/// Substitute `$ARGUMENTS`, `$ARGUMENTS[N]`, `$N`. `\$` escapes.
+/// Appends `ARGUMENTS: <task>` when no placeholder consumed the task.
+pub fn substitute_args(body: &str, task: &str, args: &[String]) -> String {
+    let mut out = String::new();
+    let mut consumed = false;
+    let mut chars = body.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' && matches!(chars.peek(), Some('$')) {
+            out.push('$'); chars.next(); continue;
+        }
+        if c != '$' { out.push(c); continue; }
+        // $ARGUMENTS[N] / $ARGUMENTS
+        let probe: String = chars.clone().take(9).collect();
+        if probe == "ARGUMENTS" {
+            for _ in 0..9 { chars.next(); }
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                let mut num = String::new();
+                for ch in chars.by_ref() {
+                    if ch == ']' { break; }
+                    num.push(ch);
+                }
+                if let Ok(n) = num.parse::<usize>() {
+                    if let Some(v) = args.get(n) { out.push_str(v); consumed = true; }
+                    else { out.push_str(&format!("$ARGUMENTS[{num}]")); }
+                } else { out.push_str("$ARGUMENTS"); consumed = true; }
+            } else { out.push_str(task); consumed = true; }
+            continue;
+        }
+        // $N shorthand
+        if let Some(&d) = chars.peek() {
+            if d.is_ascii_digit() {
+                let n = (d as u8 - b'0') as usize;
+                chars.next();
+                if let Some(v) = args.get(n) { out.push_str(v); consumed = true; }
+                else { out.push_str(&format!("${n}")); }
+                continue;
+            }
+        }
+        out.push('$');
+    }
+    if !task.trim().is_empty() && !consumed {
+        if !out.ends_with('\n') { out.push('\n'); }
+        out.push_str(&format!("ARGUMENTS: {task}"));
+    }
+    out
+}
+
+/// Parse leading `/skill:name` tokens (up to MAX_STACKED). Returns (names, trailing_task).
+/// Stops at first non-matching token. Mid-sentence mentions are NOT leading.
+pub fn split_leading_mentions(text: &str) -> (Vec<String>, String) {
+    let tokens: Vec<&str> = text.split_whitespace().collect();
+    let mut names = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() && names.len() < MAX_STACKED {
+        if let Some(rest) = tokens[i].strip_prefix("/skill:") {
+            if rest.is_empty() || rest.contains('/') { break; }
+            names.push(rest.to_string());
+            i += 1;
+        } else { break; }
+    }
+    if names.is_empty() { return (vec![], text.to_string()); }
+    let mut task = text.to_string();
+    for _ in 0..names.len() {
+        let t = task.trim_start();
+        let end = t.find(char::is_whitespace).unwrap_or(t.len());
+        task = t[end..].to_string();
+    }
+    (names, task.trim_start().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,6 +362,42 @@ mod tests {
         assert!(text.contains("/r/.agents/skills/pdf/SKILL.md"), "got: {text}");
         assert!(text.contains("reference.md"), "got: {text}");
         assert!(text.contains("/skill:<name>"), "got: {text}");
+    }
+
+    #[test]
+    fn substitutes_arguments_and_indexed() {
+        let body = "Do $ARGUMENTS now. First $0, second $1.";
+        let out = substitute_args(body, "fix login", &["fix".into(), "login".into()]);
+        assert!(out.contains("Do fix login now."), "got: {out}");
+        assert!(out.contains("First fix, second login."), "got: {out}");
+    }
+
+    #[test]
+    fn appends_arguments_when_no_placeholder() {
+        let out = substitute_args("Just do it.", "hello", &["hello".into()]);
+        assert!(out.contains("ARGUMENTS: hello"), "got: {out}");
+    }
+
+    #[test]
+    fn missing_index_stays_literal_and_appends() {
+        // Claude rule: indexed placeholder with no arg stays literal and doesn't count.
+        let out = substitute_args("Only $2 here.", "a", &["a".into()]);
+        assert!(out.contains("$2"), "got: {out}");
+        assert!(out.contains("ARGUMENTS: a"), "got: {out}");
+    }
+
+    #[test]
+    fn parses_stacked_leading_mentions() {
+        let (names, task) = split_leading_mentions("/skill:a /skill:b do the thing");
+        assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(task, "do the thing");
+    }
+
+    #[test]
+    fn stops_at_first_non_skill_token() {
+        let (names, task) = split_leading_mentions("help /skill:a x");
+        assert!(names.is_empty());
+        assert_eq!(task, "help /skill:a x");
     }
 
     #[test]
