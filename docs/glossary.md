@@ -63,6 +63,15 @@
 - **Autosave**: Per-turn persist via `blocking_lock` `export_sync` -> `save_messages`. Sync TUI submit path; failures must surface, never silent.
 - **Project key**: Literal canonicalized cwd string stored as `project_root`. Picker filters by exact match (`list_for_project`), no prefix/glob.
 
+## Skills (ADR-0012)
+
+- **Skill**: Claude-compatible `<name>/SKILL.md` bundle (YAML frontmatter + Markdown body + optional sibling files). Identity is the folder name; frontmatter `name` ignored for v1.
+- **Discovery roots**: `<project>/.agents/skills/` → `~/.config/rem/skills/` → `~/.agents/skills/`, first wins on name collision. Missing roots skipped.
+- **Preamble index**: startup list of `name — description — SKILL.md path (+ bundle siblings)` after `AGENTS.md`. Bodies load on demand via `read`; scripts run via `bash` approvals.
+- **Invoke**: `/skill:<name> [task]` colon form; leading stacked mentions (up to 6) expand bodies in order with `$ARGUMENTS` substitution. Transcript shows the short form.
+- **Reload**: `/skills reload` re-scans + rebuilds the inner agent so normal chat auto-knows new skills; history/hooks/mode preserved, fail-closed on error. Refused while busy.
+- **Lenient load**: missing `description` → first body line; bad YAML → name-only with note, direct invoke still works.
+
 ## Non-goals (v1)
 
 - True OS sandboxing (namespaces, seccomp, grsecurity). The gate is a *policy + human* layer, not a kernel boundary.
