@@ -170,6 +170,8 @@ fn run_app(
         .context("create terminal")?;
 
         let mut app = App::new(model, effort);
+        // Skills index for `/skill:<partial>` suggestions (Task 14 cache).
+        app.skill_names = agent.list_skills().iter().map(|s| s.name.clone()).collect();
         // Resume: on relaunch with REM_SESSION_ID set, replay the stored
         // transcript so the pane shows prior turns before new input.
         if let Ok(sid) = std::env::var("REM_SESSION_ID") {
@@ -507,6 +509,9 @@ struct App {
     /// Slash-menu selection index (ADR-0007). `None` = menu closed;
     /// `Some(i)` = menu open with row `i` highlighted.
     menu_sel: Option<usize>,
+    /// Cached skill folder names for `/skill:<partial>` suggestions.
+    /// Refreshed at startup and on `/skills reload`.
+    skill_names: Vec<String>,
     /// Pending human approvals (FIFO). Head renders as a blocking modal;
     /// resolving it resumes the parked agent worker in the same run.
     pending_approvals: VecDeque<ApprovalRequest>,
@@ -616,6 +621,7 @@ impl App {
             dirty: true,
             streamed_tools: 0,
             menu_sel: None,
+            skill_names: Vec::new(),
             pending_approvals: VecDeque::new(),
             current_turn: None,
             current_watcher: None,
@@ -1428,6 +1434,38 @@ fn submit(
                 match crate::sessions::create_session(&conn, &picker_project_root(), &agent.model_name()) {
                     Err(e) => app.enqueue_notice(format!("fork failed: {e}")),
                     Ok(ns) => { let title = format!("{} (fork)", app.session_title); let _ = crate::sessions::save_messages(&conn, &ns.id, &msgs); let _ = crate::sessions::update_title(&conn, &ns.id, &title); app.session_id = ns.id.clone(); app.session_title = title.clone(); app.enqueue_notice(format!("forked as {title}")); }
+                }
+                return false;
+            }
+            "skills" => {
+                if arg.trim() == "reload" {
+                    if app.busy {
+                        app.enqueue_notice("skills: busy — reload after the turn finishes".to_string());
+                        return false;
+                    }
+                    match agent.reload_skills_sync() {
+                        Ok(msg) => {
+                            app.skill_names = agent.list_skills().iter().map(|s| s.name.clone()).collect();
+                            app.enqueue_notice(format!("skills: {msg}"));
+                        }
+                        Err(e) => app.enqueue_notice(format!("skills reload failed: {e}")),
+                    }
+                    return false;
+                }
+                if !arg.trim().is_empty() {
+                    app.enqueue_notice("usage: /skills [reload]".to_string());
+                    return false;
+                }
+                let list = agent.list_skills();
+                if list.is_empty() {
+                    app.enqueue_notice("no skills installed (project .agents/skills, ~/.config/rem/skills, ~/.agents/skills)".to_string());
+                } else {
+                    let mut msg = String::from("skills:");
+                    for s in list {
+                        let note = s.note.map(|n| format!(" [{n}]")).unwrap_or_default();
+                        msg.push_str(&format!("\n  /skill:{} — {}{} — {}", s.name, s.description, note, s.path));
+                    }
+                    app.enqueue_notice(msg);
                 }
                 return false;
             }
@@ -3183,6 +3221,42 @@ mod tests {
         assert_eq!(app.hist_idx, None);
         assert_eq!(app.input, "/");
         assert_eq!(app.history, vec!["old turn".to_string()]);
+    }
+
+    fn print_flat(app: &App) -> String {
+        app.print_queue.iter().flatten().map(|l| {
+            l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()
+        }).collect::<Vec<_>>().join("\n")
+    }
+
+    #[tokio::test]
+    async fn slash_skills_lists_without_turn() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        let agent = std::sync::Arc::new(StubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        app.input = "/skills".to_string();
+        app.cursor = 7;
+        assert!(!handle_key(&mut app, &agent, &tx, &think_tx, KeyCode::Enter, KeyModifiers::empty()));
+        assert!(!app.busy, "/skills must not start a turn");
+        let flat = print_flat(&app);
+        // StubAgent has no skills → empty notice.
+        assert!(flat.contains("no skills"), "got: {flat}");
+    }
+
+    #[tokio::test]
+    async fn slash_skills_bad_arg_usage_no_turn() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        let agent = std::sync::Arc::new(StubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        app.input = "/skills frobnicate".to_string();
+        app.cursor = 19;
+        assert!(!handle_key(&mut app, &agent, &tx, &think_tx, KeyCode::Enter, KeyModifiers::empty()));
+        assert!(!app.busy);
+        assert!(print_flat(&app).contains("usage: /skills [reload]"));
     }
 
     #[tokio::test]
