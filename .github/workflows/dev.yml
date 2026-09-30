@@ -1,0 +1,104 @@
+name: Dev CI + Promote
+
+# Push to `dev` runs tests. If tests pass, the `promote` job waits for
+# your approval (environment `production`) before merging dev -> main,
+# bumping the patch tag (v0.1.0 -> v0.1.1) and pushing.
+#
+# REQUIRED ONE-TIME SETUP (or promote will never pause for approval):
+#   Repo -> Settings -> Environments -> New environment -> name: `production`
+#   -> Required reviewers -> add yourself. That's your "consent" button.
+#   Each push to dev shows up under Actions -> approve `promote` to ship.
+
+on:
+  push:
+    branches: [dev]
+  pull_request:
+    branches: [dev]
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Test (dev)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --all --verbose
+
+  promote:
+    name: Promote dev -> main (needs your approval)
+    # Only real pushes to dev can promote. PRs just run tests.
+    if: github.event_name == 'push'
+    needs: test
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Merge dev into main
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin dev main --tags
+          git checkout main
+          git reset --hard origin/main
+          git merge --no-ff origin/dev -m "chore(promote): merge dev into main"
+
+      - name: Bump patch tag, sync Cargo.toml, push
+        run: |
+          set -euo pipefail
+          git fetch --tags origin
+
+          LATEST=$(git tag --list 'v*.*.*' | sort -V | tail -n1 || true)
+          if [ -z "${LATEST:-}" ]; then
+            # No tags yet: seed from Cargo.toml (e.g. 0.1.0 -> v0.1.0)
+            VER=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+            NEW_TAG="v${VER}"
+          else
+            NUM=${LATEST#v}
+            MAJOR=$(echo "$NUM" | cut -d. -f1)
+            MINOR=$(echo "$NUM" | cut -d. -f2)
+            PATCH=$(echo "$NUM" | cut -d. -f3)
+            PATCH=$((PATCH + 1))
+            NEW_TAG="v${MAJOR}.${MINOR}.${PATCH}"
+            # Guard against collision (e.g. tag already pushed manually)
+            while git rev-parse "$NEW_TAG" >/dev/null 2>&1; do
+              PATCH=$((PATCH + 1))
+              NEW_TAG="v${MAJOR}.${MINOR}.${PATCH}"
+            done
+          fi
+
+          echo "Latest: ${LATEST:-<none>} -> New: $NEW_TAG"
+          echo "NEW_TAG=$NEW_TAG" >> "$GITHUB_ENV"
+
+          # Keep Cargo.toml / Cargo.lock in sync with the tag, commit on main
+          NEW_VER=${NEW_TAG#v}
+          sed -i "0,/^version = \".*\"/s//version = \"$NEW_VER\"/" Cargo.toml
+          cargo generate-lockfile 2>/dev/null || cargo check --quiet || true
+          git add Cargo.toml Cargo.lock
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(release): bump version to $NEW_TAG"
+          fi
+
+          git push origin main
+          git tag "$NEW_TAG"
+          git push origin "$NEW_TAG"
