@@ -55,6 +55,20 @@ pub trait AgentLoop {
     fn mode_handle(&self) -> Arc<Mutex<Mode>> {
         Arc::new(Mutex::new(Mode::default()))
     }
+    /// Discovered skills for `/skills` list + `/skill:<name>` invoke.
+    /// Defaulted so other `AgentLoop` impls report none.
+    fn list_skills(&self) -> Vec<SkillSummary> {
+        Vec::new()
+    }
+    /// Full `SKILL.md` body for one skill by folder name. Default: none.
+    fn get_skill_body(&self, _name: &str) -> Option<String> {
+        None
+    }
+    /// Re-scan skill dirs + rebuild preamble for subsequent turns.
+    /// Returns human summary (`reloaded N skills: a, b`). Default: unsupported.
+    fn reload_skills_sync(&self) -> Result<String, String> {
+        Err("not supported".to_string())
+    }
     // Trait surface for alternate `AgentLoop` impls; `RigAgent` overrides it.
     #[allow(dead_code)]
     async fn export_messages_json(&self) -> Result<String, String> {
@@ -69,6 +83,17 @@ pub trait AgentLoop {
     fn import_sync(&self, _json: &str) -> Result<(), String> {
         Err("not supported".to_string())
     }
+}
+
+/// One discovered skill for the `/skills` list: identity + listing fields only.
+/// No `PathBuf` across the trait — TUI renders `path` as text; bodies load
+/// via [`AgentLoop::get_skill_body`].
+#[derive(Debug, Clone)]
+pub struct SkillSummary {
+    pub name: String,
+    pub description: String,
+    pub path: String,
+    pub note: Option<String>,
 }
 
 /// One tool execution observed during a turn: what ran, with what args,
@@ -216,12 +241,18 @@ fn first_line(s: &str, max: usize) -> String {
 /// Conversation history is caller-owned in [`Context`]: tool outputs are
 /// truncated on entry and old turns are summarized past 100 messages.
 pub struct RigAgent {
-    agent: rig::agent::Agent,
+    inner: tokio::sync::RwLock<rig::agent::Agent>,
     context: tokio::sync::Mutex<Context>,
     recorder: ToolRecorder,
     model_name: String,
     effort: String,
     mode: Arc<Mutex<Mode>>,
+    // Rebuild inputs for `/skills reload`: the inner `Agent` is frozen at
+    // build time, so reload re-runs `build_inner` with a fresh skill scan.
+    cfg: Config,
+    project_root: std::path::PathBuf,
+    gate: PermissionHook,
+    skills: Arc<Mutex<Vec<crate::skills::Skill>>>,
 }
 
 /// Project instructions file name, loaded from the project root only.
@@ -241,6 +272,38 @@ impl RigAgent {
         approval_tx: ApprovalTx,
         project_root: std::path::PathBuf,
     ) -> Result<Self, String> {
+        let recorder = ToolRecorder::default();
+        let mode = Arc::new(Mutex::new(Mode::default()));
+        // Observer first (see everything), gate second (steers). ADR-0001.
+        let gate = PermissionHook::new(approval_tx, project_root.clone(), mode.clone());
+        let skills = crate::skills::discover(&project_root);
+
+        let agent = Self::build_inner(cfg, &gate, &recorder, &project_root, &skills)?;
+
+        Ok(Self {
+            inner: tokio::sync::RwLock::new(agent),
+            context: tokio::sync::Mutex::new(Context::new()),
+            recorder,
+            model_name: cfg.model.default.clone(),
+            effort: cfg.model.effort.clone(),
+            mode,
+            cfg: cfg.clone(),
+            project_root,
+            gate,
+            skills: Arc::new(Mutex::new(skills)),
+        })
+    }
+
+    /// Build the inner `rig::agent::Agent`: client + preamble (static +
+    /// AGENTS.md + skills index) + 11 tools + hooks. Pure constructor —
+    /// called at startup and on `/skills reload`.
+    fn build_inner(
+        cfg: &Config,
+        gate: &PermissionHook,
+        recorder: &ToolRecorder,
+        project_root: &std::path::Path,
+        skills: &[crate::skills::Skill],
+    ) -> Result<rig::agent::Agent, String> {
         // Explicit `.base_url()` per spec — no reliance on OPENAI_BASE_URL env.
         let client = openai::CompletionsClient::builder()
             .api_key(cfg.api.key.clone())
@@ -249,11 +312,6 @@ impl RigAgent {
             .map_err(|e| format!("failed to build LLM client: {e}"))?;
 
         let model = client.completion_model(cfg.model.default.clone());
-
-        let recorder = ToolRecorder::default();
-        let mode = Arc::new(Mutex::new(Mode::default()));
-        // Observer first (see everything), gate second (steers). ADR-0001.
-        let gate = PermissionHook::new(approval_tx, project_root.clone(), mode.clone());
 
         let mut preamble = String::from(
             "You are rem, a coding agent in a terminal TUI. \
@@ -265,9 +323,13 @@ impl RigAgent {
         );
         // Project context (ADR-0009): project-root AGENTS.md only, appended
         // after static instructions, silently skipped when missing.
-        if let Some(body) = load_agents_md(&project_root) {
+        if let Some(body) = load_agents_md(project_root) {
             preamble.push_str(AGENTS_MD_HEADER);
             preamble.push_str(&body);
+        }
+        // Skills index: names+descriptions+paths at startup, bodies via `read`.
+        if !skills.is_empty() {
+            preamble.push_str(&crate::skills::preamble_section(skills));
         }
 
         let agent = AgentBuilder::new(model)
@@ -286,17 +348,10 @@ impl RigAgent {
             .default_max_turns(100)
             .additional_params(serde_json::json!({"reasoning_effort": cfg.model.effort.clone()}))
             .add_hook(recorder.clone())
-            .add_hook(gate)
+            .add_hook(gate.clone())
             .build();
 
-        Ok(Self {
-            agent,
-            context: tokio::sync::Mutex::new(Context::new()),
-            recorder,
-            model_name: cfg.model.default.clone(),
-            effort: cfg.model.effort.clone(),
-            mode,
-        })
+        Ok(agent)
     }
 
     // Wired up by upcoming session-title work (`generate_title` has a TODO
@@ -308,7 +363,9 @@ impl RigAgent {
 
     #[allow(dead_code)]
     pub async fn generate_title(&self) -> Result<String, String> {
-        self.agent
+        self.inner
+            .read()
+            .await
             .prompt("Give this coding session a short 2-5 word title, reply with title only")
             .preamble("You name coding sessions. Reply with a short title only.")
             .tool_choice(ToolChoice::None)
@@ -338,9 +395,13 @@ impl AgentLoop for RigAgent {
             guard.clear();
         }
 
-        let reply = Chat::chat(&self.agent, prompt, ctx.messages_mut())
+        // Read-lock the inner agent for the turn. Safe: hooks never lock
+        // `inner` or `context`, so no lock cycle with `ctx` held.
+        let inner = self.inner.read().await;
+        let reply = Chat::chat(&*inner, prompt, ctx.messages_mut())
             .await
             .map_err(|e| e.to_string())?;
+        drop(inner);
 
         // Truncate newly committed tool outputs so they don't eat the window.
         ctx.truncate_new(before);
@@ -351,7 +412,9 @@ impl AgentLoop for RigAgent {
             // Summarize WITHOUT tools and WITHOUT history: a plain one-shot
             // call so the summary can't recurse into compaction or tool loops.
             match self
-                .agent
+                .inner
+                .read()
+                .await
                 .prompt(material)
                 .preamble(SUMMARIZER_PROMPT)
                 .tool_choice(ToolChoice::None)
@@ -423,6 +486,62 @@ impl AgentLoop for RigAgent {
             Err(_) => Err("context busy, try again".to_string()),
         }
     }
+    fn list_skills(&self) -> Vec<SkillSummary> {
+        self.skills
+            .lock()
+            .map(|g| {
+                g.iter()
+                    .map(|s| SkillSummary {
+                        name: s.name.clone(),
+                        description: s.description.clone(),
+                        path: s.path.to_string_lossy().to_string(),
+                        note: s.note.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    fn get_skill_body(&self, name: &str) -> Option<String> {
+        self.skills
+            .lock()
+            .ok()?
+            .iter()
+            .find(|s| s.name == name)
+            .map(|s| s.body.clone())
+    }
+    /// Re-scan skill dirs + rebuild the inner `Agent` so subsequent turns see
+    /// new/edited skills. History (`Context`), recorder, gate allows, and mode
+    /// survive (same Arcs reused). Fail-closed: rebuild error keeps old agent.
+    /// Caller (TUI) must refuse while a turn is in-flight (`app.busy`).
+    fn reload_skills_sync(&self) -> Result<String, String> {
+        let fresh = crate::skills::discover(&self.project_root);
+        let rebuilt = Self::build_inner(
+            &self.cfg,
+            &self.gate,
+            &self.recorder,
+            &self.project_root,
+            &fresh,
+        )?;
+        match self.inner.try_write() {
+            Ok(mut guard) => {
+                *guard = rebuilt;
+            }
+            Err(_) => return Err("agent busy, try again".to_string()),
+        }
+        let names: Vec<String> = fresh.iter().map(|s| s.name.clone()).collect();
+        if let Ok(mut guard) = self.skills.lock() {
+            *guard = fresh;
+        }
+        match names.is_empty() {
+            true => Ok("reloaded 0 skills".to_string()),
+            false => Ok(format!(
+                "reloaded {} skill{}: {}",
+                names.len(),
+                if names.len() == 1 { "" } else { "s" },
+                names.join(", ")
+            )),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -436,6 +555,21 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         assert!(load_agents_md(&dir).is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reload_skills_sync_preserves_list_shape() {
+        // Shape test without a live LLM client: build_inner needs real creds,
+        // so exercise the summary mapping via discover_in + preamble only.
+        let base = std::env::temp_dir().join("rem-skill-test-reload-shape");
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("skills/pdf");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), "---\ndescription: D.\n---\nBody.\n").unwrap();
+        let found = crate::skills::discover_in(&[base.join("skills")]);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].name, "pdf");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
