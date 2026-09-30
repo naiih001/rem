@@ -31,6 +31,16 @@
 - **Session rule**: An `always allow` decision cached for the process lifetime (e.g. always allow `cargo test`). Scoped by exact tool + normalized args, never by prefix alone.
 - **Audit trail**: Every decision appends a `permission ...` system block to the transcript.
 
+## Popups (ADR-0011, ADR-0012)
+
+- **Popup shell**: Shared centered modal surface shown inside a full-height managed viewport while open. It provides common layout, styling, selection, footer, and sizing behavior without prescribing content semantics; closing it restores the compact composer viewport.
+- **Popup controller**: Feature-specific state and actions layered over the shared shell, such as resume, approval, or a future question prompt.
+- **Inline filter**: Popup-owned filter mode rendered inside the shell. `/` enters it; `Esc` leaves filter mode before any popup dismissal policy is applied.
+- **Popup navigation**: `j/k` and Up/Down move one item; `Ctrl+d/u` move half a visible page. `g/G` are not supported. `q` is reserved for popup-specific quit/abort semantics.
+- **Blocking FIFO popup**: Approval popup mode showing only the oldest pending request. Later requests remain queued and cannot be selected or reordered.
+- **Risk-first approval**: Approval presentation that shows the reason and risk classification before command details, with labels and restrained color cues supporting the decision.
+- **Approval action bar**: Horizontal themed action row containing `Allow once`, `Allow always`, `Reject`, and `Abort`; `h/l` or Left/Right selects and Enter confirms.
+
 ## Input area (ADR-0004, Aster-style)
 
 - **Input band**: Shaded composer (`PANE_BG` `#191919`) that grows with wrapped or explicit lines to five visible rows (fewer on short terminals), then scrolls internally. Normally one row of vertical padding surrounds the text; the slash menu may reclaim a padding row. Overflow uses `↑` / `↓` cues. `Shift+Enter` inserts a newline when enhanced keyboard reporting is available; `Ctrl+O` is the portable fallback. `Enter` submits.
@@ -57,7 +67,7 @@
 ## Sessions (ADR-0010)
 
 - **Session**: One persisted conversation row in `sessions.db` (`id, project_root, title, created, updated, model, messages_json`). Created at startup, resumed via `--resume <id>` or `/resume`.
-- **Picker**: Centered popup listing project sessions by `updated_at DESC`. Opened by bare `/resume`; `/resume <id>` bypasses it.
+- **Picker**: Bottom popup listing project sessions by `updated_at DESC`. Opened by bare `/resume`; `/resume <id>` bypasses it.
 - **Fork**: Clone of the current session's `messages_json` into a new session id. History verbatim, title reset.
 - **Title**: Human label for a session row. Fallback is first user message truncated to 40 chars; LLM title (`generate_title`, 2-5 words) is TODO.
 - **Autosave**: Per-turn persist via `blocking_lock` `export_sync` -> `save_messages`. Sync TUI submit path; failures must surface, never silent.
