@@ -167,6 +167,26 @@ pub fn discover(project_root: &std::path::Path) -> Vec<Skill> {
     discover_in(&roots)
 }
 
+const SKILLS_HEADER: &str = "\n\nAvailable skills (name — description — SKILL.md path). Read the SKILL.md with the read tool when the task matches, or the user may force with /skill:<name> (trailing text is the task). Sibling bundle files are listed; read them with read/glob and run scripts via bash (normal approvals apply):\n";
+
+/// Preamble index. Empty when no skills. Descriptions already capped at parse.
+pub fn preamble_section(skills: &[Skill]) -> String {
+    if skills.is_empty() { return String::new(); }
+    let mut out = String::from(SKILLS_HEADER);
+    for s in skills {
+        let sibs = if s.siblings.is_empty() { String::new() } else {
+            let shown: Vec<_> = s.siblings.iter().take(MAX_SIBLINGS).cloned().collect();
+            let mut t = format!(" (bundle: {})", shown.join(", "));
+            if s.siblings.len() > MAX_SIBLINGS {
+                t.push_str(&format!(" +{} more", s.siblings.len() - MAX_SIBLINGS));
+            }
+            t
+        };
+        out.push_str(&format!("- {} — {} — {}{}\n", s.name, s.description, s.path.display(), sibs));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,6 +259,24 @@ mod tests {
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].description, "Project one.");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn preamble_section_lists_name_desc_path_and_siblings() {
+        let s = Skill { name: "pdf".into(), description: "Work PDFs.".into(),
+            path: "/r/.agents/skills/pdf/SKILL.md".into(), dir: "/r/.agents/skills/pdf".into(),
+            siblings: vec!["reference.md".into()], body: "x".into(), note: None };
+        let text = preamble_section(&[s]);
+        assert!(text.contains("pdf"), "got: {text}");
+        assert!(text.contains("Work PDFs."), "got: {text}");
+        assert!(text.contains("/r/.agents/skills/pdf/SKILL.md"), "got: {text}");
+        assert!(text.contains("reference.md"), "got: {text}");
+        assert!(text.contains("/skill:pdf"), "got: {text}");
+    }
+
+    #[test]
+    fn preamble_empty_is_empty() {
+        assert!(preamble_section(&[]).is_empty());
     }
 
     #[test]
