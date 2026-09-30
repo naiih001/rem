@@ -1743,7 +1743,10 @@ impl App {
     fn pane_height(&self, term_width: u16) -> u16 {
         let input_extra = self.visible_input_lines(term_width).saturating_sub(1) as u16;
         let menu_extra = if is_menu_open(self) {
-            menu_row_count(&self.input)
+            // App-aware count: command/theme rows plus `/skill:` suggestions
+            // from the cache. The input-only count misses skills and leaves
+            // the pane ungrown (~2 squeezed rows).
+            menu_row_count_app(self)
                 .min(MENU_PREFERRED_ROWS)
                 .min(MENU_MAX_ROWS) as u16
         } else {
@@ -3464,6 +3467,32 @@ mod tests {
             vec!["deploy".to_string()]
         );
         assert!(skill_arg_matches_for("/skill:x", &names).is_empty());
+    }
+
+    #[test]
+    fn skill_menu_pane_grows_for_suggestions() {
+        // Regression: pane_height used the command/theme-only count, so the
+        // `/skill:` popup was squeezed to ~2 rows instead of up to 7.
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.skill_names = vec![
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string(),
+            "d".to_string(),
+            "e".to_string(),
+            "f".to_string(),
+            "g".to_string(),
+        ];
+        app.input = "/skill:".to_string();
+        app.cursor = 7;
+        assert!(is_menu_open(&app));
+        assert_eq!(menu_row_count_app(&app), 7);
+        // Pane grows by min(7, PREFERRED) rows when the menu is open.
+        let grown = app.pane_height(80);
+        app.menu_sel = None;
+        app.input = "hello".to_string();
+        let idle = app.pane_height(80);
+        assert_eq!(grown, idle + MENU_PREFERRED_ROWS.min(7) as u16);
     }
 
     #[test]
