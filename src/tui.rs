@@ -1305,6 +1305,34 @@ fn handle_theme_command(app: &mut App, arg: &str) {
     }
 }
 
+/// Expand leading `/skill:name` mentions (up to `MAX_STACKED`) into full
+/// `SKILL.md` bodies with `$ARGUMENTS` substitution. Returns `None` when the
+/// input is not a skill invoke. `Err` names the first unknown skill.
+/// The display short form is the original text (transcript shows `/skill:x`).
+fn expand_skill_invokes(
+    text: &str,
+    agent: &Arc<impl AgentLoop + Send + Sync + 'static>,
+) -> Result<Option<(String, String)>, String> {
+    let (names, task) = crate::skills::split_leading_mentions(text);
+    if names.is_empty() {
+        return Ok(None);
+    }
+    let args = crate::skills::split_args(&task);
+    let mut bodies = Vec::with_capacity(names.len());
+    for name in &names {
+        match agent.get_skill_body(name) {
+            Some(body) => bodies.push(crate::skills::substitute_args(&body, &task, &args)),
+            None => return Err(format!("no skill '{name}' (see /skills)")),
+        }
+    }
+    let mut expanded = bodies.join("\n\n");
+    if !task.trim().is_empty() {
+        expanded.push_str("\n\n");
+        expanded.push_str(task.trim());
+    }
+    Ok(Some((text.to_string(), expanded)))
+}
+
 fn submit(
     app: &mut App,
     agent: &Arc<impl AgentLoop + Send + Sync + 'static>,
@@ -1315,6 +1343,33 @@ fn submit(
     if text.is_empty() || app.busy {
         return false;
     }
+    // Skill invoke (`/skill:name ...`, possibly stacked): expand to full
+    // bodies before any menu/parse logic. Transcript keeps the short form
+    // (mirrors `/init` display handling below).
+    let mut skill_display: Option<String> = None;
+    match expand_skill_invokes(&text, agent) {
+        Ok(Some((display, expanded))) => {
+            skill_display = Some(display);
+            text = expanded;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            app.input.clear();
+            app.cursor = 0;
+            app.menu_sel = None;
+            app.enqueue_notice(format!("skill: {e}"));
+            return false;
+        }
+    }
+    // Bare `/skill:` with no name (not a leading mention) → usage.
+    if skill_display.is_none() && text.starts_with("/skill:") {
+        app.input.clear();
+        app.cursor = 0;
+        app.menu_sel = None;
+        app.enqueue_notice("usage: /skill:<name> [task]".to_string());
+        return false;
+    }
+    let skill_turn = skill_display.is_some();
     // Theme-arg accept (ADR-0010, mirrors the command prefix-run below):
     // `/theme <partial>` with suggestions open resolves the highlighted
     // theme name first, so Enter picks a suggestion. Bare `/theme` and
@@ -1336,7 +1391,8 @@ fn submit(
     app.input.clear();
     app.cursor = 0;
     app.menu_sel = None;
-    app.history.push(text.clone());
+    // Skill turns record the short `/skill:x` form, not the expansion.
+    app.history.push(skill_display.clone().unwrap_or_else(|| text.clone()));
     app.hist_idx = None;
 
     if let Some((cmd, arg)) = parse_command(&text) {
@@ -1472,14 +1528,18 @@ fn submit(
             _ => {}
         }
     }
-    if text.starts_with('/') {
+    if text.starts_with('/') && !skill_turn {
         app.enqueue_notice(format!("unknown command \"{text}\". Try /help."));
         return false;
     }
 
-    // `/init` shows the short command in the transcript while the agent
-    // receives the full fixed instruction.
-    let display = if text.as_str() == INIT_PROMPT {
+    // `/init` and `/skill:x` show the short command in the transcript while
+    // the agent receives the full expanded instruction.
+    let display_owned;
+    let display = if let Some(short) = skill_display.as_deref() {
+        display_owned = short.to_string();
+        display_owned.as_str()
+    } else if text.as_str() == INIT_PROMPT {
         "/init"
     } else {
         text.as_str()
@@ -3260,6 +3320,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn skill_colon_unknown_queues_notice_no_turn() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        let agent = std::sync::Arc::new(SkillStubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        app.input = "/skill:nope do x".to_string();
+        app.cursor = 14;
+        assert!(!handle_key(&mut app, &agent, &tx, &think_tx, KeyCode::Enter, KeyModifiers::empty()));
+        assert!(!app.busy, "unknown skill must not start a turn");
+        assert!(print_flat(&app).contains("no skill 'nope'"));
+    }
+
+    #[tokio::test]
+    async fn skill_colon_single_expands_body_with_task() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        let agent = std::sync::Arc::new(SkillStubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        app.input = "/skill:demo fix login".to_string();
+        app.cursor = 22;
+        assert!(!handle_key(&mut app, &agent, &tx, &think_tx, KeyCode::Enter, KeyModifiers::empty()));
+        assert!(app.busy, "known skill must start a turn");
+        // Transcript + history show the short form.
+        assert_eq!(app.history.last().map(String::as_str), Some("/skill:demo fix login"));
+        assert!(print_flat(&app).contains("/skill:demo fix login"));
+    }
+
+    #[tokio::test]
+    async fn skill_colon_stacked_expands_both() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        let agent = std::sync::Arc::new(TwoSkillStubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        app.input = "/skill:demo /skill:plain task here".to_string();
+        app.cursor = 34;
+        assert!(!handle_key(&mut app, &agent, &tx, &think_tx, KeyCode::Enter, KeyModifiers::empty()));
+        assert!(app.busy, "stacked skills must start a turn");
+        assert_eq!(app.history.last().map(String::as_str), Some("/skill:demo /skill:plain task here"));
+    }
+
+    #[tokio::test]
+    async fn skill_colon_bare_shows_usage() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        let agent = std::sync::Arc::new(SkillStubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        app.input = "/skill:".to_string();
+        app.cursor = 7;
+        assert!(!handle_key(&mut app, &agent, &tx, &think_tx, KeyCode::Enter, KeyModifiers::empty()));
+        assert!(!app.busy);
+        assert!(print_flat(&app).contains("usage: /skill:<name>"));
+    }
+
+    #[tokio::test]
     async fn slash_init_starts_turn_with_display_short() {
         // ADR-0009: `/init` rewrites to INIT_PROMPT and runs a normal turn;
         // the transcript shows `/init`, not the full instruction.
@@ -3943,6 +4061,48 @@ mod tests {
     impl AgentLoop for StubAgent {
         async fn chat(&self, _prompt: &str) -> Result<String, String> {
             Ok(String::new())
+        }
+    }
+
+    /// Stub with one skill (`demo`: body echoes `$ARGUMENTS`).
+    struct SkillStubAgent;
+
+    #[async_trait::async_trait]
+    impl AgentLoop for SkillStubAgent {
+        async fn chat(&self, _prompt: &str) -> Result<String, String> {
+            Ok(String::new())
+        }
+        fn list_skills(&self) -> Vec<crate::agent::SkillSummary> {
+            vec![crate::agent::SkillSummary {
+                name: "demo".to_string(),
+                description: "Demo skill.".to_string(),
+                path: "/x/demo/SKILL.md".to_string(),
+                note: None,
+            }]
+        }
+        fn get_skill_body(&self, name: &str) -> Option<String> {
+            match name {
+                "demo" => Some("Do the demo: $ARGUMENTS".to_string()),
+                "plain" => Some("Just do it.".to_string()),
+                _ => None,
+            }
+        }
+    }
+
+    /// Stub with two invokable skills for stacked-mention tests.
+    struct TwoSkillStubAgent;
+
+    #[async_trait::async_trait]
+    impl AgentLoop for TwoSkillStubAgent {
+        async fn chat(&self, _prompt: &str) -> Result<String, String> {
+            Ok(String::new())
+        }
+        fn get_skill_body(&self, name: &str) -> Option<String> {
+            match name {
+                "demo" => Some("Do the demo: $ARGUMENTS".to_string()),
+                "plain" => Some("Just do it.".to_string()),
+                _ => None,
+            }
         }
     }
 }
