@@ -7,6 +7,7 @@ mod modes;
 mod theme;
 mod permissions;
 mod sessions;
+mod skills;
 mod tools;
 mod tui;
 
