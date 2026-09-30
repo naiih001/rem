@@ -129,6 +129,44 @@ fn list_siblings(dir: &std::path::Path) -> Vec<String> {
     out
 }
 
+/// Scan roots in precedence order (first wins). Each root holds `<name>/SKILL.md`.
+/// Returns skills sorted by name for a stable preamble.
+pub fn discover_in(roots: &[std::path::PathBuf]) -> Vec<Skill> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(root) else { continue; };
+        let mut names: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+        names.sort_by_key(|e| e.file_name());
+        for entry in names {
+            let dir = entry.path();
+            if !dir.is_dir() { continue; }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') || !seen.insert(name.clone()) { continue; }
+            let md = dir.join("SKILL.md");
+            if !md.is_file() { continue; } // empty folder → skip (no lenient load without file)
+            match parse_skill_file(&name, &md) {
+                Ok(s) => out.push(s),
+                Err(e) => out.push(Skill {
+                    name: name.clone(), description: format!("(unreadable: {e})"),
+                    path: md.clone(), dir: dir.clone(), siblings: vec![],
+                    body: String::new(), note: Some(e),
+                }),
+            }
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// Live roots: project + `~/.config/rem/skills` + `~/.agents/skills`. Missing dirs skipped.
+pub fn discover(project_root: &std::path::Path) -> Vec<Skill> {
+    let mut roots = vec![project_root.join(".agents/skills")];
+    if let Some(cfg) = dirs::config_dir() { roots.push(cfg.join("rem").join("skills")); }
+    if let Some(home) = dirs::home_dir() { roots.push(home.join(".agents/skills")); }
+    discover_in(&roots)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,6 +223,22 @@ mod tests {
         let sibs = list_siblings(&dir);
         assert_eq!(sibs, vec!["reference.md".to_string(), "scripts/helper.py".to_string()]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discover_dedups_project_wins() {
+        let base = std::env::temp_dir().join("rem-skill-test-disc");
+        let _ = std::fs::remove_dir_all(&base);
+        let proj = base.join("proj/.agents/skills/pdf");
+        let glob = base.join("global/pdf");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::create_dir_all(&glob).unwrap();
+        std::fs::write(proj.join("SKILL.md"), "---\ndescription: Project one.\n---\nBody.\n").unwrap();
+        std::fs::write(glob.join("SKILL.md"), "---\ndescription: Global one.\n---\nBody.\n").unwrap();
+        let skills = discover_in(&[proj.parent().unwrap().to_path_buf(), glob.parent().unwrap().to_path_buf()]);
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].description, "Project one.");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
