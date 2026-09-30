@@ -43,7 +43,10 @@ impl Default for Theme {
     fn default() -> Self {
         Self {
             name: "default".into(),
-            pane_bg: Color::Rgb(0x19, 0x19, 0x19),
+            // pane_bg and rail_bg must stay distinct: the viewport tests
+            // assert the bottom pane carries pane_bg and never rail_bg
+            // (the old fullscreen rail wash). Matches the ashen theme.
+            pane_bg: Color::Rgb(0x12, 0x12, 0x12),
             rail_bg: Color::Rgb(0x19, 0x19, 0x19),
             accent: Color::Rgb(242, 118, 79),
             placeholder: Color::Rgb(0x4d, 0x4d, 0x4d),
@@ -418,6 +421,9 @@ blockquote_fg = "#928374"
         assert_eq!(t.name, "default");
         // Just spot-check a few — Default impl is the source of truth.
         assert_eq!(t.accent, Color::Rgb(242, 118, 79));
-        assert_eq!(t.pane_bg, Color::Rgb(0x19, 0x19, 0x19));
+        assert_eq!(t.pane_bg, Color::Rgb(0x12, 0x12, 0x12));
+        // Viewport tests require pane/rail separation under every config
+        // (CI has no config file, so it runs on these defaults).
+        assert_ne!(t.pane_bg, t.rail_bg, "pane_bg and rail_bg must differ");
     }
 }
