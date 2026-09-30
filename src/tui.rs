@@ -326,6 +326,11 @@ static COMMANDS: &[Command] = &[
         takes_arg: false,
         desc: "fork session from here",
     },
+    Command {
+        name: "skills",
+        takes_arg: true,
+        desc: "list or reload skills",
+    },
 ];
 
 /// Fixed instruction for `/init` (ADR-0009): runs as a normal agent turn so
@@ -3111,7 +3116,7 @@ mod tests {
         app.input = "/".to_string();
         app.cursor = 1;
         assert!(is_menu_open(&app));
-        // 5 registry commands, 3-row idle capacity: the menu caps at
+        // 9 registry commands, 3-row idle capacity: the menu caps at
         // capacity and spills into a `+N more` overflow row.
         assert_eq!(
             menu_height(&app),
@@ -3153,9 +3158,9 @@ mod tests {
         app.cursor = 1;
         app.menu_sel = Some(0);
         app.history = vec!["old turn".to_string()];
-        // 8 registry commands: quit, clear, help, theme, init, resume,
-        // rename, fork.
-        for expect in [1, 2, 3, 4, 5, 6, 7, 0] {
+        // 9 registry commands: quit, clear, help, theme, init, resume,
+        // rename, fork, skills.
+        for expect in [1, 2, 3, 4, 5, 6, 7, 8, 0] {
             assert!(!handle_key(
                 &mut app,
                 &agent,
@@ -3174,7 +3179,7 @@ mod tests {
             KeyCode::Up,
             KeyModifiers::empty()
         ));
-        assert_eq!(app.menu_sel, Some(7));
+        assert_eq!(app.menu_sel, Some(8));
         assert_eq!(app.hist_idx, None);
         assert_eq!(app.input, "/");
         assert_eq!(app.history, vec!["old turn".to_string()]);
@@ -3408,7 +3413,7 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        for name in ["/quit", "/clear", "/help", "/theme", "/init"] {
+        for name in ["/quit", "/clear", "/help", "/theme", "/init", "/skills"] {
             assert!(flat.contains(name), "help missing {name}: {flat}");
         }
         assert!(flat.contains("quit the app"), "help missing desc: {flat}");
@@ -3458,8 +3463,8 @@ mod tests {
         app.menu_sel = Some(0);
         terminal.draw(|f| render_pane(f, &mut app)).unwrap();
         let text = terminal.backend().to_string();
-        // Idle capacity fits 3 rows; 8 registry commands spill into
-        // 2 visible rows + a `+6 more` overflow row.
+        // Idle capacity fits 3 rows; 9 registry commands spill into
+        // 2 visible rows + a `+7 more` overflow row.
         for name in ["/quit", "/clear"] {
             assert!(text.contains(name), "menu row missing {name}: {text}");
         }
@@ -3468,7 +3473,7 @@ mod tests {
             "menu desc missing: {text}"
         );
         assert!(text.contains('▸'), "selection marker missing: {text}");
-        assert!(text.contains("+6 more"), "overflow row missing: {text}");
+        assert!(text.contains("+7 more"), "overflow row missing: {text}");
         let menu_row = text.lines().position(|l| l.contains("/quit")).unwrap();
         let input_row = text.lines().position(|l| l.contains("❯ /")).unwrap();
         assert!(menu_row < input_row, "menu must render above the composer");
