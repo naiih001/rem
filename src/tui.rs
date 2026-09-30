@@ -170,6 +170,8 @@ fn run_app(
         .context("create terminal")?;
 
         let mut app = App::new(model, effort);
+        // Skills index for `/skill:<partial>` suggestions (Task 14 cache).
+        app.skill_names = agent.list_skills().iter().map(|s| s.name.clone()).collect();
         // Resume: on relaunch with REM_SESSION_ID set, replay the stored
         // transcript so the pane shows prior turns before new input.
         if let Ok(sid) = std::env::var("REM_SESSION_ID")
@@ -355,6 +357,12 @@ static COMMANDS: &[Command] = &[
         desc: "fork session from here",
         hint: "",
     },
+    Command {
+        name: "skills",
+        takes_arg: true,
+        desc: "list or reload skills",
+        hint: "[reload]",
+    },
 ];
 
 /// Fixed instruction for `/init` (ADR-0009): runs as a normal agent turn so
@@ -431,8 +439,10 @@ fn menu_matches_token(token: &str) -> Vec<&'static Command> {
 }
 
 /// Live menu rows at caret. Mid-input case 1. Theme-arg mode same as old
-/// (`/theme <partial>` where partial has no space).
-fn menu_live(input: &str, cursor: usize) -> MenuLive {
+/// (`/theme <partial>` where partial has no space). Skill-arg mode
+/// (`/skill:<partial>`) draws suggestions from the `App.skill_names`
+/// cache — pass `&[]` when no cache exists (pure command/theme tests).
+fn menu_live(input: &str, cursor: usize, skills: &[String]) -> MenuLive {
     let before: String = input.chars().take(cursor).collect();
     // Theme-arg case: `/theme <partial>` or bare `/theme `.
     // This must be checked before token walk-back because the cursor may
@@ -459,6 +469,21 @@ fn menu_live(input: &str, cursor: usize) -> MenuLive {
             return MenuLive::Closed;
         }
         return MenuLive::Themes {
+            names,
+            b_start,
+            b_end,
+        };
+    }
+    // Skill-arg case: `/skill:<partial>` or bare `/skill:`. Checked before
+    // the command-token walk-back: `:` is a word char, so the token would
+    // be `skill:<partial>` and match no command. Names come from the
+    // skills cache (no filesystem read on the keystroke path).
+    if let Some((partial, b_start, b_end)) = skill_arg_partial_at(&before, skills) {
+        let names = match_skill_names(skills, &partial);
+        if names.is_empty() {
+            return MenuLive::Closed;
+        }
+        return MenuLive::Skills {
             names,
             b_start,
             b_end,
@@ -493,6 +518,11 @@ enum MenuLive {
         b_start: usize,
         b_end: usize,
     },
+    Skills {
+        names: Vec<String>,
+        b_start: usize,
+        b_end: usize,
+    },
 }
 
 /// `/theme <partial>` check on text before caret. Same rules as
@@ -516,6 +546,32 @@ fn theme_arg_partial_at(before: &str) -> Option<String> {
         return None;
     }
     Some(partial.to_string())
+}
+
+/// `/skill:<partial>` check on text before caret. Mirrors
+/// [`theme_arg_partial_at`]: the `/` must be at start or after whitespace,
+/// the partial carries no whitespace. Returns the partial plus the byte
+/// span of `/skill:<partial>` (completion rewrites the whole token to the
+/// full `/skill:<name>` invokable form). A partial matching no cached
+/// name closes the menu — submit reports the unknown skill.
+fn skill_arg_partial_at(before: &str, skills: &[String]) -> Option<(String, usize, usize)> {
+    // Find last `/skill:` run before caret.
+    let idx = before.rfind("/skill:")?;
+    // `/` must be at start or after whitespace (case 1 rule).
+    if idx > 0 {
+        let prev = before[..idx].chars().last()?;
+        if !prev.is_whitespace() {
+            return None;
+        }
+    }
+    let partial = &before[idx + "/skill:".len()..];
+    if partial.chars().any(|c| c.is_whitespace()) {
+        return None;
+    }
+    if match_skill_names(skills, partial).is_empty() {
+        return None;
+    }
+    Some((partial.to_string(), idx, before.len()))
 }
 
 /// Theme-arg partial: the menu suggests installed theme names while the
@@ -560,9 +616,42 @@ fn theme_arg_matches(input: &str) -> Vec<String> {
     }
 }
 
+/// Skill-arg partial: the menu suggests discovered skill names while the
+/// input is `/skill:<partial>` — colon form, partial name with no
+/// whitespace. Returns the partial (empty = bare `/skill:`, list
+/// everything). `None` for anything else. Case-sensitive, mirroring
+/// `menu_matches`. Unlike themes (live filesystem), names come from the
+/// `App.skill_names` cache — see `skill_arg_matches_for`.
+fn skill_arg_partial(input: &str) -> Option<String> {
+    let rest = input.strip_prefix('/')?;
+    let partial = rest.strip_prefix("skill:")?;
+    if partial.chars().any(|c| c.is_whitespace()) {
+        return None;
+    }
+    Some(partial.to_string())
+}
+
+/// Prefix-filter skill names, order preserved. Pure seam for tests; the live
+/// path composes this with the `App.skill_names` cache.
+fn match_skill_names(names: &[String], partial: &str) -> Vec<String> {
+    names
+        .iter()
+        .filter(|n| n.starts_with(partial))
+        .cloned()
+        .collect()
+}
+
+/// Skill suggestions for an input + cached name list.
+fn skill_arg_matches_for(input: &str, names: &[String]) -> Vec<String> {
+    let Some(partial) = skill_arg_partial(input) else {
+        return Vec::new();
+    };
+    match_skill_names(names, &partial)
+}
+
 /// Total menu rows: command rows for a bare `/token`, theme-name rows for
-/// `/theme <partial>`. Mutually exclusive by construction (whitespace
-/// decides), so this is one mode's count — never a mixed sum.
+/// `/theme <partial>`, skill rows for `/skill:<partial>`. Mutually exclusive
+/// by construction, so this is one mode's count — never a mixed sum.
 fn menu_row_count(input: &str) -> usize {
     let n = menu_matches(input).len();
     if n > 0 {
@@ -572,15 +661,29 @@ fn menu_row_count(input: &str) -> usize {
     }
 }
 
+/// Menu rows for a live `App`: command/theme counts plus skill suggestions
+/// from the cache.
+fn menu_row_count_app(app: &App) -> usize {
+    let n = menu_row_count(&app.input);
+    if n > 0 {
+        n
+    } else {
+        skill_arg_matches_for(&app.input, &app.skill_names).len()
+    }
+}
+
 /// True when the slash menu should show: at least one match.
 /// Old start-only path (submit + old tests). Live path uses `menu_live`.
 fn is_menu_open(app: &App) -> bool {
-    menu_row_count(&app.input) > 0
+    menu_row_count_app(app) > 0
 }
 
 /// True when live float menu shows at caret (mid-input case 1).
 fn is_menu_live(app: &App) -> bool {
-    !matches!(menu_live(&app.input, app.cursor), MenuLive::Closed)
+    !matches!(
+        menu_live(&app.input, app.cursor, &app.skill_names),
+        MenuLive::Closed
+    )
 }
 
 fn menu_status_height(_app: &App) -> u16 {
@@ -601,10 +704,11 @@ fn menu_height(app: &App) -> u16 {
 /// `None` → `Some(0)`; `Some(i)` → clamped; menu closed → `None`.
 /// Uses live caret token (mid-input). Old start-only count kept for submit.
 fn clamp_menu_sel(app: &mut App) {
-    let n = match menu_live(&app.input, app.cursor) {
+    let n = match menu_live(&app.input, app.cursor, &app.skill_names) {
         MenuLive::Closed => menu_row_count(&app.input),
         MenuLive::Commands { cmds, .. } => cmds.len(),
         MenuLive::Themes { names, .. } => names.len(),
+        MenuLive::Skills { names, .. } => names.len(),
     };
     if n == 0 {
         app.menu_sel = None;
@@ -616,7 +720,7 @@ fn clamp_menu_sel(app: &mut App) {
 /// Fill top pick into text at caret token span. Mid-input safe.
 /// `fix bug /res` -> `fix bug /resume`. Cursor lands after filled text.
 fn complete_menu_at_caret(app: &mut App) {
-    let live = menu_live(&app.input, app.cursor);
+    let live = menu_live(&app.input, app.cursor, &app.skill_names);
     match live {
         MenuLive::Closed => {}
         MenuLive::Commands {
@@ -645,6 +749,22 @@ fn complete_menu_at_caret(app: &mut App) {
             // Replace partial after `/theme ` with picked name.
             // b_start..b_end covers `/partial`; keep `/theme ` head.
             let fill = names[idx].clone();
+            app.input.replace_range(b_start..b_end, &fill);
+            app.cursor = app.input[..b_start + fill.len()].chars().count();
+            clamp_menu_sel(app);
+        }
+        MenuLive::Skills {
+            names,
+            b_start,
+            b_end,
+        } => {
+            if names.is_empty() {
+                return;
+            }
+            let idx = app.menu_sel.unwrap_or(0).min(names.len() - 1);
+            // b_start..b_end covers `/skill:<partial>`; rewrite the whole
+            // token to the full `/skill:<name>` invokable form.
+            let fill = format!("/skill:{}", names[idx]);
             app.input.replace_range(b_start..b_end, &fill);
             app.cursor = app.input[..b_start + fill.len()].chars().count();
             clamp_menu_sel(app);
@@ -689,6 +809,9 @@ struct App {
     /// Slash-menu selection index (ADR-0007). `None` = menu closed;
     /// `Some(i)` = menu open with row `i` highlighted.
     menu_sel: Option<usize>,
+    /// Cached skill folder names for `/skill:<partial>` suggestions.
+    /// Refreshed at startup and on `/skills reload`.
+    skill_names: Vec<String>,
     /// Pending human approvals (FIFO). Head renders as a blocking modal;
     /// resolving it resumes the parked agent worker in the same run.
     pending_approvals: VecDeque<ApprovalRequest>,
@@ -856,6 +979,7 @@ impl App {
             dirty: true,
             streamed_tools: 0,
             menu_sel: None,
+            skill_names: Vec::new(),
             pending_approvals: VecDeque::new(),
             approval_sel: 0,
             approval_comment: String::new(),
@@ -1439,10 +1563,11 @@ fn handle_key(
     let live_open = is_menu_live(app);
     if live_open {
         // Count rows from live token (not whole input).
-        let live_n = match menu_live(&app.input, app.cursor) {
+        let live_n = match menu_live(&app.input, app.cursor, &app.skill_names) {
             MenuLive::Closed => 0,
             MenuLive::Commands { cmds, .. } => cmds.len(),
             MenuLive::Themes { names, .. } => names.len(),
+            MenuLive::Skills { names, .. } => names.len(),
         };
         match code {
             KeyCode::Up => {
@@ -1648,6 +1773,34 @@ fn handle_theme_command(app: &mut App, arg: &str) {
     }
 }
 
+/// Expand leading `/skill:name` mentions (up to `MAX_STACKED`) into full
+/// `SKILL.md` bodies with `$ARGUMENTS` substitution. Returns `None` when the
+/// input is not a skill invoke. `Err` names the first unknown skill.
+/// The display short form is the original text (transcript shows `/skill:x`).
+fn expand_skill_invokes(
+    text: &str,
+    agent: &Arc<impl AgentLoop + Send + Sync + 'static>,
+) -> Result<Option<(String, String)>, String> {
+    let (names, task) = crate::skills::split_leading_mentions(text);
+    if names.is_empty() {
+        return Ok(None);
+    }
+    let args = crate::skills::split_args(&task);
+    let mut bodies = Vec::with_capacity(names.len());
+    for name in &names {
+        match agent.get_skill_body(name) {
+            Some(body) => bodies.push(crate::skills::substitute_args(&body, &task, &args)),
+            None => return Err(format!("no skill '{name}' (see /skills)")),
+        }
+    }
+    let mut expanded = bodies.join("\n\n");
+    if !task.trim().is_empty() {
+        expanded.push_str("\n\n");
+        expanded.push_str(task.trim());
+    }
+    Ok(Some((text.to_string(), expanded)))
+}
+
 fn submit(
     app: &mut App,
     agent: &Arc<impl AgentLoop + Send + Sync + 'static>,
@@ -1658,9 +1811,55 @@ fn submit(
     if text.is_empty() || app.busy {
         return false;
     }
+    // Skill-arg accept (mirrors theme-arg accept below): `/skill:<partial>`
+    // with suggestions open resolves the highlighted skill to invokable
+    // text before expansion, so Enter picks a suggestion. Runs first — an
+    // unresolved partial would otherwise fail expansion as unknown.
+    if menu_matches(&text).is_empty()
+        && skill_arg_partial(&text).is_some()
+        && !text.contains(char::is_whitespace)
+    {
+        let names = skill_arg_matches_for(&text, &app.skill_names);
+        if !names.is_empty() {
+            let idx = app.menu_sel.unwrap_or(0).min(names.len() - 1);
+            text = format!("/skill:{}", names[idx]);
+        }
+    }
+    // Skill invoke (`/skill:name ...`, possibly stacked): expand to full
+    // bodies before any menu/parse logic. Transcript keeps the short form
+    // (mirrors `/init` display handling below).
+    let mut skill_display: Option<String> = None;
+    match expand_skill_invokes(&text, agent) {
+        Ok(Some((display, expanded))) => {
+            skill_display = Some(display);
+            text = expanded;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            app.input.clear();
+            app.cursor = 0;
+            app.menu_sel = None;
+            app.enqueue_notice(format!("skill: {e}"));
+            return false;
+        }
+    }
+    // Bare `/skill:` with no name (not a leading mention) → usage.
+    if skill_display.is_none() && text.starts_with("/skill:") {
+        app.input.clear();
+        app.cursor = 0;
+        app.menu_sel = None;
+        app.enqueue_notice("usage: /skill:<name> [task]".to_string());
+        return false;
+    }
+    let skill_turn = skill_display.is_some();
     // Live menu first (mid-input case 1): fill top pick at caret token,
     // then fall to old start-only paths. Enter picks suggestion.
-    if !matches!(menu_live(&app.input, app.cursor), MenuLive::Closed) {
+    if !skill_turn
+        && !matches!(
+            menu_live(&app.input, app.cursor, &app.skill_names),
+            MenuLive::Closed
+        )
+    {
         complete_menu_at_caret(app);
         text = app.input.trim().to_string();
     }
@@ -1685,7 +1884,9 @@ fn submit(
     app.input.clear();
     app.cursor = 0;
     app.menu_sel = None;
-    app.history.push(text.clone());
+    // Skill turns record the short `/skill:x` form, not the expansion.
+    app.history
+        .push(skill_display.clone().unwrap_or_else(|| text.clone()));
     app.hist_idx = None;
 
     if let Some((cmd, arg)) = parse_command(&text) {
@@ -1835,17 +2036,59 @@ fn submit(
                 }
                 return false;
             }
+            "skills" => {
+                if arg.trim() == "reload" {
+                    if app.busy {
+                        app.enqueue_notice(
+                            "skills: busy — reload after the turn finishes".to_string(),
+                        );
+                        return false;
+                    }
+                    match agent.reload_skills_sync() {
+                        Ok(msg) => {
+                            app.skill_names =
+                                agent.list_skills().iter().map(|s| s.name.clone()).collect();
+                            app.enqueue_notice(format!("skills: {msg}"));
+                        }
+                        Err(e) => app.enqueue_notice(format!("skills reload failed: {e}")),
+                    }
+                    return false;
+                }
+                if !arg.trim().is_empty() {
+                    app.enqueue_notice("usage: /skills [reload]".to_string());
+                    return false;
+                }
+                let list = agent.list_skills();
+                if list.is_empty() {
+                    app.enqueue_notice("no skills installed (project .agents/skills, ~/.config/rem/skills, ~/.agents/skills)".to_string());
+                } else {
+                    let mut msg = String::from("skills:");
+                    for s in list {
+                        let note = s.note.map(|n| format!(" [{n}]")).unwrap_or_default();
+                        msg.push_str(&format!(
+                            "\n  /skill:{} — {}{} — {}",
+                            s.name, s.description, note, s.path
+                        ));
+                    }
+                    app.enqueue_notice(msg);
+                }
+                return false;
+            }
             _ => {}
         }
     }
-    if text.starts_with('/') {
+    if text.starts_with('/') && !skill_turn {
         app.enqueue_notice(format!("unknown command \"{text}\". Try /help."));
         return false;
     }
 
-    // `/init` shows the short command in the transcript while the agent
-    // receives the full fixed instruction.
-    let display = if text.as_str() == INIT_PROMPT {
+    // `/init` and `/skill:x` show the short command in the transcript while
+    // the agent receives the full expanded instruction.
+    let display_owned;
+    let display = if let Some(short) = skill_display.as_deref() {
+        display_owned = short.to_string();
+        display_owned.as_str()
+    } else if text.as_str() == INIT_PROMPT {
         "/init"
     } else {
         text.as_str()
@@ -2677,17 +2920,20 @@ fn render_status(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect)
 
 /// Slash-menu float box above input. Small box with thin border.
 /// Mid-input case 1: `/` after space or at start. Gray `[hint]` after space.
-/// `▸ /name  desc` rows, `▸ <theme>` rows in theme mode. Cap 10 + `+N more`.
-/// Old pane-row slot now draws nothing (area height is 0). Float draws in
-/// `render_pane_in` after input, so box sits above input line.
+/// `▸ /name  desc` rows, `▸ <theme>` rows in theme mode, `▸ <skill>` rows
+/// in skill mode (`/skill:<partial>`, from the skills cache). Cap 10 +
+/// `+N more`. Old pane-row slot now draws nothing (area height is 0).
+/// Float draws in `render_pane_in` after input, so box sits above input line.
 /// Float slash menu. Small box with border, above input line.
 /// Same rows as old band, but in float box. Gray hint text included.
 fn render_menu_float(f: &mut ratatui::Frame, app: &App, area: Rect) {
-    let live = menu_live(&app.input, app.cursor);
-    let (is_themes, total) = match &live {
+    let live = menu_live(&app.input, app.cursor, &app.skill_names);
+    // Mode tag: skill rows render like theme rows (`▸ <name>`).
+    let (mode, total) = match &live {
         MenuLive::Closed => return,
-        MenuLive::Commands { cmds, .. } => (false, cmds.len()),
-        MenuLive::Themes { names, .. } => (true, names.len()),
+        MenuLive::Commands { cmds, .. } => ("cmds", cmds.len()),
+        MenuLive::Themes { names, .. } => ("themes", names.len()),
+        MenuLive::Skills { names, .. } => ("skills", names.len()),
     };
     if total == 0 {
         return;
@@ -2739,7 +2985,7 @@ fn render_menu_float(f: &mut ratatui::Frame, app: &App, area: Rect) {
             false => Style::default().fg(Color::DarkGray).bg(theme.pane_bg),
         }
     };
-    if is_themes {
+    if mode == "themes" {
         let MenuLive::Themes { names, .. } = &live else {
             return;
         };
@@ -2764,6 +3010,30 @@ fn render_menu_float(f: &mut ratatui::Frame, app: &App, area: Rect) {
                 selected,
                 marker,
                 vec![Span::styled(label, sel_style(selected))],
+            ));
+        }
+    } else if mode == "skills" {
+        let MenuLive::Skills { names, .. } = &live else {
+            return;
+        };
+        // Skill rows render like theme rows (`▸ <name>`); Tab/Enter
+        // completes the full `/skill:<name>` invokable form.
+        for (i, name) in names.iter().enumerate().skip(start).take(show_rows) {
+            let selected = i == sel;
+            let marker = match selected {
+                true => Span::styled(
+                    "▸ ",
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD)
+                        .bg(theme.menu_sel_bg),
+                ),
+                false => Span::styled("  ", Style::default().bg(theme.pane_bg)),
+            };
+            lines.push(mk_row(
+                selected,
+                marker,
+                vec![Span::styled(name.clone(), sel_style(selected))],
             ));
         }
     } else {
@@ -4060,9 +4330,9 @@ mod tests {
         app.cursor = 1;
         app.menu_sel = Some(0);
         app.history = vec!["old turn".to_string()];
-        // 8 registry commands: quit, clear, help, theme, init, resume,
-        // rename, fork.
-        for expect in [1, 2, 3, 4, 5, 6, 7, 0] {
+        // 9 registry commands: quit, clear, help, theme, init, resume,
+        // rename, fork, skills.
+        for expect in [1, 2, 3, 4, 5, 6, 7, 8, 0] {
             assert!(!handle_key(
                 &mut app,
                 &agent,
@@ -4081,10 +4351,225 @@ mod tests {
             KeyCode::Up,
             KeyModifiers::empty()
         ));
-        assert_eq!(app.menu_sel, Some(7));
+        assert_eq!(app.menu_sel, Some(8));
         assert_eq!(app.hist_idx, None);
         assert_eq!(app.input, "/");
         assert_eq!(app.history, vec!["old turn".to_string()]);
+    }
+
+    fn print_flat(app: &App) -> String {
+        app.print_queue
+            .iter()
+            .flatten()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tokio::test]
+    async fn slash_skills_lists_without_turn() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        let agent = std::sync::Arc::new(StubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        app.input = "/skills".to_string();
+        app.cursor = 7;
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Enter,
+            KeyModifiers::empty()
+        ));
+        assert!(!app.busy, "/skills must not start a turn");
+        let flat = print_flat(&app);
+        // StubAgent has no skills → empty notice.
+        assert!(flat.contains("no skills"), "got: {flat}");
+    }
+
+    #[tokio::test]
+    async fn slash_skills_bad_arg_usage_no_turn() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        let agent = std::sync::Arc::new(StubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        app.input = "/skills frobnicate".to_string();
+        app.cursor = 19;
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Enter,
+            KeyModifiers::empty()
+        ));
+        assert!(!app.busy);
+        assert!(print_flat(&app).contains("usage: /skills [reload]"));
+    }
+
+    #[tokio::test]
+    async fn skill_colon_unknown_queues_notice_no_turn() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        let agent = std::sync::Arc::new(SkillStubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        app.input = "/skill:nope do x".to_string();
+        app.cursor = 14;
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Enter,
+            KeyModifiers::empty()
+        ));
+        assert!(!app.busy, "unknown skill must not start a turn");
+        assert!(print_flat(&app).contains("no skill 'nope'"));
+    }
+
+    #[tokio::test]
+    async fn skill_colon_single_expands_body_with_task() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        let agent = std::sync::Arc::new(SkillStubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        app.input = "/skill:demo fix login".to_string();
+        app.cursor = 22;
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Enter,
+            KeyModifiers::empty()
+        ));
+        assert!(app.busy, "known skill must start a turn");
+        // Transcript + history show the short form.
+        assert_eq!(
+            app.history.last().map(String::as_str),
+            Some("/skill:demo fix login")
+        );
+        assert!(print_flat(&app).contains("/skill:demo fix login"));
+    }
+
+    #[tokio::test]
+    async fn skill_colon_stacked_expands_both() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        let agent = std::sync::Arc::new(TwoSkillStubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        app.input = "/skill:demo /skill:plain task here".to_string();
+        app.cursor = 34;
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Enter,
+            KeyModifiers::empty()
+        ));
+        assert!(app.busy, "stacked skills must start a turn");
+        assert_eq!(
+            app.history.last().map(String::as_str),
+            Some("/skill:demo /skill:plain task here")
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_colon_bare_shows_usage() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        let agent = std::sync::Arc::new(SkillStubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+        app.input = "/skill:".to_string();
+        app.cursor = 7;
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Enter,
+            KeyModifiers::empty()
+        ));
+        assert!(!app.busy);
+        assert!(print_flat(&app).contains("usage: /skill:<name>"));
+    }
+
+    #[test]
+    fn skill_menu_suggests_prefix() {
+        let names = vec!["pdf".to_string(), "plan".to_string(), "deploy".to_string()];
+        assert_eq!(skill_arg_partial("/skill:p"), Some("p".to_string()));
+        assert_eq!(skill_arg_partial("/skill:"), Some(String::new()));
+        assert!(skill_arg_partial("/skill:p task").is_none());
+        assert!(skill_arg_partial("/skills").is_none());
+        assert_eq!(
+            match_skill_names(&names, "p"),
+            vec!["pdf".to_string(), "plan".to_string()]
+        );
+        assert_eq!(
+            skill_arg_matches_for("/skill:dep", &names),
+            vec!["deploy".to_string()]
+        );
+        assert!(skill_arg_matches_for("/skill:x", &names).is_empty());
+    }
+
+    #[test]
+    fn skill_menu_floats_without_growing_pane() {
+        // Float-world counterpart: the slash menu floats over the pane
+        // (ADR-0011), so `/skill:` suggestions never grow `pane_height`.
+        // The float box itself caps at 7 skill rows + border.
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.skill_names = vec![
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string(),
+            "d".to_string(),
+            "e".to_string(),
+            "f".to_string(),
+            "g".to_string(),
+        ];
+        app.input = "/skill:".to_string();
+        app.cursor = 7;
+        assert!(is_menu_open(&app));
+        assert_eq!(menu_row_count_app(&app), 7);
+        // Pane stays compact with the menu open.
+        let with_menu = app.pane_height(80);
+        app.menu_sel = None;
+        app.input = "hello".to_string();
+        let idle = app.pane_height(80);
+        assert_eq!(with_menu, idle);
+        // The live float menu sees all 7 skill rows.
+        app.input = "/skill:".to_string();
+        app.cursor = 7;
+        let live = menu_live(&app.input, app.cursor, &app.skill_names);
+        match live {
+            MenuLive::Skills { names, .. } => assert_eq!(names.len(), 7),
+            other => panic!("expected Skills menu, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn skill_menu_opens_for_partial() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.skill_names = vec!["pdf".to_string(), "plan".to_string()];
+        app.input = "/skill:p".to_string();
+        app.cursor = 8;
+        assert!(is_menu_open(&app));
+        assert_eq!(menu_row_count_app(&app), 2);
+        clamp_menu_sel(&mut app);
+        assert_eq!(app.menu_sel, Some(0));
     }
 
     #[tokio::test]
@@ -4315,7 +4800,7 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        for name in ["/quit", "/clear", "/help", "/theme", "/init"] {
+        for name in ["/quit", "/clear", "/help", "/theme", "/init", "/skills"] {
             assert!(flat.contains(name), "help missing {name}: {flat}");
         }
         assert!(flat.contains("quit the app"), "help missing desc: {flat}");
@@ -4385,6 +4870,34 @@ mod tests {
         assert!(
             text.contains("Message rem…"),
             "composer placeholder missing: {text}"
+        );
+    }
+
+    #[test]
+    fn skill_menu_renders_skill_rows_above_composer() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let backend = TestBackend::new(80, PANE_ROWS);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("test-model".to_string(), "medium".to_string());
+        app.skill_names = vec!["pdf".to_string(), "plan".to_string()];
+        app.input = "/skill:p".to_string();
+        app.cursor = 8;
+        app.menu_sel = Some(0);
+        terminal.draw(|f| render_pane(f, &mut app)).unwrap();
+        let text = terminal.backend().to_string();
+        // Float box renders skill rows like theme rows (`▸ <name>`).
+        for name in ["pdf", "plan"] {
+            assert!(text.contains(name), "skill row missing {name}: {text}");
+        }
+        assert!(text.contains('▸'), "selection marker missing: {text}");
+        assert!(text.contains("┌"), "box border missing: {text}");
+        // Float box covers the composer while open (it owns the keys);
+        // skill rows sit above the pane bottom (no fullscreen takeover).
+        let menu_row = text.lines().position(|l| l.contains("pdf")).unwrap();
+        let n_rows = text.lines().count();
+        assert!(
+            menu_row + 1 < n_rows,
+            "menu must render above the pane bottom"
         );
     }
 
@@ -4760,6 +5273,48 @@ mod tests {
     impl AgentLoop for StubAgent {
         async fn chat(&self, _prompt: &str) -> Result<String, String> {
             Ok(String::new())
+        }
+    }
+
+    /// Stub with one skill (`demo`: body echoes `$ARGUMENTS`).
+    struct SkillStubAgent;
+
+    #[async_trait::async_trait]
+    impl AgentLoop for SkillStubAgent {
+        async fn chat(&self, _prompt: &str) -> Result<String, String> {
+            Ok(String::new())
+        }
+        fn list_skills(&self) -> Vec<crate::agent::SkillSummary> {
+            vec![crate::agent::SkillSummary {
+                name: "demo".to_string(),
+                description: "Demo skill.".to_string(),
+                path: "/x/demo/SKILL.md".to_string(),
+                note: None,
+            }]
+        }
+        fn get_skill_body(&self, name: &str) -> Option<String> {
+            match name {
+                "demo" => Some("Do the demo: $ARGUMENTS".to_string()),
+                "plain" => Some("Just do it.".to_string()),
+                _ => None,
+            }
+        }
+    }
+
+    /// Stub with two invokable skills for stacked-mention tests.
+    struct TwoSkillStubAgent;
+
+    #[async_trait::async_trait]
+    impl AgentLoop for TwoSkillStubAgent {
+        async fn chat(&self, _prompt: &str) -> Result<String, String> {
+            Ok(String::new())
+        }
+        fn get_skill_body(&self, name: &str) -> Option<String> {
+            match name {
+                "demo" => Some("Do the demo: $ARGUMENTS".to_string()),
+                "plain" => Some("Just do it.".to_string()),
+                _ => None,
+            }
         }
     }
 }
