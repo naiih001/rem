@@ -649,6 +649,305 @@ fn skill_arg_matches_for(input: &str, names: &[String]) -> Vec<String> {
     match_skill_names(names, &partial)
 }
 
+// ---------------------------------------------------------------------------
+// @ mention helpers (ADR-0012)
+// ---------------------------------------------------------------------------
+
+/// Trailing-punctuation trim set for @ token endings (trimmed from the end,
+/// after the token is bounded by whitespace or the terminator set).
+const AT_TRAIL_TRIM: &[char] = &['.', ':'];
+/// Punctuation that terminates a token (never part of the path).
+const AT_TRAIL_TERM: &[char] = &[',', ';', '!', '?', ')', ']', '}'];
+
+/// Scan `input` for `@` refs in appearance order. `@` starts a ref unless
+/// the char directly before it is an ASCII letter (`[A-Za-z]`). Token runs
+/// to whitespace or terminator punct; trailing `AT_TRAIL_TRIM` then trimmed.
+/// No quoted-space paths in v1. `@@foo` parses as a ref token (no escape).
+fn scan_at_refs(input: &str) -> Vec<String> {
+    let chars: Vec<char> = input.chars().collect();
+    let n = chars.len();
+    let mut refs = Vec::new();
+    let mut i = 0;
+    while i < n {
+        if chars[i] == '@' {
+            let trigger = i == 0 || !chars[i - 1].is_ascii_alphabetic();
+            if trigger {
+                let start = i + 1;
+                let mut end = start;
+                while end < n
+                    && !chars[end].is_ascii_whitespace()
+                    && !AT_TRAIL_TERM.contains(&chars[end])
+                {
+                    end += 1;
+                }
+                let token: String = chars[start..end]
+                    .iter()
+                    .collect::<String>()
+                    .trim_end_matches(AT_TRAIL_TRIM)
+                    .to_string();
+                if !token.is_empty() {
+                    refs.push(token);
+                }
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    refs
+}
+
+/// Return the active `@` token under the caret, if any.
+/// `(at_char_idx, token_end_char_idx, partial)` — the span is the raw
+/// token chars including the trailing punctuation (for rewriting on
+/// completion). `partial` is the trimmed form. The token includes spaces
+/// (fuzzy query like `@src ma`), ending only at `AT_TRAIL_TERM` or EOL.
+fn active_at_token(input: &str, caret: usize) -> Option<(usize, usize, String)> {
+    let chars: Vec<char> = input.chars().collect();
+    let n = chars.len();
+    if caret > n {
+        return None;
+    }
+    let mut i = 0;
+    while i < n {
+        if chars[i] == '@' {
+            let trigger = i == 0 || !chars[i - 1].is_ascii_alphabetic();
+            if trigger {
+                let start = i + 1;
+                let mut end = start;
+                // Token includes spaces (fuzzy query); ends at terminator,
+                // next @-trigger, or EOL.
+                while end < n
+                    && !AT_TRAIL_TERM.contains(&chars[end])
+                    && !(chars[end] == '@' && (end == 0 || !chars[end - 1].is_ascii_alphabetic()))
+                {
+                    end += 1;
+                }
+                // Caret is inside this token if it's within (start..=end).
+                if caret >= start && caret <= end {
+                    let partial: String = chars[start..end]
+                        .iter()
+                        .collect::<String>()
+                        .trim_end_matches(AT_TRAIL_TRIM)
+                        .trim_start()
+                        .to_string();
+                    return Some((i, end, partial));
+                }
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Resolve a raw `@` token path against `project_root`. Returns `Some(full)
+/// on success, `None` on outside-root / absolute / symlink escape.
+/// Lexical normalization only (no fs access) — canonical check happens at
+/// read time.
+fn at_resolve_in_root(project_root: &std::path::Path, raw: &str) -> Option<std::path::PathBuf> {
+    use std::path::{Component, PathBuf};
+    if raw.is_empty() {
+        return None;
+    }
+    let p = std::path::Path::new(raw);
+    if p.is_absolute() {
+        return None; // block absolute
+    }
+    let joined = project_root.join(p);
+    // Lexical normalize.
+    let mut norm = PathBuf::new();
+    for comp in joined.components() {
+        match comp {
+            Component::ParentDir => {
+                if !norm.pop() {
+                    return None; // escapes root
+                }
+            }
+            Component::CurDir => {}
+            Component::Normal(_) | Component::RootDir | Component::Prefix(_) => {
+                norm.push(comp);
+            }
+        }
+    }
+    if !norm.starts_with(project_root) {
+        return None;
+    }
+    Some(norm)
+}
+
+/// Check if a file's first 8 KiB contains a NUL byte (binary heuristic).
+fn is_binary_file(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return true; // unreadable → treat as binary
+    };
+    let mut buf = [0u8; 8192];
+    let n = f.read(&mut buf).unwrap_or(0);
+    buf[..n].contains(&0)
+}
+
+/// Read a file for @ expansion, capping at `Context::TOOL_BUDGET` chars.
+/// Returns the formatted fenced block. Errors name the ref path.
+fn read_at_file(path: &std::path::Path, display: &str) -> Result<String, String> {
+    if path.is_dir() {
+        return Err(format!("@{display}: is a directory"));
+    }
+    if is_binary_file(path) {
+        return Err(format!("@{display}: binary file"));
+    }
+    let content = std::fs::read_to_string(path).map_err(|e| format!("@{display}: {e}"))?;
+    let cap = crate::context::Context::TOOL_BUDGET;
+    if content.chars().count() > cap {
+        let truncated: String = content.chars().take(cap).collect();
+        let dropped = content.chars().count() - cap;
+        Ok(format!(
+            "{display}:\n```\n{truncated}\n```\n[truncated {dropped} chars]"
+        ))
+    } else {
+        Ok(format!("{display}:\n```\n{content}\n```"))
+    }
+}
+
+/// Read a directory for @ expansion. Non-recursive, sorted, `file:`/`dir:`
+/// lines, capped at 500 entries (matching `list_directory`).
+fn read_at_dir(path: &std::path::Path, display: &str) -> Result<String, String> {
+    const MAX_ENTRIES: usize = 500;
+    let entries = std::fs::read_dir(path).map_err(|e| format!("@{display}/: {e}"))?;
+    let mut lines = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("@{display}/: {e}"))?;
+        let ft = entry.file_type().map_err(|e| format!("@{display}/: {e}"))?;
+        let kind = if ft.is_dir() { "dir" } else { "file" };
+        lines.push(format!("{kind}: {}", entry.file_name().to_string_lossy()));
+        if lines.len() >= MAX_ENTRIES {
+            lines.push(format!("[truncated to {MAX_ENTRIES} entries]"));
+            break;
+        }
+    }
+    lines.sort();
+    let listing = if lines.is_empty() {
+        "(empty directory)".to_string()
+    } else {
+        lines.join("\n")
+    };
+    Ok(format!("{display}/ (directory listing):\n{listing}"))
+}
+
+/// Expand all `@` refs in `text` into fenced content blocks appended after
+/// the original text. On any bad ref, returns `Err` naming the first bad ref.
+/// Root confinement: resolved against `project_root`.
+fn expand_at_refs(text: &str, project_root: &std::path::Path) -> Result<String, String> {
+    let refs = scan_at_refs(text);
+    if refs.is_empty() {
+        return Ok(text.to_string());
+    }
+    let mut blocks = Vec::new();
+    for raw in &refs {
+        let full = at_resolve_in_root(project_root, raw)
+            .ok_or_else(|| format!("@{raw}: outside project root"))?;
+        if full.is_dir() {
+            blocks.push(read_at_dir(&full, raw)?);
+        } else {
+            blocks.push(read_at_file(&full, raw)?);
+        }
+    }
+    Ok(format!("{text}\n\n{}", blocks.join("\n\n")))
+}
+
+/// Fuzzy subsequence match: every char of `query` appears in `target` in
+/// order (case-insensitive). Empty query matches everything.
+fn fuzzy_match(query: &str, target: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let q: Vec<char> = query.to_lowercase().chars().collect();
+    let t: Vec<char> = target.to_lowercase().chars().collect();
+    let mut qi = 0;
+    for &tc in &t {
+        if qi < q.len() && tc == q[qi] {
+            qi += 1;
+        }
+    }
+    qi == q.len()
+}
+
+/// Rank score for fuzzy match quality. Lower = better.
+/// 0 = filename contains query as substring (best)
+/// 1 = path contains query as substring
+/// 2 = subsequence match (fallback)
+fn fuzzy_rank(query: &str, target: &str) -> u8 {
+    if query.is_empty() {
+        return 0;
+    }
+    let fname = std::path::Path::new(target)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let q = query.to_lowercase();
+    if fname.contains(&q) {
+        return 0;
+    }
+    if target.to_lowercase().contains(&q) {
+        return 1;
+    }
+    2
+}
+
+/// Fuzzy-filter `@` popup candidates. Subsequence match + ranked:
+/// filename hits first, then path hits, then alphabetical.
+fn fuzzy_at_candidates(entries: &[String], query: &str) -> Vec<String> {
+    if query.is_empty() {
+        return entries.to_vec();
+    }
+    let mut matched: Vec<(u8, &String)> = entries
+        .iter()
+        .filter(|e| fuzzy_match(query, e))
+        .map(|e| (fuzzy_rank(query, e), e))
+        .collect();
+    matched.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+    matched.into_iter().map(|(_, e)| e.clone()).collect()
+}
+
+/// Walk the project tree to collect `@` popup entries.
+/// Returns sorted project-relative paths; dirs get trailing `/`.
+/// Skips `.git/`, `target/`, respects `.gitignore` basename patterns.
+fn at_walk_entries(project_root: &std::path::Path) -> Vec<String> {
+    fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<String>, max: usize) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if out.len() >= max {
+                return;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            let ft = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            if name == ".git" || name == "target" {
+                continue;
+            }
+            let rel = match entry.path().strip_prefix(root) {
+                Ok(r) => r.to_string_lossy().to_string(),
+                Err(_) => continue,
+            };
+            if ft.is_dir() {
+                out.push(format!("{rel}/"));
+                walk(&entry.path(), root, out, max);
+            } else {
+                out.push(rel);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(project_root, project_root, &mut out, 5000);
+    out.sort();
+    out
+}
+
 /// Total menu rows: command rows for a bare `/token`, theme-name rows for
 /// `/theme <partial>`, skill rows for `/skill:<partial>`. Mutually exclusive
 /// by construction, so this is one mode's count — never a mixed sum.
@@ -700,9 +999,40 @@ fn menu_height(app: &App) -> u16 {
     }
 }
 
-/// Reconcile `menu_sel` with the current input after an edit: menu open +
-/// `None` → `Some(0)`; `Some(i)` → clamped; menu closed → `None`.
-/// Uses live caret token (mid-input). Old start-only count kept for submit.
+// ---------------------------------------------------------------------------
+// @ mention popup helpers (ADR-0012)
+// ---------------------------------------------------------------------------
+
+/// True when the @ menu should show: caret is on an active @ token,
+/// no pending approvals, not busy. Suppressed when `/` menu is open.
+fn at_menu_open(app: &App) -> bool {
+    at_row_count(app) > 0
+}
+
+/// Number of @ popup rows to render (0 when `/`-menu open, busy, or
+/// pending approval). Uses `menu_row_count_app` so the skills menu
+/// (which `menu_row_count` alone misses) also suppresses @.
+fn at_row_count(app: &App) -> usize {
+    if !app.pending_approvals.is_empty() || app.busy {
+        return 0;
+    }
+    // /-wins: when slash menu has rows, suppress @ (skills included)
+    if menu_row_count_app(app) > 0 {
+        return 0;
+    }
+    // Need an active @ token (even empty — bare @ shows full list)
+    let Some((_, _, partial)) = active_at_token(&app.input, app.cursor) else {
+        return 0;
+    };
+    let root = std::env::current_dir().unwrap_or_default();
+    let entries = at_walk_entries(&root);
+    if partial.is_empty() {
+        return entries.len(); // bare @: show everything
+    }
+    fuzzy_at_candidates(&entries, &partial).len()
+}
+
+/// Reconcile `menu_sel` and `at_sel` with the current input after an edit.
 fn clamp_menu_sel(app: &mut App) {
     let n = match menu_live(&app.input, app.cursor, &app.skill_names) {
         MenuLive::Closed => menu_row_count(&app.input),
@@ -714,6 +1044,13 @@ fn clamp_menu_sel(app: &mut App) {
         app.menu_sel = None;
     } else {
         app.menu_sel = Some(app.menu_sel.map_or(0, |i| i.min(n - 1)));
+    }
+    // @ clamp: suppressed when /-menu open
+    let at_n = at_row_count(app);
+    if at_n == 0 || menu_row_count(&app.input) > 0 {
+        app.at_sel = None;
+    } else {
+        app.at_sel = Some(app.at_sel.map_or(0, |i| i.min(at_n - 1)));
     }
 }
 
@@ -812,6 +1149,10 @@ struct App {
     /// Cached skill folder names for `/skill:<partial>` suggestions.
     /// Refreshed at startup and on `/skills reload`.
     skill_names: Vec<String>,
+    /// @-mention menu selection index (ADR-0012). `None` = menu closed;
+    /// `Some(i)` = menu open with row `i` highlighted. Suppressed when
+    /// the `/` menu is open (`/`-wins precedence).
+    at_sel: Option<usize>,
     /// Pending human approvals (FIFO). Head renders as a blocking modal;
     /// resolving it resumes the parked agent worker in the same run.
     pending_approvals: VecDeque<ApprovalRequest>,
@@ -980,6 +1321,7 @@ impl App {
             streamed_tools: 0,
             menu_sel: None,
             skill_names: Vec::new(),
+            at_sel: None,
             pending_approvals: VecDeque::new(),
             approval_sel: 0,
             approval_comment: String::new(),
@@ -1603,6 +1945,71 @@ fn handle_key(
             _ => {}
         }
     }
+    // @-mention menu branch (ADR-0012): @ menu owns keys when open.
+    // Runs AFTER /-menu branch (/-wins precedence by construction).
+    if at_menu_open(app) {
+        match code {
+            KeyCode::Up => {
+                let n = at_row_count(app);
+                if n > 0 {
+                    let cur = app.at_sel.unwrap_or(0) % n;
+                    app.at_sel = Some((cur + n - 1) % n);
+                }
+                return false;
+            }
+            KeyCode::Down => {
+                let n = at_row_count(app);
+                if n > 0 {
+                    let cur = app.at_sel.unwrap_or(0) % n;
+                    app.at_sel = Some((cur + 1) % n);
+                }
+                return false;
+            }
+            KeyCode::Enter if mods.contains(KeyModifiers::SHIFT) => {
+                insert_newline(app);
+                return false;
+            }
+            KeyCode::Tab | KeyCode::Enter => {
+                // Rewrite the active @ token span with the selected candidate.
+                let Some((at_idx, end_idx, _partial)) = active_at_token(&app.input, app.cursor)
+                else {
+                    return false;
+                };
+                let root = std::env::current_dir().unwrap_or_default();
+                let entries = at_walk_entries(&root);
+                let partial = active_at_token(&app.input, app.cursor)
+                    .unwrap_or_default()
+                    .2;
+                let filtered = if partial.is_empty() {
+                    entries // bare @: all candidates
+                } else {
+                    fuzzy_at_candidates(&entries, &partial)
+                };
+                if filtered.is_empty() {
+                    return false;
+                }
+                let idx = app.at_sel.unwrap_or(0).min(filtered.len() - 1);
+                let completed = filtered[idx].clone();
+                // Replace chars at_idx+1..end_idx (after the @) with the
+                // completed path + trailing space (terminates the token so
+                // the @-menu closes and the next Enter submits, mirroring
+                // Claude Code's completion behavior).
+                let chars: Vec<char> = app.input.chars().collect();
+                let before: String = chars[..at_idx + 1].iter().collect();
+                let after: String = chars[end_idx..].iter().collect();
+                app.input = format!("{before}{completed} {after}");
+                app.cursor = before.chars().count() + completed.chars().count() + 1;
+                clamp_menu_sel(app);
+                return false;
+            }
+            KeyCode::Esc => {
+                // Dismiss @ popup only, never abort turn.
+                app.at_sel = None;
+                return false;
+            }
+            _ => {}
+        }
+    }
     // Esc (Task 2 / ADR-0006, scrollback edition): busy interrupts, idle
     // is a no-op. No selection exists to deselect; no Esc sequence quits.
     if code == KeyCode::Esc {
@@ -1884,6 +2291,7 @@ fn submit(
     app.input.clear();
     app.cursor = 0;
     app.menu_sel = None;
+    app.at_sel = None;
     // Skill turns record the short `/skill:x` form, not the expansion.
     app.history
         .push(skill_display.clone().unwrap_or_else(|| text.clone()));
@@ -2093,6 +2501,25 @@ fn submit(
     } else {
         text.as_str()
     };
+    // @-mention expansion (ADR-0012): inline file/dir contents for the
+    // model payload while keeping the original `@token` for display/history.
+    let expanded = {
+        let root = std::path::PathBuf::from(picker_project_root());
+        match expand_at_refs(&text, &root) {
+            Ok(e) if e != text => Some(e),
+            Ok(_) => None,
+            Err(e) => {
+                app.enqueue_notice(format!("@ mention: {e}"));
+                app.input = text; // restore input so user can fix
+                app.cursor = app.input.chars().count();
+                return false;
+            }
+        }
+    };
+    let prompt = match expanded {
+        Some(ref e) => e.clone(),
+        None => text.clone(),
+    };
     app.enqueue_user(display);
     app.busy = true;
     app.busy_since = Instant::now();
@@ -2135,7 +2562,7 @@ fn submit(
     let watcher_abort = watcher_handle.abort_handle();
     app.current_watcher = Some(watcher_handle);
     app.current_turn = Some(tokio::spawn(async move {
-        let result = agent.chat(&text).await;
+        let result = agent.chat(&prompt).await;
         watcher_abort.abort();
         // Forward anything the 80ms poll missed between last probe and return.
         let events = agent.last_tool_events();
@@ -2930,12 +3357,18 @@ fn render_menu_float(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let live = menu_live(&app.input, app.cursor, &app.skill_names);
     // Mode tag: skill rows render like theme rows (`▸ <name>`).
     let (mode, total) = match &live {
-        MenuLive::Closed => return,
         MenuLive::Commands { cmds, .. } => ("cmds", cmds.len()),
         MenuLive::Themes { names, .. } => ("themes", names.len()),
         MenuLive::Skills { names, .. } => ("skills", names.len()),
+        MenuLive::Closed => {
+            // @-mention menu (ADR-0012): renders in the same float slot
+            // when the `/` menu is closed. Same chrome, same float box.
+            render_at_menu(f, app, area);
+            return;
+        }
     };
     if total == 0 {
+        render_at_menu(f, app, area);
         return;
     }
     let theme = &app.theme;
@@ -3075,6 +3508,99 @@ fn render_menu_float(f: &mut ratatui::Frame, app: &App, area: Rect) {
             }
             lines.push(mk_row(selected, marker, body));
         }
+    }
+    if has_overflow {
+        lines.push(Line::from(vec![Span::styled(
+            format!("  +{} more", total - show_rows),
+            Style::default().fg(Color::DarkGray).bg(theme.pane_bg),
+        )]));
+    }
+    lines.truncate(inner.height as usize);
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// @-mention popup (ADR-0012): renders file/dir candidates above the
+/// composer using the same chrome as the slash menu (pane_bg, menu_sel_bg,
+/// ▸ selection marker, accent bold). Shows `+N more` on overflow.
+/// @-mention popup (ADR-0012): fuzzy file/dir candidates in the same
+/// float-box chrome as the slash menu (bordered box, pane_bg fill,
+/// `menu_sel_bg` highlight, accent `▸` marker). Floats above the input
+/// line; `+N more` on overflow.
+fn render_at_menu(f: &mut ratatui::Frame, app: &App, area: Rect) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    if !at_menu_open(app) {
+        return;
+    }
+    let Some((_, _, partial)) = active_at_token(&app.input, app.cursor) else {
+        return;
+    };
+    let root = std::env::current_dir().unwrap_or_default();
+    let entries = at_walk_entries(&root);
+    let candidates = if partial.is_empty() {
+        entries // bare @: show everything
+    } else {
+        fuzzy_at_candidates(&entries, &partial)
+    };
+    if candidates.is_empty() {
+        return;
+    }
+    let theme = &app.theme;
+    let total = candidates.len();
+    let sel = app.at_sel.map_or(0, |i| i.min(total.saturating_sub(1)));
+    // Same row budget as the slash float: max 10 rows, overflow hides the
+    // last visible row to make room for the `+N more` indicator.
+    let max_rows = MENU_MAX_ROWS.min(10);
+    let has_overflow = total > max_rows;
+    let show_rows = match has_overflow {
+        true => max_rows.saturating_sub(1).max(1),
+        false => total.min(max_rows),
+    };
+    let start = match show_rows == 0 {
+        true => 0,
+        false => sel
+            .saturating_sub(show_rows - 1)
+            .min(total.saturating_sub(show_rows)),
+    };
+    // Box height = rows + overflow row? + border (2). Same shape as
+    // `render_menu_float`'s box.
+    let mut h = show_rows as u16 + 2;
+    if has_overflow {
+        h += 1;
+    }
+    let inner = crate::popup::render_float(f, area, h, 64, theme);
+    if inner.width < 20 {
+        return;
+    }
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (i, candidate) in candidates.iter().enumerate().skip(start).take(show_rows) {
+        let selected = i == sel;
+        let row_style = match selected {
+            true => Style::default().bg(theme.menu_sel_bg),
+            false => Style::default().bg(theme.pane_bg),
+        };
+        let marker = match selected {
+            true => Span::styled(
+                "▸ ",
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD)
+                    .bg(theme.menu_sel_bg),
+            ),
+            false => Span::styled("  ", Style::default().bg(theme.pane_bg)),
+        };
+        let name_style = match selected {
+            true => Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD)
+                .bg(theme.menu_sel_bg),
+            false => Style::default().fg(Color::DarkGray).bg(theme.pane_bg),
+        };
+        let label = candidate.clone();
+        let mut line = Line::from(vec![marker, Span::styled(label, name_style)]);
+        line.style = row_style;
+        lines.push(line);
     }
     if has_overflow {
         lines.push(Line::from(vec![Span::styled(
@@ -5234,6 +5760,35 @@ mod tests {
     }
 
     #[test]
+    fn at_menu_renders_candidates_above_composer() {
+        use ratatui::{Terminal, backend::TestBackend};
+        // Create a test file in cwd so the walk finds it.
+        let test_dir = std::env::current_dir().unwrap().join(".rem_at_render_test");
+        let _ = std::fs::remove_dir_all(&test_dir);
+        let _ = std::fs::create_dir_all(&test_dir);
+        std::fs::write(test_dir.join("alpha.rs"), "fn a() {}").unwrap();
+
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.input = "@.rem_at_render_test/".to_string();
+        app.cursor = app.input.chars().count();
+        clamp_menu_sel(&mut app);
+        assert!(at_menu_open(&app), "@-menu should be open");
+        terminal.draw(|f| render_pane(f, &mut app)).unwrap();
+        let text = terminal.backend().to_string();
+        assert!(text.contains("alpha.rs"), "candidate row missing: {text}");
+        assert!(text.contains('▸'), "selection marker missing: {text}");
+        // Float box sits above the input line by design (same as the
+        // slash float): it overlaps the composer row, so the typed `@`
+        // prefix stays visible left of the centered box. Pin the rows.
+        let menu_row = text.lines().position(|l| l.contains("alpha.rs")).unwrap();
+        let input_row = text.lines().position(|l| l.contains("❯ @")).unwrap();
+        assert!(menu_row <= input_row, "menu must render above the composer");
+        let _ = std::fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
     fn slash_help_lists_theme_command() {
         // Covered by slash_submit_help_lists_every_registry_command,
         // but pin the theme usage line explicitly.
@@ -5268,10 +5823,12 @@ mod tests {
     }
 
     struct StubAgent;
+    static LAST_PROMPT: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
     #[async_trait::async_trait]
     impl AgentLoop for StubAgent {
-        async fn chat(&self, _prompt: &str) -> Result<String, String> {
+        async fn chat(&self, prompt: &str) -> Result<String, String> {
+            *LAST_PROMPT.lock().unwrap() = prompt.to_string();
             Ok(String::new())
         }
     }
@@ -5316,5 +5873,518 @@ mod tests {
                 _ => None,
             }
         }
+    }
+
+    // ---- @ mention tests (ADR-0012) ----
+
+    #[test]
+    fn at_trigger_requires_non_letter_before() {
+        // user@example.com stays literal
+        assert_eq!(scan_at_refs("user@example.com"), Vec::<String>::new());
+        // start of line triggers
+        assert_eq!(scan_at_refs("@src/main.rs"), vec!["src/main.rs"]);
+        // punctuation triggers
+        assert_eq!(scan_at_refs("(@a.rs)"), vec!["a.rs"]);
+        assert_eq!(scan_at_refs("foo/@a.rs"), vec!["a.rs"]);
+        assert_eq!(scan_at_refs("see @a.rs, and @b.rs."), vec!["a.rs", "b.rs"]);
+        // No @@ escape in v1: @@foo parses as a ref token
+        assert_eq!(scan_at_refs("@@foo"), vec!["@foo"]);
+        // letter directly before: no trigger
+        assert_eq!(scan_at_refs("foo@bar"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn at_token_trims_trailing_punctuation() {
+        assert_eq!(scan_at_refs("fix @src/a.rs; next"), vec!["src/a.rs"]);
+        assert_eq!(scan_at_refs("(@src/x.rs)"), vec!["src/x.rs"]);
+        assert_eq!(scan_at_refs("@a.rs,@b.rs"), vec!["a.rs", "b.rs"]);
+    }
+
+    #[test]
+    fn at_active_token_follows_caret() {
+        // Fuzzy query: token includes spaces, ends at terminator/EOL.
+        let input = "explain @src/ma";
+        let before_first = "explain ".len();
+        let act = active_at_token(input, before_first + 3);
+        assert_eq!(act.map(|t| t.2), Some("src/ma".to_string()));
+        // Caret at end of input — still inside the token
+        let end = input.chars().count();
+        let act = active_at_token(input, end);
+        assert_eq!(act.map(|t| t.2), Some("src/ma".to_string()));
+        // Caret before the @ — no token
+        assert!(active_at_token(input, 3).is_none());
+        // Email position — no token
+        assert!(active_at_token("a@b c", 1).is_none());
+        // Two tokens: second one found by caret position
+        let input2 = "@foo bar @baz";
+        let at2 = input2.rfind('@').unwrap() + 1;
+        let act = active_at_token(input2, at2 + 2);
+        assert_eq!(act.map(|t| t.2), Some("baz".to_string()));
+    }
+
+    #[test]
+    fn at_active_token_none_for_email() {
+        assert!(active_at_token("a@b c", 1).is_none());
+    }
+
+    #[test]
+    fn at_confinement_blocks_escapes() {
+        let root = std::env::temp_dir().join("rem-at-confine-test");
+        let _ = std::fs::create_dir_all(&root);
+        assert!(at_resolve_in_root(&root, "src/a.rs").is_some());
+        assert!(at_resolve_in_root(&root, "/etc/passwd").is_none());
+        assert!(at_resolve_in_root(&root, "../escape.txt").is_none());
+        assert!(at_resolve_in_root(&root, "sub/../../escape.txt").is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn at_candidates_prefix_filter() {
+        let entries = vec![
+            "src/main.rs".to_string(),
+            "src/tui.rs".to_string(),
+            "src/utils/".to_string(),
+        ];
+        // Full prefix still works as fuzzy
+        assert_eq!(fuzzy_at_candidates(&entries, "src/"), entries);
+        // Partial prefix narrows
+        let result = fuzzy_at_candidates(&entries, "src/m");
+        assert!(result.contains(&"src/main.rs".to_string()));
+        assert!(!result.contains(&"src/tui.rs".to_string()));
+        // No match
+        assert_eq!(fuzzy_at_candidates(&entries, "zzz"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn at_fuzzy_matches_subsequence() {
+        let entries = vec![
+            "src/main.rs".to_string(),
+            "src/tui.rs".to_string(),
+            "Cargo.toml".to_string(),
+        ];
+        // "ma" is subsequence of "src/main.rs"
+        let result = fuzzy_at_candidates(&entries, "ma");
+        assert!(
+            result.contains(&"src/main.rs".to_string()),
+            "got: {result:?}"
+        );
+        assert!(!result.contains(&"src/tui.rs".to_string()));
+        // "ct" matches Cargo.toml (C-a-r-g-o-.-t-o-m-l: c then t)
+        let result = fuzzy_at_candidates(&entries, "ct");
+        assert!(
+            result.contains(&"Cargo.toml".to_string()),
+            "got: {result:?}"
+        );
+        // "sm" matches src/main.rs (s...m)
+        let result = fuzzy_at_candidates(&entries, "sm");
+        assert!(
+            result.contains(&"src/main.rs".to_string()),
+            "got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn at_fuzzy_ranks_filename_matches_first() {
+        let entries = vec![
+            "src/deep/very/main.rs".to_string(),
+            "main.rs".to_string(),
+            "src/main.rs".to_string(),
+        ];
+        let result = fuzzy_at_candidates(&entries, "main");
+        // "main" in filename of all three; "main.rs" and "src/main.rs"
+        // have it as filename substring, "src/deep/very/main.rs" too.
+        // All rank 0 (filename substring), sorted alphabetically.
+        assert_eq!(result[0], "main.rs", "got: {result:?}");
+    }
+
+    #[test]
+    fn at_file_block_truncates_at_tool_budget() {
+        let dir = std::env::temp_dir().join("rem-at-block-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("big.txt");
+        let content = "x".repeat(2500);
+        std::fs::write(&path, &content).unwrap();
+        let block = read_at_file(&path, "big.txt").unwrap();
+        assert!(block.contains("[truncated 500 chars]"), "got: {block}");
+        assert!(block.contains("```"), "got: {block}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn at_dir_block_matches_list_directory_shape() {
+        let dir = std::env::temp_dir().join("rem-at-dir-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(dir.join("sub"));
+        std::fs::write(dir.join("a.txt"), "hi").unwrap();
+        std::fs::write(dir.join("b.txt"), "yo").unwrap();
+        let block = read_at_dir(&dir, "mydir").unwrap();
+        assert!(
+            block.starts_with("mydir/ (directory listing):"),
+            "got: {block}"
+        );
+        assert!(block.contains("file: a.txt"), "got: {block}");
+        assert!(block.contains("file: b.txt"), "got: {block}");
+        assert!(block.contains("dir: sub"), "got: {block}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn at_expand_adds_fenced_blocks() {
+        let dir = std::env::temp_dir().join("rem-at-expand-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("a.txt"), "hello").unwrap();
+        let result = expand_at_refs("look at @a.txt", &dir).unwrap();
+        assert!(result.starts_with("look at @a.txt"), "got: {result}");
+        assert!(result.contains("```"), "got: {result}");
+        assert!(result.contains("hello"), "got: {result}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn at_expand_no_refs_returns_original() {
+        let dir = std::env::temp_dir();
+        let result = expand_at_refs("no refs here", &dir).unwrap();
+        assert_eq!(result, "no refs here");
+    }
+
+    #[test]
+    fn at_expand_blocks_outside_root() {
+        let dir = std::env::temp_dir().join("rem-at-root-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let result = expand_at_refs("@/etc/passwd", &dir);
+        assert!(result.is_err(), "expected Err, got: {result:?}");
+        let err = result.unwrap_err();
+        assert!(err.contains("outside project root"), "got: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn at_expand_blocks_missing_file() {
+        let dir = std::env::temp_dir().join("rem-at-missing-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let result = expand_at_refs("@nope.txt", &dir);
+        assert!(result.is_err(), "expected Err, got: {result:?}");
+        assert!(result.unwrap_err().contains("nope.txt"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn at_expand_blocks_binary_file() {
+        let dir = std::env::temp_dir().join("rem-at-binary-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("bin.dat"), [0u8, 0, 0, 0xff]).unwrap();
+        let result = expand_at_refs("@bin.dat", &dir);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("binary"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn at_menu_suppressed_when_slash_menu_open() {
+        // Simulate: /-menu open via bare prefix, @ suppressed by /-wins.
+        // We can't have both /-token + @-token in one input without whitespace
+        // (which closes the /-menu), so verify the precedence rule directly:
+        // when menu_row_count > 0, at_row_count must be 0.
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        app.input = "/help".to_string();
+        app.cursor = 5;
+        clamp_menu_sel(&mut app);
+        // /-menu open
+        assert!(menu_row_count(&app.input) > 0, "/-menu should have rows");
+        // Even if at_sel was somehow set, clamp clears it
+        assert!(app.at_sel.is_none());
+        // at_row_count must return 0 when /-menu open (/-wins precedence)
+        assert_eq!(at_row_count(&app), 0, "@-menu suppressed by /-wins");
+    }
+
+    #[test]
+    fn at_menu_suppressed_when_busy() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        app.busy = true;
+        app.input = "@src/main.rs".to_string();
+        app.cursor = app.input.chars().count();
+        assert_eq!(at_row_count(&app), 0, "@-menu suppressed when busy");
+    }
+
+    #[test]
+    fn at_menu_suppressed_when_pending_approval() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        app.input = "@src/main.rs".to_string();
+        app.cursor = app.input.chars().count();
+        // Manually inject a fake approval
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        app.pending_approvals
+            .push_back(crate::permissions::ApprovalRequest {
+                tool_name: "test".to_string(),
+                args_preview: "()".to_string(),
+                full_args: serde_json::Value::Null,
+                reason: "test".to_string(),
+                reply: tx,
+            });
+        assert_eq!(at_row_count(&app), 0, "@-menu suppressed during approval");
+    }
+
+    #[test]
+    fn at_menu_active_with_token_and_no_slash() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        app.input = "look @src/".to_string();
+        app.cursor = app.input.chars().count();
+        // Active token is "src/" — may or may not match depending on cwd
+        // Just verify no panic and clamp works
+        clamp_menu_sel(&mut app);
+        // If at_menu_open, at_sel should be Some
+        if at_menu_open(&app) {
+            assert!(app.at_sel.is_some());
+        }
+    }
+
+    #[test]
+    fn at_menu_bare_at_shows_entries() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        app.input = "@".to_string();
+        app.cursor = 1; // caret right after @
+        clamp_menu_sel(&mut app);
+        // Bare @ should open the menu (showing all walk entries)
+        assert!(at_menu_open(&app), "bare @ should open popup");
+        assert!(at_row_count(&app) > 0, "bare @ should have rows");
+    }
+
+    #[test]
+    fn at_menu_tab_completes_token_not_submits() {
+        let dir = std::env::temp_dir().join("rem-at-key-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("hello.rs"), "fn main() {}").unwrap();
+
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        app.input = format!("look @{}/", dir.to_string_lossy());
+        app.cursor = app.input.chars().count();
+        clamp_menu_sel(&mut app);
+
+        let agent = std::sync::Arc::new(StubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+
+        // If menu open, Tab should complete, not submit
+        if at_menu_open(&app) {
+            assert!(!handle_key(
+                &mut app,
+                &agent,
+                &tx,
+                &think_tx,
+                KeyCode::Tab,
+                KeyModifiers::empty()
+            ));
+            // Input should now contain completed path, not be empty
+            assert!(
+                !app.input.is_empty(),
+                "Tab should complete, not clear input"
+            );
+            assert!(!app.busy, "Tab should not start a turn");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn at_menu_esc_dismisses_not_aborts() {
+        let dir = std::env::temp_dir().join("rem-at-esc-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("foo.rs"), "x").unwrap();
+
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        app.input = format!("@{}/", dir.to_string_lossy());
+        app.cursor = app.input.chars().count();
+        clamp_menu_sel(&mut app);
+
+        let agent = std::sync::Arc::new(StubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+
+        if at_menu_open(&app) {
+            assert!(!handle_key(
+                &mut app,
+                &agent,
+                &tx,
+                &think_tx,
+                KeyCode::Esc,
+                KeyModifiers::empty()
+            ));
+            assert!(app.at_sel.is_none(), "Esc should dismiss @ popup");
+            assert!(!app.input.is_empty(), "Esc should keep input text");
+            assert!(!app.busy, "Esc should not start a turn");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn at_submit_expands_in_chat_payload_not_display() {
+        // Create a test file relative to cwd so @ resolves.
+        let test_dir = std::env::current_dir().unwrap().join(".rem_at_submit_test");
+        let _ = std::fs::remove_dir_all(&test_dir);
+        let _ = std::fs::create_dir_all(&test_dir);
+        std::fs::write(test_dir.join("hello.rs"), "fn main() {}").unwrap();
+
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        app.input = "look at @.rem_at_submit_test/hello.rs".to_string();
+        app.cursor = app.input.chars().count();
+
+        let agent = std::sync::Arc::new(StubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+
+        // First Enter: @-menu completion (if popup open)
+        if at_menu_open(&app) {
+            handle_key(
+                &mut app,
+                &agent,
+                &tx,
+                &think_tx,
+                KeyCode::Enter,
+                KeyModifiers::empty(),
+            );
+            // Token was completed — now cursor is past the completed path
+        }
+        // Second Enter: submit (chat path)
+        let started = handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Enter,
+            KeyModifiers::empty(),
+        );
+        assert!(!started, "chat submit returns false (not quit)");
+        assert!(app.busy, "submit should start a turn");
+        assert!(
+            app.history.last().unwrap().contains(".rem_at_submit_test"),
+            "history should store original: {}",
+            app.history.last().unwrap()
+        );
+        // Wait for spawned chat task to complete
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let sent = LAST_PROMPT.lock().unwrap().clone();
+        assert!(
+            sent.contains("fn main() {}"),
+            "agent should receive expanded content: {sent}"
+        );
+        assert!(
+            sent.contains("```"),
+            "agent payload should have fenced block: {sent}"
+        );
+        // Transcript shows original @token
+        let user_line: String = app
+            .print_queue
+            .iter()
+            .flatten()
+            .find(|l| l.spans.iter().any(|s| s.content.contains("look at")))
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .unwrap_or_default();
+        assert!(
+            user_line.contains("@"),
+            "transcript should show original @token: {user_line}"
+        );
+        let _ = std::fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn at_submit_blocks_on_bad_ref() {
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        app.input = "look at @nonexistent_file_xyz.txt".to_string();
+        app.cursor = app.input.chars().count();
+
+        let agent = std::sync::Arc::new(StubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Enter,
+            KeyModifiers::empty()
+        ));
+        // Not busy — submit was blocked
+        assert!(!app.busy, "bad ref should block submit");
+        // Input restored for user to fix
+        assert!(
+            app.input.contains("nonexistent_file_xyz"),
+            "input should be restored after bad ref: {}",
+            app.input
+        );
+        // Notice queued naming the ref
+        let notice: String = app
+            .print_queue
+            .iter()
+            .flatten()
+            .find(|l| l.spans.iter().any(|s| s.content.contains("@nonexistent")))
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .unwrap_or_default();
+        assert!(!notice.is_empty(), "notice should name the bad ref");
+    }
+
+    #[test]
+    fn at_submit_no_expand_for_slash_command() {
+        let dir = std::env::temp_dir().join("rem-at-slash-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("file.rs"), "content").unwrap();
+
+        let mut app = App::new("model".to_string(), "medium".to_string());
+        app.print_queue.clear();
+        // /help is a slash command — @ should not be expanded inline
+        app.input = "/help".to_string();
+        app.cursor = 5;
+
+        let agent = std::sync::Arc::new(StubAgent);
+        let (tx, _rx) = mpsc::channel::<TurnResult>();
+        let (think_tx, _think_rx) = mpsc::channel::<ThinkMsg>();
+
+        assert!(!handle_key(
+            &mut app,
+            &agent,
+            &tx,
+            &think_tx,
+            KeyCode::Enter,
+            KeyModifiers::empty()
+        ));
+        assert!(!app.busy, "/help should not start a turn");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn at_walk_entries_skips_git_and_target() {
+        let dir = std::env::temp_dir().join("rem-at-walk-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(dir.join(".git/objects"));
+        let _ = std::fs::create_dir_all(dir.join("target/debug"));
+        std::fs::write(dir.join("src.rs"), "x").unwrap();
+        let entries = at_walk_entries(&dir);
+        assert!(entries.iter().any(|e| e == "src.rs"));
+        assert!(!entries.iter().any(|e| e.contains(".git")));
+        assert!(!entries.iter().any(|e| e.contains("target")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

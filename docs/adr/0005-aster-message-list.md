@@ -73,7 +73,8 @@ elision, and duration-first trailer. No review rows (no engine exists).
 - Tests: headless `TestBackend` row tests pinning bullet rows, hanging
   indent, user band + rail, patch counts + tinted bands, elision gap
   marker, trailer text. `cargo test` green; new-code regions fmt-clean.
-- Deferred: review/findings engine + rows, `@` mentions, `/` menu,
-  file-stat and cost/token plumbing, token counters.
+- Deferred: review/findings engine + rows, `/` menu,
+  file-stat and cost/token plumbing, token counters. `@` mentions are now
+  implemented in ADR-0012.
 - `cargo fmt --check` still reports pre-existing diffs in `tui.rs`; the
   regions touched here must be fmt-clean.

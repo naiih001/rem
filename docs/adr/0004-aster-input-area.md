@@ -57,9 +57,9 @@ the composer now supports wrapped multi-line editing.
   band shading rows + prompt/typed text + caret math + footer content;
   idle placeholder vs busy status + busy hint; approval status row above a
   still-shaded band.
-- Deferred (not this ADR): `@` mentions and token/cost counters in the
-  footer (Aster shows `↑/↓` + `$`; rem has no usage plumbing). Slash-menu
-  behavior is specified in ADR-0007.
+- Deferred (not this ADR): token/cost counters in the footer (Aster
+  shows `↑/↓` + `$`; rem has no usage plumbing). Slash-menu behavior is
+  specified in ADR-0007. `@` mentions are now implemented in ADR-0012.
 - `cargo fmt --check` still reports pre-existing diffs elsewhere in
   `tui.rs`; the regions touched here are fmt-clean. The one clippy
   `bool_comparison` hit in tests predates this change.
