@@ -95,3 +95,15 @@
 - **Permission mode**: A session-local policy preset controlling which tool calls run automatically, ask for approval, or are denied. Modes are `plan`, `manual`, `auto`, `edit`, and `yolo`.
 - **Plan mode**: Read-only permission mode. Prohibited calls receive model-visible denial feedback so the agent can replan.
 - **Yolo mode**: Approval-free mode that still preserves unconditional denials for annihilators and secret exfiltration.
+
+## File mentions (ADR-0012)
+
+- **@ mention**: An inline file reference in composer input. `@file` inlines content; `@dir` inlines a listing. Multiple per message, in `@` appearance order.
+- **@ trigger**: `@` starts a ref unless the char directly before it is an ASCII letter. `user@example.com` stays literal; `(@a.rs)` and `foo/@a.rs` trigger. No `@@` escape in v1.
+- **@ token**: Text from a triggering `@` to whitespace, with trailing `, . : ; ! ? ) ] }` trimmed. No quoted-space paths in v1.
+- **@ popup**: Caret-aware fuzzy file finder cloned from the `/` menu (subsequence match + ranked: filename hits first, then path, then alpha; `Up`/`Down` move, `Tab`/`Enter` complete, `Esc` dismiss, 10 rows + `+N more`). The `/` menu wins on `/command` lines. Filesystem walk, project-relative paths, dirs with trailing `/`, `.gitignore`-respected, `.git`/`target` skipped.
+- **Display-vs-send**: Transcript user row, input history, and title fallback keep the short original with `@` tokens; only the model payload appends `path:\n```\ncontents\n``` ` (files) or `dir/ (directory listing):\nfile:/dir: lines` (dirs) blocks. Sessions store the expanded prompt.
+- **@ caps**: Per-file `TOOL_BUDGET` (2000 chars) with ` [truncated N chars]`; dirs non-recursive, sorted, `file:`/`dir:` lines, 500 entries (`list_directory` parity).
+- **@ block**: Submit is blocked with a notice naming the bad ref when a ref is missing, unreadable, binary, or outside the project root. Large refs truncate, never block.
+- **@ confinement**: Every ref resolves against the process cwd; absolute paths and `../`/symlink escapes are blocked, same spirit as the mutate fast-path.
+- **Explicit-intent bypass**: `@` reads never pop the approval modal, even for sensitive paths; `@` only adds prompt context, never writes or executes.
